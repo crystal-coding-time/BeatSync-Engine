@@ -44,7 +44,9 @@ Useful env vars:
 
 ## Input formats
 
-Audio: `.mp3`, `.wav`, `.flac`. Video sources: `.mp4`, `.mkv`, `.mov`, `.webm`, `.m4v`, `.avi`, `.gif`. Sources shorter than a cut segment (e.g. GIFs) are looped automatically to keep the timeline frame-accurate.
+Audio: `.mp3`, `.wav`, `.flac`. Video sources: `.mp4`, `.mkv`, `.mov`, `.webm`, `.m4v`, `.avi`, `.gif` (upper- or lowercase). Sources shorter than a cut segment (e.g. GIFs) are looped automatically to keep the timeline frame-accurate.
+
+UI quirk: Gradio's file input ignores drag-drops once it already holds files (gradio#10325), so use the "➕ Drop here to add more videos" zone beneath it to append — it merges into the main list and clears itself. After the app is restarted with code changes, refresh the browser tab: the accepted-file-type filter is baked in at page load.
 
 ## Docs
 

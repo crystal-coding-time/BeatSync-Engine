@@ -625,8 +625,27 @@ def create_ui() -> gr.Blocks:
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown('### 📁 Input Files')
-                audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
-                video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv', '.mov', '.webm', '.m4v', '.avi', '.gif'], type='filepath', elem_id='video-files-input')
+                audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=[t for ext in ['.mp3', '.wav', '.flac'] for t in (ext, ext.upper())], type='filepath', elem_id='audio-file-input')
+                # Include uppercase variants: Gradio's drag-drop filter is case-sensitive
+                # (gradio#10746), unlike its file picker.
+                video_file_types = [t for ext in ['.mp4', '.mkv', '.mov', '.webm', '.m4v', '.avi', '.gif'] for t in (ext, ext.upper())]
+                video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=video_file_types, type='filepath', elem_id='video-files-input')
+                # Gradio's File component ignores drops once it holds files
+                # (gradio#10325), so appending goes through this always-empty zone.
+                video_add_input = gr.File(label='➕ Drop here to add more videos', file_count='multiple', file_types=video_file_types, type='filepath', elem_id='video-files-add-input', height=90)
+
+                def _append_videos(new_files, current_files):
+                    merged = list(current_files) if current_files else []
+                    for f in (new_files or []):
+                        if f not in merged:
+                            merged.append(f)
+                    return merged, None
+
+                video_add_input.upload(
+                    _append_videos,
+                    inputs=[video_add_input, video_input],
+                    outputs=[video_input, video_add_input],
+                )
 
                 with gr.Group():
                     gr.Markdown('### ⚙️ Video Settings')
