@@ -321,7 +321,7 @@ def get_startup_header(cpu_count, max_threads, parallel_workers, python_status,
 # ============================================================================
 
 LABEL_AUDIO_FILE = "🎵 Audio File (MP3/WAV/FLAC)"
-LABEL_VIDEO_FILES = "🎥 Video Files (MP4/MKV)"
+LABEL_VIDEO_FILES = "🎥 Video Files (MP4/MKV/MOV/WebM/M4V/AVI/GIF)"
 
 LABEL_CUSTOM_FPS = "🎞️ Custom FPS (Frame Rate)"
 INFO_CUSTOM_FPS = "Leave empty for auto-detect, or enter value (24/30/60)"
