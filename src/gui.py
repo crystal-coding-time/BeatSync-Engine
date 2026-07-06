@@ -356,6 +356,8 @@ def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
                        custom_fps: float, session_state: dict,
+                       fit_mode: str = 'crop', effect_style: str = 'clean',
+                       effect_intensity: float = 0.7,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None) -> StatusResult:
     total_started = time.perf_counter()
@@ -450,7 +452,9 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             local_audio_path, local_video_paths, selected_beats,
             output_file=temp_output, max_workers=parallel_workers,
             beat_info=beat_info, lossless_mode=is_prores,
-            use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
+            fit_mode=fit_mode, effect_style=effect_style,
+            effect_intensity=effect_intensity
         )
 
         # Move to output folder
@@ -515,7 +519,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
-                 custom_fps: float, session_state: dict) -> Iterator[StatusResult]:
+                 custom_fps: float, fit_mode: str, effect_style: str,
+                 effect_intensity: float, session_state: dict) -> Iterator[StatusResult]:
     status_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
     initial_status = _stage_status(1)
@@ -537,6 +542,9 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     output_filename=output_filename,
                     processing_mode=processing_mode,
                     custom_fps=custom_fps,
+                    fit_mode=fit_mode,
+                    effect_style=effect_style,
+                    effect_intensity=effect_intensity,
                     session_state=session_state,
                     progress_callback=progress_callback,
                     console_logger=console_logger,
@@ -686,6 +694,19 @@ def create_ui() -> gr.Blocks:
                     custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
                 with gr.Group():
+                    gr.Markdown('### 🎨 Style')
+                    fit_mode_input = gr.Radio(
+                        choices=[('Smart crop', 'crop'), ('Blurred background', 'blur'), ('Letterbox', 'pad'), ('Stretch', 'stretch')],
+                        value='crop', label='Frame fit',
+                        info='How sources with a different aspect ratio fill the frame')
+                    effect_style_input = gr.Radio(
+                        choices=[('Clean', 'clean'), ('AMV', 'amv'), ('Hype', 'hype')],
+                        value='clean', label='Effect style',
+                        info='Beat-aware effects: zooms and flashes on drops, saturation pulses on the beat')
+                    effect_intensity_input = gr.Slider(0.0, 1.0, value=0.7, step=0.05,
+                                                       label='Effect intensity')
+
+                with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
                     if NVENC_AVAILABLE:
                         processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
@@ -710,6 +731,7 @@ def create_ui() -> gr.Blocks:
             inputs=[
                 audio_input, video_state,
                 output_filename, processing_mode, custom_fps,
+                fit_mode_input, effect_style_input, effect_intensity_input,
                 session_state
             ],
             outputs=[video_output, status_output, session_state],

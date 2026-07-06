@@ -16,12 +16,21 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
 - ✅ Apple VideoToolbox H.264/HEVC encoding (`get_gpu_quality_args` dispatch in `ffmpeg_processing.py`; GUI auto-offers it when NVENC is absent)
 - ⬜ Still images (JPG/PNG) as sources via `zoompan` (Ken Burns) — deferred, needs duration synthesis in the analysis stages
 
-## Phase 2 — beat-aware effects engine ⬜
-- Composable ffmpeg `-vf` snippet library: punch-in zoom on beat, white-flash on drop cuts, RGB split, shake, speed ramps, saturation pulse, grain/vignette
-- Driven by stage 6 planner profiles (energy / section / `drop`·`build`·`rhythm` targets) — effects hit harder on drops, ease off on intros
-- Hook point: per-segment filter chain in `extract_clip_segment_ffmpeg` (`ffmpeg_processing.py`)
-- Deterministic via existing `_stable_rng`
-- GUI: style preset (Clean / AMV / Hype) + intensity slider
+## Phase 1.5 — aspect-ratio frame fit ✅ (2026-07-06)
+- Mixed resolutions/aspect ratios no longer stretch-distort. GUI "Frame fit" option:
+  smart crop-to-fill (default) · blurred-background fill · letterbox · stretch (legacy)
+- `get_fit_filters` / `build_blur_fit_graph` in `ffmpeg_processing.py`; `setsar=1` normalizes
+  sample aspect across heterogeneous sources
+- Target resolution still comes from the first video file — a vertical first source makes a vertical video
+
+## Phase 2 — beat-aware effects engine ✅ (2026-07-06)
+- `src/effects.py`: per-segment filter chains driven by stage 6 planner metadata
+  (`target` drop/rhythm/build/soft/flow, `impact` energy). Effects land where the music does:
+  punch-in zoom (zoompan) on drop/rhythm cuts, white flash on drops, saturation pulse at the
+  beat frequency, chromatic aberration occasionally on hard cuts; hype adds shake, vignette, grain
+- GUI: Effect style Clean (default) / AMV / Hype + intensity slider
+- Deterministic (seeded per segment); ffmpeg gotcha encoded in code comments: `crop` can't animate w/h → zoom uses `zoompan`
+- Not included by design: speed ramps (`setpts` would break the zero-drift frame-locked timeline); effects don't apply in ProRes precise mode (kept pristine for external editing)
 
 ## Phase 3 — text overlays: quotes throughout the video ⬜
 - Motivational quotes (and similar text) rendered over the video at planned moments — not title cards

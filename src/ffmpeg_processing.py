@@ -165,6 +165,47 @@ def get_hwaccel_args(use_hw_encoder: bool, gpu_encoder: str) -> List[str]:
     return ['-hwaccel', 'auto']
 
 
+FIT_MODES = ('crop', 'blur', 'pad', 'stretch')
+
+
+def get_fit_filters(target_size: Tuple[int, int], fit_mode: str) -> List[str]:
+    """Aspect-ratio handling for sources that don't match the target frame.
+
+    crop    – scale to fill, center-crop overflow (no distortion, default)
+    pad     – letterbox/pillarbox with black bars
+    stretch – legacy distorting scale
+    blur    – handled separately (needs a filter graph, see caller)
+    """
+    w, h = target_size
+    if fit_mode == 'stretch':
+        return [f"scale={w}:{h}", "setsar=1"]
+    if fit_mode == 'pad':
+        return [
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease",
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
+            "setsar=1",
+        ]
+    return [
+        f"scale={w}:{h}:force_original_aspect_ratio=increase",
+        f"crop={w}:{h}",
+        "setsar=1",
+    ]
+
+
+def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
+                         post_filters: List[str]) -> str:
+    """Filter graph for blur fit: blurred fill in back, undistorted fit in front."""
+    w, h = target_size
+    pre = ",".join(pre_filters)
+    post = ("," + ",".join(post_filters)) if post_filters else ""
+    return (
+        f"[0:v]{pre},split=2[bg][fg];"
+        f"[bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},gblur=sigma=16[bgb];"
+        f"[fg]scale={w}:{h}:force_original_aspect_ratio=decrease[fgs];"
+        f"[bgb][fgs]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,setsar=1{post}[outv]"
+    )
+
+
 def get_cpu_h264_quality_args(include_pix_fmt: bool = True) -> List[str]:
     """Return lossless CPU H.264 settings."""
     args = [
@@ -351,7 +392,9 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None)
 def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: float,
                                 output_file: str, fps: float, target_size: Tuple[int, int],
                                 use_nvenc: bool,
-                                gpu_encoder: str = 'h264_nvenc') -> bool:
+                                gpu_encoder: str = 'h264_nvenc',
+                                fit_mode: str = 'crop',
+                                extra_filters: List[str] = None) -> bool:
     """
     Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
     
@@ -364,21 +407,20 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         exact_source_duration = frame_count_to_seconds(source_frame_count, fps)
         output_frame_count = source_frame_count
 
-        # Build filter complex
-        filters = []
+        # Trim first so each extracted segment has exact timing; effects come
+        # after fps so their time expressions see the final frame timing.
+        pre_filters = [f"trim=duration={exact_source_duration}", "setpts=PTS-STARTPTS", f"fps={fps}"]
+        post_filters = list(extra_filters or [])
 
-        # Trim first so each extracted segment has exact timing.
-        filters.extend([f"trim=duration={exact_source_duration}", "setpts=PTS-STARTPTS"])
-        
-        # Scale to target size
-        if target_size:
-            width, height = target_size
-            filters.append(f"scale={width}:{height}")
-        
-        # FPS filter
-        filters.append(f"fps={fps}")
-        
-        filter_complex = ",".join(filters)
+        use_blur_graph = bool(target_size) and fit_mode == 'blur'
+        if use_blur_graph:
+            filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters)
+        else:
+            filters = list(pre_filters)
+            if target_size:
+                filters.extend(get_fit_filters(target_size, fit_mode))
+            filters.extend(post_filters)
+            filter_complex = ",".join(filters)
         
         # Build FFmpeg command
         cmd = [FFMPEG_PATH]
@@ -401,8 +443,11 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         ])
         
         # Video filters
-        cmd.extend(['-vf', filter_complex])
-        
+        if use_blur_graph:
+            cmd.extend(['-filter_complex', filter_graph, '-map', '[outv]'])
+        else:
+            cmd.extend(['-vf', filter_complex])
+
         # ✅ FRAME-ACCURATE DURATION: Use -vframes instead of -t
         cmd.extend(['-vframes', str(output_frame_count)])
         

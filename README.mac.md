@@ -48,6 +48,14 @@ Audio: `.mp3`, `.wav`, `.flac`. Video sources: `.mp4`, `.mkv`, `.mov`, `.webm`, 
 
 The video dropzone stays empty and always accepts drops; loaded files accumulate in the "Loaded videos" list below it, where they can be removed individually or cleared. (This sidesteps gradio#10325 — the stock File component ignores drops once it holds files.) After the app is restarted with code changes, refresh the browser tab: the accepted-file-type filter is baked in at page load.
 
+## Style controls
+
+- **Frame fit** — how sources with a different aspect ratio fill the frame: Smart crop (fill and center-crop, default), Blurred background (undistorted over a blurred fill), Letterbox, or Stretch (legacy). Output resolution follows the first video file.
+- **Effect style** — Clean (no effects), AMV, or Hype. Effects are beat-aware: zoom punches and flashes on drop cuts, saturation pulsing at the song's tempo, plus shake/vignette/grain in Hype. Same inputs always render the same video.
+- **Effect intensity** — scales all effect strengths.
+
+Effects apply to the H.264/HEVC modes only; ProRes precise mode stays untouched for external editing.
+
 ## Docs
 
 - `docs/ROADMAP.md` — feature roadmap and status. **Keep it and this README updated when features land.**

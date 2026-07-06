@@ -49,6 +49,7 @@ from ffmpeg_processing import (
     frame_count_to_seconds,
 )
 from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_clip_plan
+from effects import build_effect_filters
 
 # Import mode modules
 from auto_mode import analyze_beats_auto
@@ -266,39 +267,56 @@ def create_clip_parallel(args):
     """
     clip_started = time.perf_counter()
     planned_clip = None
-    if len(args) >= 9:
+    render_opts = {}
+    if len(args) >= 10:
+        (i, video_file, final_duration, target_size,
+         use_nvenc, gpu_encoder, temp_dir, fps, planned_clip, render_opts) = args
+    elif len(args) >= 9:
         (i, video_file, final_duration, target_size,
          use_nvenc, gpu_encoder, temp_dir, fps, planned_clip) = args
     else:
         (i, video_file, final_duration, target_size,
          use_nvenc, gpu_encoder, temp_dir, fps) = args
-    
+
     try:
+        # Sources shorter than the segment keep the full requested duration:
+        # extraction loops them (-stream_loop) instead of emitting short clips.
         if planned_clip:
             video_file = planned_clip.get('video_file') or video_file
             video_duration = get_video_duration(video_file)
-            source_duration = float(planned_clip.get('source_duration', final_duration))
-            source_duration = max(0.05, min(source_duration, video_duration))
-            max_start = max(0.0, video_duration - source_duration)
-            clip_start = max(0.0, min(float(planned_clip.get('start_time', 0.0)), max_start))
+            source_duration = max(0.05, float(planned_clip.get('source_duration', final_duration)))
+            if video_duration >= source_duration:
+                max_start = max(0.0, video_duration - source_duration)
+                clip_start = max(0.0, min(float(planned_clip.get('start_time', 0.0)), max_start))
+            else:
+                clip_start = 0.0
         else:
             # Random start time from video if visual planning is unavailable.
             video_duration = get_video_duration(video_file)
-            
-            required_source_duration = final_duration
-            
-            if video_duration >= required_source_duration:
-                max_start = video_duration - required_source_duration
+
+            source_duration = final_duration
+
+            if video_duration >= source_duration:
+                max_start = video_duration - source_duration
                 clip_start = random.uniform(0, max_start)
-                source_duration = required_source_duration
             else:
                 clip_start = 0
-                source_duration = video_duration
-            
+
         
         # Output file
         temp_clip_path = os.path.join(temp_dir, f"temp_clip_{i}_{uuid.uuid4().hex}.mp4")
         
+        opts = render_opts or {}
+        effect_filters = build_effect_filters(
+            planned_clip,
+            opts.get('effect_style', 'clean'),
+            opts.get('effect_intensity', 0.0),
+            opts.get('tempo'),
+            i,
+            target_size,
+            fps=fps,
+        )
+
         extract_kwargs = {
             'video_file': video_file,
             'start_time': clip_start,
@@ -308,6 +326,8 @@ def create_clip_parallel(args):
             'target_size': target_size,
             'use_nvenc': use_nvenc,
             'gpu_encoder': gpu_encoder,
+            'fit_mode': opts.get('fit_mode', 'crop'),
+            'extra_filters': effect_filters,
         }
 
         success = extract_clip_segment_ffmpeg(**extract_kwargs)
@@ -328,8 +348,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                       start_time: float = 0.0, end_time: float = None,
                       max_workers: int = None,
                       beat_info: dict = None,
-                      lossless_mode: bool = False, use_gpu: bool = False, 
-                      gpu_encoder: str = 'h264_nvenc', fps: float = None) -> str:
+                      lossless_mode: bool = False, use_gpu: bool = False,
+                      gpu_encoder: str = 'h264_nvenc', fps: float = None,
+                      fit_mode: str = 'crop', effect_style: str = 'clean',
+                      effect_intensity: float = 0.7) -> str:
     """
     Creates a music video with video clips cut to detected beats.
     
@@ -612,6 +634,17 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             print(f"   Encoder: 💻 libx264 (CPU)")
         print(f"{'='*60}\n")
         
+        render_opts = {
+            'fit_mode': fit_mode,
+            'effect_style': effect_style,
+            'effect_intensity': effect_intensity,
+            'tempo': (beat_info or {}).get('tempo'),
+        }
+        if effect_style and effect_style != 'clean':
+            print(f"   Effects: 🎨 {effect_style} (intensity {effect_intensity:.2f}) | Frame fit: {fit_mode}")
+        else:
+            print(f"   Frame fit: {fit_mode}")
+
         clip_args = []
         for i, final_duration in enumerate(segment_durations):
             # Duration comes from the absolute frame-locked cut timeline.
@@ -619,7 +652,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             video_file = planned_clip.get('video_file') if planned_clip else random.choice(video_files)
             clip_args.append((i, video_file, final_duration,
                             target_size, use_nvenc, gpu_encoder, session_temp_dir, fps,
-                            planned_clip))
+                            planned_clip, render_opts))
         
         clip_files = [None] * len(clip_args)
         clip_timings: List[float] = []
