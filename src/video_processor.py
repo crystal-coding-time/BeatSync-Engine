@@ -50,6 +50,7 @@ from ffmpeg_processing import (
 )
 from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_clip_plan
 from effects import build_effect_filters
+from text_overlay import plan_text_overlays, render_text_png, overlay_fade_times
 
 # Import mode modules
 from auto_mode import analyze_beats_auto
@@ -344,6 +345,7 @@ def create_clip_parallel(args):
             'gpu_encoder': gpu_encoder,
             'fit_mode': opts.get('fit_mode', 'crop'),
             'extra_filters': effect_filters,
+            'text_overlay': (opts.get('text_plan') or {}).get(i),
         }
 
         success = extract_clip_segment_ffmpeg(**extract_kwargs)
@@ -367,7 +369,9 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                       lossless_mode: bool = False, use_gpu: bool = False,
                       gpu_encoder: str = 'h264_nvenc', fps: float = None,
                       fit_mode: str = 'crop', effect_style: str = 'clean',
-                      effect_intensity: float = 0.7) -> str:
+                      effect_intensity: float = 0.7,
+                      text_entries: List[str] = None, text_position: str = 'bottom',
+                      text_scale: float = 1.0) -> str:
     """
     Creates a music video with video clips cut to detected beats.
     
@@ -650,11 +654,29 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             print(f"   Encoder: 💻 libx264 (CPU)")
         print(f"{'='*60}\n")
         
+        text_plan = {}
+        if text_entries:
+            windows = plan_text_overlays(text_entries, segment_durations, planned_clip_sequence)
+            png_cache = {}
+            for seg_idx, (text, offset, window_dur) in windows.items():
+                png = png_cache.get(text)
+                if png is None:
+                    png_path = os.path.join(session_temp_dir, f"text_{len(png_cache):03d}.png")
+                    png = render_text_png(text, target_size, png_path,
+                                          position=text_position, scale=text_scale)
+                    png_cache[text] = png
+                if png:
+                    fade_in_duration, fade_out_start = overlay_fade_times(offset, window_dur)
+                    text_plan[seg_idx] = (png, fade_in_duration, fade_out_start)
+            if text_plan:
+                print(f"   Text overlays: 📝 {len(png_cache)} entries across {len(text_plan)} segments")
+
         render_opts = {
             'fit_mode': fit_mode,
             'effect_style': effect_style,
             'effect_intensity': effect_intensity,
             'tempo': (beat_info or {}).get('tempo'),
+            'text_plan': text_plan,
         }
         if effect_style and effect_style != 'clean':
             print(f"   Effects: 🎨 {effect_style} (intensity {effect_intensity:.2f}) | Frame fit: {fit_mode}")

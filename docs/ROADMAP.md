@@ -32,12 +32,13 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
 - Deterministic (seeded per segment); ffmpeg gotcha encoded in code comments: `crop` can't animate w/h → zoom uses `zoompan`
 - Not included by design: speed ramps (`setpts` would break the zero-drift frame-locked timeline); effects don't apply in ProRes precise mode (kept pristine for external editing)
 
-## Phase 3 — text overlay system ⬜
-- General-purpose text over the video at planned moments (motivational quotes are one use case; captions, lyrics snippets, watermarks, titles are others)
-- Text pool: user-editable file (e.g. `input/text.txt`, one entry per line) and/or direct GUI input
-- Placement driven by the section planner: e.g. one entry per section, fade in/out on beat boundaries, avoid drops where fast cuts fight legibility
-- `drawtext` with macOS system fonts (configurable font/size/position/color), burned per-segment so fast concat assembly is preserved
-- GUI: enable toggle, text source, style options
+## Phase 3 — text overlay system ✅ (2026-07-06)
+- General-purpose text over the video at planned moments (quotes, captions, titles — any text), entered one-per-line in the GUI
+- `src/text_overlay.py`: entries spread chronologically, anchored on the longest non-drop segment of each timeline bin, spanning consecutive segments until readable (~3s), alpha fades aligned to cuts
+- Rendering: **Pillow → transparent PNG → ffmpeg `overlay`** (core filter), NOT drawtext — Homebrew ffmpeg ships without libfreetype/libass. Bonus: real word wrapping, stroke + shadow, any TTF (auto-detects Arial Bold on macOS; `BEATSYNC_FONT` overrides)
+- GUI: text entries box, position (lower third/center/top), size slider
+- Gotcha encoded in code: ffmpeg `fade` rejects negative `st` — continuation segments omit the fade-in filter instead
+- Later ideas: per-entry timing control, color/font options in GUI, text file import
 
 ## Phase 4 — transitions & polish ⬜
 - Opt-in `xfade` crossfades/wipes on low-energy boundaries (requires re-encode assembly path; hard cuts stay the fast default)

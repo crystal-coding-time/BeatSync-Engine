@@ -56,6 +56,10 @@ The video dropzone stays empty and always accepts drops; loaded files accumulate
 
 Effects apply to the H.264/HEVC modes only; ProRes precise mode stays untouched for external editing.
 
+## Text overlays
+
+Enter lines in the "Text entries" box (one entry per line — quotes, captions, titles, anything). Entries are spread across the video chronologically, shown on calmer segments (never anchored on a drop cut), kept on screen ~3 seconds spanning cuts, and faded in/out. Position (lower third/center/top) and size are configurable. Text renders via Pillow with Arial Bold by default; set `BEATSYNC_FONT=/path/to/font.ttf` to change the font. Like effects, text applies to H.264/HEVC modes only.
+
 ## Docs
 
 - `docs/ROADMAP.md` — feature roadmap and status. **Keep it and this README updated when features land.**

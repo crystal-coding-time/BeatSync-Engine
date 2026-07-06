@@ -358,6 +358,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        custom_fps: float, session_state: dict,
                        fit_mode: str = 'crop', effect_style: str = 'clean',
                        effect_intensity: float = 0.7,
+                       text_entries: str = '', text_position: str = 'bottom',
+                       text_scale: float = 1.0,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None) -> StatusResult:
     total_started = time.perf_counter()
@@ -454,7 +456,9 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             beat_info=beat_info, lossless_mode=is_prores,
             use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
             fit_mode=fit_mode, effect_style=effect_style,
-            effect_intensity=effect_intensity
+            effect_intensity=effect_intensity,
+            text_entries=[line.strip() for line in (text_entries or '').splitlines() if line.strip()],
+            text_position=text_position, text_scale=text_scale
         )
 
         # Move to output folder
@@ -520,7 +524,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
                  custom_fps: float, fit_mode: str, effect_style: str,
-                 effect_intensity: float, session_state: dict) -> Iterator[StatusResult]:
+                 effect_intensity: float, text_entries: str, text_position: str,
+                 text_scale: float, session_state: dict) -> Iterator[StatusResult]:
     status_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
     initial_status = _stage_status(1)
@@ -545,6 +550,9 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     fit_mode=fit_mode,
                     effect_style=effect_style,
                     effect_intensity=effect_intensity,
+                    text_entries=text_entries,
+                    text_position=text_position,
+                    text_scale=text_scale,
                     session_state=session_state,
                     progress_callback=progress_callback,
                     console_logger=console_logger,
@@ -707,6 +715,18 @@ def create_ui() -> gr.Blocks:
                                                        label='Effect intensity')
 
                 with gr.Group():
+                    gr.Markdown('### 📝 Text Overlays')
+                    text_entries_input = gr.Textbox(
+                        label='Text entries (one per line)', lines=4, value='',
+                        placeholder='Leave empty for no text.\nEach line appears once, spread across the video.',
+                        info='Quotes, captions, titles — any text. Shown on calmer segments, fading on beat cuts.')
+                    with gr.Row():
+                        text_position_input = gr.Radio(
+                            choices=[('Lower third', 'bottom'), ('Center', 'center'), ('Top', 'top')],
+                            value='bottom', label='Position')
+                        text_scale_input = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label='Text size')
+
+                with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
                     if NVENC_AVAILABLE:
                         processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
@@ -732,6 +752,7 @@ def create_ui() -> gr.Blocks:
                 audio_input, video_state,
                 output_filename, processing_mode, custom_fps,
                 fit_mode_input, effect_style_input, effect_intensity_input,
+                text_entries_input, text_position_input, text_scale_input,
                 session_state
             ],
             outputs=[video_output, status_output, session_state],

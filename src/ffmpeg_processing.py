@@ -193,7 +193,7 @@ def get_fit_filters(target_size: Tuple[int, int], fit_mode: str) -> List[str]:
 
 
 def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
-                         post_filters: List[str]) -> str:
+                         post_filters: List[str], out_label: str = 'outv') -> str:
     """Filter graph for blur fit: blurred fill in back, undistorted fit in front."""
     w, h = target_size
     pre = ",".join(pre_filters)
@@ -202,7 +202,27 @@ def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
         f"[0:v]{pre},split=2[bg][fg];"
         f"[bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},gblur=sigma=16[bgb];"
         f"[fg]scale={w}:{h}:force_original_aspect_ratio=decrease[fgs];"
-        f"[bgb][fgs]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,setsar=1{post}[outv]"
+        f"[bgb][fgs]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,setsar=1{post}[{out_label}]"
+    )
+
+
+def build_text_overlay_graph(base_graph: str, fade_in_duration: float,
+                             fade_out_start: float, fade: float = 0.35) -> str:
+    """Composite input 1 (a looped transparent PNG) over the [basev] stream.
+
+    Text is rendered by Pillow (see text_overlay.py) because this ffmpeg
+    build has no drawtext; overlay/fade/format are core filters. A zero
+    fade-in duration means the fade completed in an earlier segment of the
+    text window, so the filter is omitted (fade rejects st<0 and d=0).
+    """
+    txt_chain = ["format=rgba"]
+    if fade_in_duration > 0.001:
+        txt_chain.append(f"fade=t=in:st=0:d={fade_in_duration:.4f}:alpha=1")
+    txt_chain.append(f"fade=t=out:st={fade_out_start:.4f}:d={fade:.4f}:alpha=1")
+    return (
+        f"{base_graph};"
+        f"[1:v]{','.join(txt_chain)}[txt];"
+        f"[basev][txt]overlay=0:0[outv]"
     )
 
 
@@ -394,7 +414,8 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                                 use_nvenc: bool,
                                 gpu_encoder: str = 'h264_nvenc',
                                 fit_mode: str = 'crop',
-                                extra_filters: List[str] = None) -> bool:
+                                extra_filters: List[str] = None,
+                                text_overlay: Tuple[str, float, float] = None) -> bool:
     """
     Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
     
@@ -412,15 +433,27 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         pre_filters = [f"trim=duration={exact_source_duration}", "setpts=PTS-STARTPTS", f"fps={fps}"]
         post_filters = list(extra_filters or [])
 
+        # text_overlay: (png_path, fade_in_start, fade_out_start) in this
+        # segment's local clock — see text_overlay.overlay_fade_times.
         use_blur_graph = bool(target_size) and fit_mode == 'blur'
+        use_graph = use_blur_graph or bool(text_overlay)
+        filter_graph = None
+        filter_complex = None
+        base_label = 'basev' if text_overlay else 'outv'
         if use_blur_graph:
-            filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters)
+            filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters,
+                                                out_label=base_label)
         else:
             filters = list(pre_filters)
             if target_size:
                 filters.extend(get_fit_filters(target_size, fit_mode))
             filters.extend(post_filters)
             filter_complex = ",".join(filters)
+            if use_graph:
+                filter_graph = f"[0:v]{filter_complex}[{base_label}]"
+        if text_overlay:
+            _, fade_in_duration, fade_out_start = text_overlay
+            filter_graph = build_text_overlay_graph(filter_graph, fade_in_duration, fade_out_start)
         
         # Build FFmpeg command
         cmd = [FFMPEG_PATH]
@@ -441,9 +474,12 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
             '-t', str(exact_source_duration),
             '-i', video_file
         ])
-        
+
+        if text_overlay:
+            cmd.extend(['-loop', '1', '-i', text_overlay[0]])
+
         # Video filters
-        if use_blur_graph:
+        if use_graph:
             cmd.extend(['-filter_complex', filter_graph, '-map', '[outv]'])
         else:
             cmd.extend(['-vf', filter_complex])
