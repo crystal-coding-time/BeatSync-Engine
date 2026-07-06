@@ -50,7 +50,7 @@ The video dropzone stays empty and always accepts drops; loaded files accumulate
 
 ## Style controls
 
-- **Frame fit** — how sources with a different aspect ratio fill the frame: Smart crop (fill and center-crop, default), Blurred background (undistorted over a blurred fill), Letterbox, or Stretch (legacy). Output resolution follows the first video file.
+- **Frame fit** — how sources with a different aspect ratio fill the frame: Smart crop (fill and center-crop, default), Blurred background (undistorted over a blurred fill), Letterbox, or Stretch (legacy). Output resolution/aspect follows the highest-resolution source (by pixel area).
 - **Effect style** — Clean (no effects), AMV, or Hype. Effects are beat-aware: zoom punches and flashes on drop cuts, saturation pulsing at the song's tempo, plus shake/vignette/grain in Hype. Same inputs always render the same video.
 - **Effect intensity** — scales all effect strengths.
 

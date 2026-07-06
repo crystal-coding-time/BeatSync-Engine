@@ -191,6 +191,22 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def get_max_resolution(video_files: VideoList) -> Tuple[int, int]:
+    """Target resolution = the highest-resolution source (by pixel area).
+
+    Its aspect ratio wins too; other sources adapt via the frame-fit mode.
+    Dimensions are rounded down to even for yuv420p encoders.
+    """
+    best = (0, 0)
+    for f in dict.fromkeys(video_files):
+        width, height = get_video_resolution(f)
+        if width * height > best[0] * best[1]:
+            best = (width, height)
+    if best == (0, 0):
+        best = (1920, 1080)
+    return (max(2, best[0] // 2 * 2), max(2, best[1] // 2 * 2))
+
+
 def get_video_files(directory : str) -> VideoList:
     video_extensions = ['.mp4', '.MP4', '.mkv', '.MKV', '.mov', '.MOV',
                         '.webm', '.WEBM', '.m4v', '.M4V', '.avi', '.AVI',
@@ -618,7 +634,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     # STANDARD MODE - Direct parallel processing (NO BATCHES)
     else:
         # Get target resolution from first video
-        target_size = get_video_resolution(video_files[0])
+        target_size = get_max_resolution(video_files)
         render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
         print(f"🎞️ Target resolution: {target_size[0]}x{target_size[1]}")
         
