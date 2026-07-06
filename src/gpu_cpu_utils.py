@@ -6,7 +6,7 @@ import os
 
 import numpy as np
 
-from logger import get_gpu_info, check_nvenc, setup_environment
+from logger import get_gpu_info, check_nvenc, check_videotoolbox, setup_environment
 
 
 CPU_COUNT = multiprocessing.cpu_count()
@@ -44,7 +44,19 @@ else:
     cp = None
 
 NVENC_AVAILABLE = check_nvenc()
+VIDEOTOOLBOX_AVAILABLE = check_videotoolbox()
 USE_GPU = False
+
+HW_ENCODERS = ['h264_nvenc', 'hevc_nvenc', 'h264_videotoolbox', 'hevc_videotoolbox']
+
+
+def hw_encoder_available(encoder: str) -> bool:
+    """Return whether the given hardware encoder is usable on this machine."""
+    if 'nvenc' in encoder:
+        return NVENC_AVAILABLE
+    if 'videotoolbox' in encoder:
+        return VIDEOTOOLBOX_AVAILABLE
+    return False
 
 
 def is_gpu_enabled() -> bool:

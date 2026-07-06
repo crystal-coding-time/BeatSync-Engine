@@ -28,6 +28,8 @@ from gpu_cpu_utils import (
     GPU_INFO as gpu_info,
     GPU_AVAILABLE,
     NVENC_AVAILABLE,
+    VIDEOTOOLBOX_AVAILABLE,
+    hw_encoder_available,
     set_gpu_mode,
 )
 from paths import (
@@ -123,8 +125,10 @@ if __name__ == '__main__':
 if __name__ == '__main__':
     if NVENC_AVAILABLE:
         print(f"🎬 NVIDIA NVENC: AVAILABLE - Hardware video encoding enabled")
+    elif VIDEOTOOLBOX_AVAILABLE:
+        print(f"🎬 Apple VideoToolbox: AVAILABLE - Hardware video encoding enabled")
     else:
-        print(f"⚠️  NVIDIA NVENC: NOT AVAILABLE - Using CPU encoding only")
+        print(f"⚠️  Hardware encoding: NOT AVAILABLE - Using CPU encoding only")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -172,9 +176,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--gpu-encoder',
         type=str,
-        choices=['h264_nvenc', 'hevc_nvenc', 'none'],
-        default='h264_nvenc',
-        help='GPU encoder: h264_nvenc (H.264), hevc_nvenc (H.265), none (CPU) (default: h264_nvenc)'
+        choices=['h264_nvenc', 'hevc_nvenc', 'h264_videotoolbox', 'hevc_videotoolbox', 'none'],
+        default='h264_nvenc' if NVENC_AVAILABLE else ('h264_videotoolbox' if VIDEOTOOLBOX_AVAILABLE else 'none'),
+        help='Hardware encoder: h264/hevc_nvenc (NVIDIA), h264/hevc_videotoolbox (Apple), none (CPU)'
     )
     parser.add_argument(
         '--fps',
@@ -187,7 +191,9 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def get_video_files(directory : str) -> VideoList:
-    video_extensions = ['.mp4', '.MP4', '.mkv', '.MKV']
+    video_extensions = ['.mp4', '.MP4', '.mkv', '.MKV', '.mov', '.MOV',
+                        '.webm', '.WEBM', '.m4v', '.M4V', '.avi', '.AVI',
+                        '.gif', '.GIF']
     video_files = []
 
     for ext in video_extensions:
@@ -389,7 +395,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     print(f"📁 Processing directory: {session_temp_dir}")
 
     # Determine processing mode
-    use_nvenc = use_gpu and NVENC_AVAILABLE and not lossless_mode and gpu_encoder != 'none'
+    use_nvenc = (not lossless_mode) and gpu_encoder != 'none' and hw_encoder_available(gpu_encoder)
     requested_workers = max_workers
     max_workers = _effective_clip_workers(max_workers, use_nvenc)
     render_info = beat_info.setdefault("render_info", {}) if isinstance(beat_info, dict) else {}
@@ -600,7 +606,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         print(f"   Parallel workers: {max_workers}")
         print(f"   Frame-accurate: ENABLED")
         if use_nvenc:
-            print(f"   Encoder: ⚡ NVIDIA {gpu_encoder.upper()} (GPU-accelerated)")
+            vendor = 'Apple' if 'videotoolbox' in gpu_encoder else 'NVIDIA'
+            print(f"   Encoder: ⚡ {vendor} {gpu_encoder.upper()} (GPU-accelerated)")
         else:
             print(f"   Encoder: 💻 libx264 (CPU)")
         print(f"{'='*60}\n")
@@ -748,7 +755,7 @@ def main() -> None:
     print(f"\n{'='*60}")
     print(f"🎵 BEATSYNC ENGINE - AUTO MODE")
     print(f"   Audio Analysis: {'⚡ GPU' if args.gpu else '💻 CPU'}")
-    if args.gpu and NVENC_AVAILABLE and not args.lossless:
+    if hw_encoder_available(args.gpu_encoder) and not args.lossless:
         print(f"   Video Encoding: ⚡ {args.gpu_encoder.upper()}")
     else:
         print(f"   Video Encoding: 💻 CPU")

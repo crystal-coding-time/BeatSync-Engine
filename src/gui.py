@@ -93,6 +93,9 @@ from gpu_cpu_utils import (
     GPU_INFO,
     GPU_AVAILABLE,
     NVENC_AVAILABLE,
+    VIDEOTOOLBOX_AVAILABLE,
+    HW_ENCODERS,
+    hw_encoder_available,
     set_gpu_mode,
 )
 from paths import (
@@ -407,7 +410,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         
         # Determine processing mode
         is_prores = processing_mode == 'prores_proxy'
-        use_nvenc = (processing_mode in ['h264_nvenc', 'hevc_nvenc']) and NVENC_AVAILABLE
+        use_nvenc = (processing_mode in HW_ENCODERS) and hw_encoder_available(processing_mode)
         gpu_encoder = processing_mode if use_nvenc else 'none'
         
         python_str = "Portable" if USING_PORTABLE_PYTHON else "System"
@@ -461,6 +464,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             preview_cmd = [FFMPEG_PATH]
             if NVENC_AVAILABLE:
                 preview_cmd.extend(['-hwaccel', 'cuda', '-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23'])
+            elif VIDEOTOOLBOX_AVAILABLE:
+                preview_cmd.extend(['-hwaccel', 'auto', '-c:v', 'h264_videotoolbox', '-q:v', '55', '-allow_sw', '1'])
             else:
                 preview_cmd.extend(['-hwaccel', 'auto', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
             preview_cmd.extend(['-i', output_path, '-pix_fmt', 'yuv420p', '-y', preview_path])
@@ -621,7 +626,7 @@ def create_ui() -> gr.Blocks:
             with gr.Column(scale=1):
                 gr.Markdown('### 📁 Input Files')
                 audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
-                video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv'], type='filepath', elem_id='video-files-input')
+                video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv', '.mov', '.webm', '.m4v', '.avi', '.gif'], type='filepath', elem_id='video-files-input')
 
                 with gr.Group():
                     gr.Markdown('### ⚙️ Video Settings')
@@ -631,6 +636,8 @@ def create_ui() -> gr.Blocks:
                     gr.Markdown(f'### 🎬 Processing Mode')
                     if NVENC_AVAILABLE:
                         processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
+                    elif VIDEOTOOLBOX_AVAILABLE:
+                        processing_mode = gr.Radio(choices=[('Apple VideoToolbox H.264', 'h264_videotoolbox'), ('Apple VideoToolbox HEVC (H.265)', 'hevc_videotoolbox'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_videotoolbox', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_videotoolbox())
                     else:
                         processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
                 

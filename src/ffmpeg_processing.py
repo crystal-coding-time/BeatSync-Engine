@@ -12,6 +12,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+import math
 import subprocess
 import time
 import json
@@ -136,6 +137,34 @@ def get_nvenc_quality_args(gpu_encoder: str, include_pix_fmt: bool = True) -> Li
     return args
 
 
+def get_videotoolbox_quality_args(gpu_encoder: str, include_pix_fmt: bool = True) -> List[str]:
+    """Return high-quality Apple VideoToolbox settings for H.264/HEVC exports."""
+    args = [
+        '-c:v', gpu_encoder,
+        '-q:v', '65',
+        '-allow_sw', '1',
+    ]
+    if gpu_encoder == 'hevc_videotoolbox':
+        args.extend(['-tag:v', 'hvc1'])
+    if include_pix_fmt:
+        args.extend(['-pix_fmt', 'yuv420p'])
+    return args
+
+
+def get_gpu_quality_args(gpu_encoder: str, include_pix_fmt: bool = True) -> List[str]:
+    """Return settings for whichever hardware encoder was selected."""
+    if 'videotoolbox' in gpu_encoder:
+        return get_videotoolbox_quality_args(gpu_encoder, include_pix_fmt)
+    return get_nvenc_quality_args(gpu_encoder, include_pix_fmt)
+
+
+def get_hwaccel_args(use_hw_encoder: bool, gpu_encoder: str) -> List[str]:
+    """CUDA decode assist only applies to NVENC; everything else probes safely."""
+    if use_hw_encoder and 'nvenc' in gpu_encoder:
+        return ['-hwaccel', 'cuda']
+    return ['-hwaccel', 'auto']
+
+
 def get_cpu_h264_quality_args(include_pix_fmt: bool = True) -> List[str]:
     """Return lossless CPU H.264 settings."""
     args = [
@@ -147,6 +176,35 @@ def get_cpu_h264_quality_args(include_pix_fmt: bool = True) -> List[str]:
         args.extend(['-pix_fmt', 'yuv420p'])
     args.extend(['-threads', str(MAX_THREADS)])
     return args
+
+
+_SOURCE_DURATION_CACHE: dict = {}
+
+
+def get_cached_video_duration(video_file: str) -> float:
+    """Duration lookup with a per-run cache (segments hit the same sources repeatedly)."""
+    cached = _SOURCE_DURATION_CACHE.get(video_file)
+    if cached is None:
+        cached = get_video_duration(video_file)
+        _SOURCE_DURATION_CACHE[video_file] = cached
+    return cached
+
+
+def get_loop_input_args(video_file: str, start_time: float, duration: float) -> Tuple[List[str], float]:
+    """Loop args for sources shorter than the requested window (GIFs, short clips).
+
+    Returns (['-stream_loop', N] or [], adjusted_start_time). With looping the
+    demuxer presents the source repeated N+1 times, so seek/trim stay frame-accurate.
+    """
+    src_duration = get_cached_video_duration(video_file)
+    if src_duration <= 0.05:
+        return [], start_time
+    if start_time + duration <= src_duration - 0.02:
+        return [], start_time
+    if start_time >= src_duration:
+        start_time = start_time % src_duration
+    loops = max(1, math.ceil((start_time + duration) / src_duration))
+    return ['-stream_loop', str(loops)], start_time
 
 
 def get_video_duration(video_file: str) -> float:
@@ -326,11 +384,13 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         cmd = [FFMPEG_PATH]
         
         # Hardware acceleration
-        if use_nvenc:
-            cmd.extend(['-hwaccel', 'cuda'])
-        else:
-            cmd.extend(['-hwaccel', 'auto'])
-        
+        cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
+
+        # Loop sources shorter than the segment (GIFs, short clips) so the
+        # frame count stays exact instead of drifting.
+        loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
+        cmd.extend(loop_args)
+
         # ✅ FRAME-ACCURATE INPUT SEEKING
         # Use -ss BEFORE -i for faster seeking (keyframe-based)
         # Then use -ss AFTER -i for frame-accurate positioning
@@ -348,7 +408,7 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         
         # Video encoding
         if use_nvenc:
-            cmd.extend(get_nvenc_quality_args(gpu_encoder, include_pix_fmt=True))
+            cmd.extend(get_gpu_quality_args(gpu_encoder, include_pix_fmt=True))
         else:
             cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
         
@@ -398,6 +458,7 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
     if video_duration <= 0:
         raise Exception(f"Invalid ProRes source duration: {video_file}")
 
+    loop_args: List[str] = []
     if video_duration >= duration:
         max_start = max(0.0, video_duration - duration)
         if start_time is None:
@@ -405,8 +466,10 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
         else:
             start_time = max(0.0, min(float(start_time), max_start))
     else:
+        # Source is shorter than the segment: loop it so precise mode keeps
+        # its exact frame count instead of emitting a short clip.
         start_time = 0.0
-        duration = video_duration
+        loop_args, start_time = get_loop_input_args(video_file, start_time, duration)
 
     frame_count = max(1, seconds_to_frame_count(duration, fps))
     exact_duration = frame_count_to_seconds(frame_count, fps)
@@ -417,6 +480,7 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
 
     def build_cmd(fast_seek: bool) -> List[str]:
         cmd = [FFMPEG_PATH, '-nostdin', '-hide_banner']
+        cmd.extend(loop_args)
         if fast_seek:
             # ProRes proxy is intra-frame, so input-side seeking remains accurate
             # while being much faster for long sources.
@@ -608,11 +672,7 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
             print(f"   🔗 Concatenating and encoding {len(video_files)} segments...")
             encode_started = time.perf_counter()
             cmd = [FFMPEG_PATH]
-            
-            if use_nvenc:
-                cmd.extend(['-hwaccel', 'cuda'])
-            else:
-                cmd.extend(['-hwaccel', 'auto'])
+            cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
             
             cmd.extend([
                 '-f', 'concat',
@@ -625,7 +685,7 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 cmd.extend(['-map', '0:v', '-map', '1:a'])
             
             if use_nvenc:
-                cmd.extend(get_nvenc_quality_args(gpu_encoder, include_pix_fmt=True))
+                cmd.extend(get_gpu_quality_args(gpu_encoder, include_pix_fmt=True))
             else:
                 cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
             

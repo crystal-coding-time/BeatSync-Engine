@@ -134,14 +134,26 @@ def get_gpu_info() -> Dict:
         
     return info
 
+_FFMPEG_ENCODERS_CACHE = None
+
+def _ffmpeg_encoders() -> str:
+    global _FFMPEG_ENCODERS_CACHE
+    if _FFMPEG_ENCODERS_CACHE is None:
+        try:
+            cmd = [FFMPEG_EXE if FFMPEG_FOUND else 'ffmpeg', '-encoders']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            _FFMPEG_ENCODERS_CACHE = result.stdout
+        except Exception:
+            _FFMPEG_ENCODERS_CACHE = ''
+    return _FFMPEG_ENCODERS_CACHE
+
 def check_nvenc() -> bool:
     """Check if FFmpeg supports NVIDIA hardware encoding (NVENC)."""
-    try:
-        cmd = [FFMPEG_EXE if FFMPEG_FOUND else 'ffmpeg', '-encoders']
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        return 'h264_nvenc' in result.stdout
-    except Exception:
-        return False
+    return 'h264_nvenc' in _ffmpeg_encoders()
+
+def check_videotoolbox() -> bool:
+    """Check if FFmpeg supports Apple VideoToolbox hardware encoding."""
+    return 'h264_videotoolbox' in _ffmpeg_encoders()
 
 # ============================================================================
 # LOGGING & OUTPUT
