@@ -629,22 +629,56 @@ def create_ui() -> gr.Blocks:
                 # Include uppercase variants: Gradio's drag-drop filter is case-sensitive
                 # (gradio#10746), unlike its file picker.
                 video_file_types = [t for ext in ['.mp4', '.mkv', '.mov', '.webm', '.m4v', '.avi', '.gif'] for t in (ext, ext.upper())]
-                video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=video_file_types, type='filepath', elem_id='video-files-input')
+
                 # Gradio's File component ignores drops once it holds files
-                # (gradio#10325), so appending goes through this always-empty zone.
-                video_add_input = gr.File(label='➕ Drop here to add more videos', file_count='multiple', file_types=video_file_types, type='filepath', elem_id='video-files-add-input', height=90)
+                # (gradio#10325), so the dropzone never keeps its value: uploads
+                # accumulate in video_state and render in the list below, which
+                # keeps the zone permanently droppable.
+                video_dropzone = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=video_file_types, type='filepath', elem_id='video-files-input', height=110)
+                video_state = gr.State([])
+                video_list = gr.CheckboxGroup(choices=[], value=[], label='🎬 Loaded videos (0)', info='Tick files to remove them', visible=False)
+                with gr.Row():
+                    remove_videos_btn = gr.Button('🗑 Remove selected', size='sm', visible=False)
+                    clear_videos_btn = gr.Button('♻️ Clear all', size='sm', visible=False)
 
-                def _append_videos(new_files, current_files):
-                    merged = list(current_files) if current_files else []
+                def _video_list_updates(files):
+                    shown = len(files) > 0
+                    return (
+                        gr.update(choices=[(os.path.basename(f), f) for f in files],
+                                  value=[], label=f'🎬 Loaded videos ({len(files)})', visible=shown),
+                        gr.update(visible=shown),
+                        gr.update(visible=shown),
+                    )
+
+                def _add_videos(new_files, files):
+                    files = list(files or [])
                     for f in (new_files or []):
-                        if f not in merged:
-                            merged.append(f)
-                    return merged, None
+                        if f not in files:
+                            files.append(f)
+                    return (files, None, *_video_list_updates(files))
 
-                video_add_input.upload(
-                    _append_videos,
-                    inputs=[video_add_input, video_input],
-                    outputs=[video_input, video_add_input],
+                def _remove_videos(selected, files):
+                    selected = set(selected or [])
+                    files = [f for f in (files or []) if f not in selected]
+                    return (files, *_video_list_updates(files))
+
+                def _clear_videos():
+                    return ([], *_video_list_updates([]))
+
+                video_dropzone.upload(
+                    _add_videos,
+                    inputs=[video_dropzone, video_state],
+                    outputs=[video_state, video_dropzone, video_list, remove_videos_btn, clear_videos_btn],
+                )
+                remove_videos_btn.click(
+                    _remove_videos,
+                    inputs=[video_list, video_state],
+                    outputs=[video_state, video_list, remove_videos_btn, clear_videos_btn],
+                )
+                clear_videos_btn.click(
+                    _clear_videos,
+                    inputs=None,
+                    outputs=[video_state, video_list, remove_videos_btn, clear_videos_btn],
                 )
 
                 with gr.Group():
@@ -674,7 +708,7 @@ def create_ui() -> gr.Blocks:
         process_btn.click(
             fn=process_video,
             inputs=[
-                audio_input, video_input,
+                audio_input, video_state,
                 output_filename, processing_mode, custom_fps,
                 session_state
             ],

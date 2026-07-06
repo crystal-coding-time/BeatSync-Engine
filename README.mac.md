@@ -46,7 +46,7 @@ Useful env vars:
 
 Audio: `.mp3`, `.wav`, `.flac`. Video sources: `.mp4`, `.mkv`, `.mov`, `.webm`, `.m4v`, `.avi`, `.gif` (upper- or lowercase). Sources shorter than a cut segment (e.g. GIFs) are looped automatically to keep the timeline frame-accurate.
 
-UI quirk: Gradio's file input ignores drag-drops once it already holds files (gradio#10325), so use the "➕ Drop here to add more videos" zone beneath it to append — it merges into the main list and clears itself. After the app is restarted with code changes, refresh the browser tab: the accepted-file-type filter is baked in at page load.
+The video dropzone stays empty and always accepts drops; loaded files accumulate in the "Loaded videos" list below it, where they can be removed individually or cleared. (This sidesteps gradio#10325 — the stock File component ignores drops once it holds files.) After the app is restarted with code changes, refresh the browser tab: the accepted-file-type filter is baked in at page load.
 
 ## Docs
 
