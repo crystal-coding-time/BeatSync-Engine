@@ -20,7 +20,10 @@ if SRC_DIR not in sys.path:
 PORTABLE_CUDA_DIR = os.path.join(ROOT_DIR, 'bin', 'CUDA', 'v13.3')
 PORTABLE_PYTHON_DIR = os.path.join(ROOT_DIR, 'bin', 'python-3.13.14-embed-amd64')
 FFMPEG_BIN_DIR = os.path.join(ROOT_DIR, 'bin', 'ffmpeg')
-FFMPEG_EXE = os.path.join(FFMPEG_BIN_DIR, 'ffmpeg.exe')
+FFMPEG_EXE = os.path.join(FFMPEG_BIN_DIR, 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+if not os.path.exists(FFMPEG_EXE):
+    import shutil
+    FFMPEG_EXE = shutil.which('ffmpeg') or FFMPEG_EXE
 
 def _package_installed(name: str) -> bool:
     try:

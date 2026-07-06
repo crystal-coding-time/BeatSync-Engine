@@ -33,7 +33,8 @@ from gpu_cpu_utils import MAX_THREADS
 setup_environment()
 
 # Set up FFPROBE_PATH based on FFMPEG_PATH
-FFPROBE_PATH = FFMPEG_PATH.replace('ffmpeg.exe', 'ffprobe.exe')
+_FFMPEG_DIR, _FFMPEG_NAME = os.path.split(FFMPEG_PATH)
+FFPROBE_PATH = os.path.join(_FFMPEG_DIR, _FFMPEG_NAME.replace('ffmpeg', 'ffprobe'))
 
 
 NVENC_QUALITY_CQ = '1'

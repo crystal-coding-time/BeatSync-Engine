@@ -33,7 +33,19 @@ from PIL import Image
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 BIN_DIR = ROOT_DIR / "bin"
-DEFAULT_LLAMA_DIR = BIN_DIR / "llama-bin-win-vulkan-x64"
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+
+
+def _find_default_llama_dir() -> Path:
+    bundled = BIN_DIR / "llama-bin-win-vulkan-x64"
+    if bundled.exists():
+        return bundled
+    import shutil as _shutil
+    found = _shutil.which("llama-server")
+    return Path(found).resolve().parent if found else bundled
+
+
+DEFAULT_LLAMA_DIR = _find_default_llama_dir()
 DEFAULT_MODEL = BIN_DIR / "models" / "Qwen3VL-2B-Instruct-Q8_0.gguf"
 DEFAULT_MMPROJ = BIN_DIR / "models" / "mmproj-Qwen3VL-2B-Instruct-F16.gguf"
 
@@ -334,9 +346,9 @@ def _is_context_or_memory_error(text: str) -> bool:
 class LlamaPaths:
     def __init__(self, model_path: str | None) -> None:
         self.llama_dir = Path(os.environ.get("BEATSYNC_QWEN_LLAMA_DIR", str(DEFAULT_LLAMA_DIR)))
-        self.server_exe = self.llama_dir / "llama-server.exe"
-        self.mtmd_exe = self.llama_dir / "llama-mtmd-cli.exe"
-        self.list_exe = self.llama_dir / "llama-cli.exe"
+        self.server_exe = self.llama_dir / f"llama-server{EXE_SUFFIX}"
+        self.mtmd_exe = self.llama_dir / f"llama-mtmd-cli{EXE_SUFFIX}"
+        self.list_exe = self.llama_dir / f"llama-cli{EXE_SUFFIX}"
         self.model = self._resolve_model(model_path)
         self.mmproj = self._resolve_mmproj()
 

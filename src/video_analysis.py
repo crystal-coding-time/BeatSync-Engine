@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -37,7 +38,18 @@ ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"
 DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models")
 DEFAULT_QWEN_GGUF_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "Qwen3VL-2B-Instruct-Q8_0.gguf")
 DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
-DEFAULT_LLAMA_CPP_DIR = os.path.join(ROOT_DIR, "bin", "llama-bin-win-vulkan-x64")
+_BUNDLED_LLAMA_CPP_DIR = os.path.join(ROOT_DIR, "bin", "llama-bin-win-vulkan-x64")
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+
+
+def _find_default_llama_dir() -> str:
+    if os.path.isdir(_BUNDLED_LLAMA_CPP_DIR):
+        return _BUNDLED_LLAMA_CPP_DIR
+    found = shutil.which("llama-server")
+    return os.path.dirname(os.path.realpath(found)) if found else _BUNDLED_LLAMA_CPP_DIR
+
+
+DEFAULT_LLAMA_CPP_DIR = _find_default_llama_dir()
 VIDEO_ANALYSIS_CACHE_DIR = os.path.join(ROOT_DIR, "input", "video_analysis_cache")
 _LLAMA_VERSION_TOKENS: Dict[str, str] = {}
 
@@ -91,8 +103,8 @@ def _resolve_qwen_backend_paths(qwen_model_path: str | None) -> Dict[str, str]:
 
     return {
         "llama_dir": os.path.abspath(llama_dir),
-        "server": os.path.abspath(os.path.join(llama_dir, "llama-server.exe")),
-        "mtmd": os.path.abspath(os.path.join(llama_dir, "llama-mtmd-cli.exe")),
+        "server": os.path.abspath(os.path.join(llama_dir, f"llama-server{EXE_SUFFIX}")),
+        "mtmd": os.path.abspath(os.path.join(llama_dir, f"llama-mtmd-cli{EXE_SUFFIX}")),
         "model": os.path.abspath(model_path),
         "mmproj": os.path.abspath(mmproj_path),
     }
@@ -121,7 +133,7 @@ def _llama_version_token(llama_dir: str) -> str:
     if cached:
         return cached
 
-    mtmd = os.path.join(llama_dir, "llama-mtmd-cli.exe")
+    mtmd = os.path.join(llama_dir, f"llama-mtmd-cli{EXE_SUFFIX}")
     token = _path_signature_token(mtmd)
     if os.path.exists(mtmd):
         env = os.environ.copy()
