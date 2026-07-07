@@ -83,7 +83,7 @@ import socket
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
 
 # Import FFmpeg processing module
-from ffmpeg_processing import get_video_fps, FFMPEG_PATH
+from ffmpeg_processing import get_video_fps, get_video_resolution, FFMPEG_PATH
 
 # Shared runtime settings
 from gpu_cpu_utils import (
@@ -141,14 +141,54 @@ def _stage_status(stage_number: int) -> str:
     return f"Stage {stage_number} is processing. Please wait."
 
 
-class QuietConsole:
-    """Discard legacy verbose prints while the Gradio worker runs."""
+class RenderLogConsole:
+    """Capture legacy verbose prints to a log file while the Gradio worker runs.
+
+    The pipeline's diagnostics (including FFmpeg stderr on failures) used to be
+    discarded entirely, leaving "N clip(s) failed" with no way to see why. Now
+    everything lands in a per-run render log the error message can point at.
+    """
+
+    def __init__(self, log_dir: str, prefix: str = 'render'):
+        self.log_path = os.path.join(
+            log_dir, f"{prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        self._file = None
+        self._failed = False
+
+    def _ensure_file(self):
+        if self._file is None and not self._failed:
+            try:
+                os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+                self._file = open(self.log_path, 'a', encoding='utf-8', errors='replace')
+            except OSError:
+                self._failed = True
+        return self._file
 
     def write(self, text: str) -> int:
+        f = self._ensure_file()
+        if f is not None:
+            try:
+                f.write(text)
+                f.flush()
+            except OSError:
+                self._failed = True
         return len(text)
 
     def flush(self) -> None:
-        pass
+        if self._file is not None:
+            try:
+                self._file.flush()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        if self._file is not None:
+            try:
+                self._file.close()
+            except OSError:
+                pass
+            self._file = None
 
 
 class StageConsoleLogger:
@@ -424,7 +464,14 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         if custom_fps is not None and custom_fps > 0:
             output_fps = custom_fps
         else:
-            output_fps = get_video_fps(local_video_paths[0])
+            # Follow the fps of the highest-resolution source (same source that
+            # wins the target resolution) — a 10fps GIF that happens to be first
+            # in the list must not drag the whole render down to 10fps.
+            best_path = max(
+                local_video_paths,
+                key=lambda p: (lambda wh: wh[0] * wh[1])(get_video_resolution(p)),
+            )
+            output_fps = get_video_fps(best_path)
             
         # Prepare output paths
         output_folder = get_output_dir()
@@ -469,15 +516,23 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         if is_prores:
             preview_filename = f"{name}_{timestamp}_preview.mp4"
             preview_path = os.path.join(session_dir, preview_filename)
-            preview_cmd = [FFMPEG_PATH]
+            # Only input options (like -hwaccel) may appear before -i; the
+            # encoder settings are output options and must come after it.
+            preview_cmd = [FFMPEG_PATH, '-nostdin', '-hide_banner',
+                           '-hwaccel', 'auto', '-i', output_path]
             if NVENC_AVAILABLE:
-                preview_cmd.extend(['-hwaccel', 'cuda', '-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23'])
+                preview_cmd.extend(['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23'])
             elif VIDEOTOOLBOX_AVAILABLE:
-                preview_cmd.extend(['-hwaccel', 'auto', '-c:v', 'h264_videotoolbox', '-q:v', '55', '-allow_sw', '1'])
+                preview_cmd.extend(['-c:v', 'h264_videotoolbox', '-q:v', '55', '-allow_sw', '1'])
             else:
-                preview_cmd.extend(['-hwaccel', 'auto', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
-            preview_cmd.extend(['-i', output_path, '-pix_fmt', 'yuv420p', '-y', preview_path])
-            subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
+                preview_cmd.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
+            preview_cmd.extend(['-pix_fmt', 'yuv420p', '-y', preview_path])
+            preview_result = subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
+            if (preview_result.returncode != 0 or not os.path.exists(preview_path)
+                    or os.path.getsize(preview_path) == 0):
+                print(f"   ⚠️  Preview transcode failed, showing ProRes file directly: "
+                      f"{(preview_result.stderr or '').strip()[-500:]}")
+                preview_path = output_path
         _stage6_summary(console_logger, beat_info)
 
         # Generate status message based on mode
@@ -530,7 +585,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
     initial_status = _stage_status(1)
     console_logger = StageConsoleLogger(sys.__stdout__)
-    quiet_console = QuietConsole()
+    render_console = RenderLogConsole(get_output_dir())
 
     def progress_callback(message: str) -> None:
         status_queue.put(message)
@@ -540,7 +595,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
 
     def worker() -> None:
         try:
-            with contextlib.redirect_stdout(quiet_console), contextlib.redirect_stderr(quiet_console):
+            with contextlib.redirect_stdout(render_console), contextlib.redirect_stderr(render_console):
                 result = _process_video_impl(
                     audio_file=audio_file,
                     video_files=video_files,
@@ -562,6 +617,10 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
             result = None, f"❌ Error: {e}", session_state
         finally:
             console_logger.finish()
+            render_console.close()
+        # Point failures at the captured pipeline log (FFmpeg stderr etc.).
+        if result[1].startswith('❌') and os.path.exists(render_console.log_path):
+            result = result[0], f"{result[1]}\n📄 Full log: {render_console.log_path}", result[2]
         result_queue.put(result)
         status_queue.put(None)
 

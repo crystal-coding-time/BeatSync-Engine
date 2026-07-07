@@ -182,11 +182,41 @@ def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
 
     placed: List[Tuple[str, float, float]] = []
 
+    def occupied_segments(start: float, end: float) -> Tuple[int, int]:
+        # First/last segment this window occupies, by the same >0.01s overlap
+        # rule the projection loop below uses. (-1, -1) if it touches none.
+        first = last = -1
+        for i in range(len(cut_times) - 1):
+            if min(end, cut_times[i + 1]) - max(start, cut_times[i]) > 0.01:
+                if first < 0:
+                    first = i
+                last = i
+        return first, last
+
     def overlapping(start: float, end: float) -> Optional[Tuple[str, float, float]]:
+        # A segment can only carry one text overlay, so windows clash when
+        # they intersect in time OR merely share a segment.
+        first, last = occupied_segments(start, end)
         for w in placed:
             if min(end, w[2]) - max(start, w[1]) > 0.0:
                 return w
+            w_first, w_last = occupied_segments(w[1], w[2])
+            if first >= 0 and w_first >= 0 and first <= w_last and w_first <= last:
+                return w
         return None
+
+    def push_after(clash: Tuple[str, float, float]) -> float:
+        # Start after the clashing window AND outside the last segment it
+        # occupies, so the retry cannot clash with the same window again.
+        _, last = occupied_segments(clash[1], clash[2])
+        seg_exit = cut_times[min(last + 1, len(cut_times) - 1)] if last >= 0 else clash[2]
+        return max(clash[2] + 0.15, seg_exit)
+
+    def pull_before(clash: Tuple[str, float, float]) -> float:
+        # End before the clashing window AND before the first segment it occupies.
+        first, _ = occupied_segments(clash[1], clash[2])
+        seg_entry = cut_times[first] if first >= 0 else clash[1]
+        return min(clash[1] - 0.15, seg_entry)
 
     # Pinned entries claim their time first; auto entries then flow around them.
     for text, pin in entries:
@@ -196,7 +226,7 @@ def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
         end = min(start + duration_cap, timeline_end)
         clash = overlapping(start, end)
         while clash is not None:
-            start = clash[2] + 0.15
+            start = push_after(clash)
             end = start + duration_cap
             clash = overlapping(start, end) if end <= timeline_end else None
         if end > timeline_end or end - start < 0.8:
@@ -213,8 +243,10 @@ def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
         clash = overlapping(start, end)
         if clash is not None:
             # Try after the clashing window, then before it.
-            after = (clash[2] + 0.15, clash[2] + 0.15 + duration_cap)
-            before = (clash[1] - 0.15 - duration_cap, clash[1] - 0.15)
+            after_start = push_after(clash)
+            after = (after_start, after_start + duration_cap)
+            before_end = pull_before(clash)
+            before = (before_end - duration_cap, before_end)
             if after[1] <= timeline_end and overlapping(*after) is None:
                 start, end = after
             elif before[0] >= timeline_start and overlapping(*before) is None:
@@ -237,9 +269,11 @@ def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
             if local_start >= 0:
                 fade_in_start, fade_in_duration = local_start, FADE_SECONDS
             else:
-                # Fade began in an earlier segment; only the remainder (if
-                # any) plays here. ffmpeg's fade rejects st<0.
-                fade_in_start, fade_in_duration = 0.0, max(0.0, FADE_SECONDS + local_start)
+                # The fade began in an earlier segment. Restarting the
+                # remainder here would drop alpha back to 0 at the cut (a
+                # visible pop), so continuation segments show the text at
+                # full opacity instead; ffmpeg's fade rejects st<0 anyway.
+                fade_in_start, fade_in_duration = 0.0, 0.0
             fade_out_start = max(0.0, local_end - FADE_SECONDS)
             seg_map[i] = (text, fade_in_start, fade_in_duration, fade_out_start)
     return seg_map, schedule

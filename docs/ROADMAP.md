@@ -41,6 +41,17 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
 - Gotcha encoded in code: ffmpeg `fade` rejects negative `st` — continuation segments omit the fade-in filter instead
 - Later ideas: per-entry timing control, color/font options in GUI, text file import
 
+## Hardening pass ✅ (2026-07-06)
+Code-review fixes across the render pipeline; verified with repeat-run `framemd5` comparisons and targeted repros:
+- Frame-exact looping when a source window spills past EOF: `-ss` before `-i` combined with `-stream_loop` re-seeks on **every** loop iteration (repro: 45 frames instead of 60), so looped seeks moved into the filter chain (`trim=start=`) — `extract_clip_segment_ffmpeg`
+- Deterministic renders on every path: all fallback sampling (no visual plan, ProRes source/start picks) now uses the seeded `_stable_rng` pattern; two identical runs produce byte-identical video streams
+- Text entries are now truly guaranteed: two windows landing in the same segment used to silently overwrite each other in `seg_map` — planning treats "shares a segment" as a clash and relocates; continuation segments no longer restart the fade (alpha pop at cuts)
+- The planner's beat grid actually reaches text planning (`beat_info['times']` key mismatch meant snapping always fell back to cut boundaries)
+- ProRes precise mode normalizes mixed-resolution sources to the target resolution during proxy conversion (concat stream-copy requires identical dimensions), and its GUI preview is fixed (encoder options were placed before `-i`, so preview generation always failed silently)
+- Pipeline diagnostics (including ffmpeg stderr) are captured to `output/render_<timestamp>.log` instead of being discarded; error statuses point at the log
+- Output FPS follows the highest-resolution source (matching how target resolution is picked) instead of the arbitrary first upload; ffprobe failures are no longer cached for the whole run
+- Simplification: `ClipJob` dataclass replaces the 10-element args tuple; shared pre-filter/audio-mux helpers in `ffmpeg_processing.py`
+
 ## Phase 4 — transitions & polish ⬜
 - Opt-in `xfade` crossfades/wipes on low-energy boundaries (requires re-encode assembly path; hard cuts stay the fast default)
 - LUT-based color grading for a consistent look across mismatched sources

@@ -12,6 +12,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+import hashlib
 import math
 import subprocess
 import time
@@ -250,7 +251,11 @@ def get_cached_video_duration(video_file: str) -> float:
     """Duration lookup with a per-run cache (segments hit the same sources repeatedly)."""
     cached = _SOURCE_DURATION_CACHE.get(video_file)
     if cached is None:
-        cached = get_video_duration(video_file)
+        cached = _probe_video_duration(video_file)
+        if cached is None:
+            # Don't cache failures: a transient ffprobe error must not pin the
+            # fallback duration for the rest of the run.
+            return 10.0
         _SOURCE_DURATION_CACHE[video_file] = cached
     return cached
 
@@ -259,7 +264,11 @@ def get_loop_input_args(video_file: str, start_time: float, duration: float) -> 
     """Loop args for sources shorter than the requested window (GIFs, short clips).
 
     Returns (['-stream_loop', N] or [], adjusted_start_time). With looping the
-    demuxer presents the source repeated N+1 times, so seek/trim stay frame-accurate.
+    demuxer presents the source repeated N+1 times. ffmpeg gotcha: an input-side
+    -ss combined with -stream_loop re-seeks to the offset on EVERY loop
+    iteration (each pass yields only [start, EOF]), so when these args are used
+    with a nonzero start the caller must seek in the filter chain (trim=start=)
+    instead of with -ss.
     """
     src_duration = get_cached_video_duration(video_file)
     if src_duration <= 0.05:
@@ -272,8 +281,8 @@ def get_loop_input_args(video_file: str, start_time: float, duration: float) -> 
     return ['-stream_loop', str(loops)], start_time
 
 
-def get_video_duration(video_file: str) -> float:
-    """Get the duration of a video file using ffprobe."""
+def _probe_video_duration(video_file: str) -> float | None:
+    """Duration via ffprobe; None on failure so callers can avoid caching it."""
     try:
         probe_cmd = [
             FFPROBE_PATH,
@@ -282,13 +291,21 @@ def get_video_duration(video_file: str) -> float:
             '-of', 'default=noprint_wrappers=1:nokey=1',
             video_file
         ]
-        
+
         result = _run_media_command(probe_cmd, timeout=10)
+        if result.returncode != 0:
+            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
         duration = float(result.stdout.strip())
         return duration
     except Exception as e:
-        print(f"   ⚠️  Could not get video duration with ffprobe: {e}")
-        return 10.0  # Default fallback
+        print(f"   ⚠️  Could not get video duration with ffprobe ({os.path.basename(video_file)}): {e}")
+        return None
+
+
+def get_video_duration(video_file: str) -> float:
+    """Get the duration of a video file using ffprobe."""
+    duration = _probe_video_duration(video_file)
+    return 10.0 if duration is None else duration  # Default fallback
 
 
 def get_video_fps(video_file: str) -> float:
@@ -304,18 +321,20 @@ def get_video_fps(video_file: str) -> float:
         ]
         
         result = _run_media_command(probe_cmd, timeout=10)
+        if result.returncode != 0:
+            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
         fps_str = result.stdout.strip()
-        
+
         # Parse fraction (e.g., "30000/1001" or "30/1")
         if '/' in fps_str:
             num, den = fps_str.split('/')
             fps = float(num) / float(den)
         else:
             fps = float(fps_str)
-        
+
         return fps
     except Exception as e:
-        print(f"   ⚠️  Could not get video FPS with ffprobe: {e}")
+        print(f"   ⚠️  Could not get video FPS with ffprobe ({os.path.basename(video_file)}): {e}")
         return 30.0  # Default fallback
 
 
@@ -332,14 +351,16 @@ def get_video_resolution(video_file: str) -> Tuple[int, int]:
         ]
         
         result = _run_media_command(probe_cmd, timeout=10)
+        if result.returncode != 0:
+            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
         data = json.loads(result.stdout)
-        
+
         width = data['streams'][0]['width']
         height = data['streams'][0]['height']
-        
+
         return (width, height)
     except Exception as e:
-        print(f"   ⚠️  Could not get video resolution with ffprobe: {e}")
+        print(f"   ⚠️  Could not get video resolution with ffprobe ({os.path.basename(video_file)}): {e}")
         return (1920, 1080)  # Default fallback
 
 
@@ -359,22 +380,28 @@ def frame_count_to_seconds(frames: int, fps: float) -> float:
     return frames / fps
 
 
-def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None) -> str:
+def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None,
+                            target_size: Tuple[int, int] = None,
+                            fit_mode: str = 'crop') -> str:
     """
     Convert video to ProRes 422 Proxy for lossless editing.
     All frames are I-frames (keyframes) for frame-accurate cutting.
     STRIPS AUDIO - we'll add the music track at the end.
+
+    target_size normalizes every proxy to one frame size so the later concat
+    stream-copy sees identical streams (mixed-resolution sources would
+    otherwise produce an invalid output). None keeps the source resolution.
     """
     filename = os.path.basename(video_file)
     name, _ = os.path.splitext(filename)
     output_file = os.path.join(output_dir, f"{name}_prores.mov")
-    
+
     print(f"   📹 Converting to ProRes 422 Proxy: {filename}")
-    
+
     # Detect FPS if not provided
     if fps is None:
         fps = get_video_fps(video_file)
-    
+
     # Build FFmpeg command for ProRes 422 Proxy (NO AUDIO).
     # ProRes encode/decode is CPU-native in FFmpeg; forcing hwaccel auto can make
     # FFmpeg pick Vulkan/D3D paths that are slower or unstable for ProRes.
@@ -384,6 +411,13 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None)
         '-hide_banner',
         '-i', video_file,
         '-map', '0:v:0',
+    ]
+    if target_size:
+        # Blur fit needs a filter graph; proxies use get_fit_filters' default
+        # crop chain for it instead (proxy normalization only needs identical
+        # dimensions, not the blurred-background look).
+        cmd.extend(['-vf', ','.join(get_fit_filters(target_size, fit_mode))])
+    cmd.extend([
         '-c:v', 'prores',  # ProRes encoder
         '-profile:v', '0',  # Proxy quality (0=Proxy, 1=LT, 2=Standard, 3=HQ)
         '-vendor', 'apl0',
@@ -395,7 +429,7 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None)
         '-threads', str(MAX_THREADS),
         '-y',
         output_file
-    ]
+    ])
     
     try:
         result = _run_media_command(cmd, timeout=600)  # 10 minute timeout
@@ -411,6 +445,22 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None)
         raise Exception(f"ProRes conversion timeout for {filename}")
     except Exception as e:
         raise Exception(f"ProRes conversion error: {str(e)}")
+
+
+def build_segment_pre_filters(exact_duration: float, fps: float,
+                              trim_start: float = 0.0) -> List[str]:
+    """Shared trim/setpts/fps head of every segment's filter chain.
+
+    Trim first so each extracted segment has exact timing; effects come after
+    fps so their time expressions see the final frame timing. A nonzero
+    trim_start seeks in the filter chain (used with -stream_loop, where an
+    input-side -ss re-seeks on every loop iteration).
+    """
+    if trim_start > 0:
+        trim_filter = f"trim=start={trim_start:.6f}:duration={exact_duration}"
+    else:
+        trim_filter = f"trim=duration={exact_duration}"
+    return [trim_filter, "setpts=PTS-STARTPTS", f"fps={fps}"]
 
 
 def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: float,
@@ -432,9 +482,16 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         exact_source_duration = frame_count_to_seconds(source_frame_count, fps)
         output_frame_count = source_frame_count
 
-        # Trim first so each extracted segment has exact timing; effects come
-        # after fps so their time expressions see the final frame timing.
-        pre_filters = [f"trim=duration={exact_source_duration}", "setpts=PTS-STARTPTS", f"fps={fps}"]
+        # Loop sources shorter than the segment (GIFs, short clips) so the
+        # frame count stays exact instead of drifting. ffmpeg gotcha: with
+        # -stream_loop, an input-side -ss re-seeks to the offset on EVERY loop
+        # iteration (each pass yields only [start, EOF] instead of wrapping),
+        # so looped seeks happen in the filter chain via trim=start= instead.
+        loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
+        filter_seek = bool(loop_args) and start_time > 0
+
+        pre_filters = build_segment_pre_filters(
+            exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0)
         post_filters = list(extra_filters or [])
 
         # text_overlay: (png_path, fade_in_start, fade_in_duration,
@@ -467,19 +524,22 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         # Hardware acceleration
         cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
 
-        # Loop sources shorter than the segment (GIFs, short clips) so the
-        # frame count stays exact instead of drifting.
-        loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
         cmd.extend(loop_args)
 
-        # ✅ FRAME-ACCURATE INPUT SEEKING
-        # Use -ss BEFORE -i for faster seeking (keyframe-based)
-        # Then use -ss AFTER -i for frame-accurate positioning
-        cmd.extend([
-            '-ss', str(start_time),
-            '-t', str(exact_source_duration),
-            '-i', video_file
-        ])
+        if filter_seek:
+            # Looped seek: no input-side -ss/-t (see gotcha above); trim=start=
+            # in the filter chain positions the window and -vframes caps output.
+            # Looped sources are short by definition, so the extra decode from
+            # 0 to start is negligible.
+            cmd.extend(['-i', video_file])
+        else:
+            # ✅ FRAME-ACCURATE INPUT SEEKING (input -ss decodes forward from
+            # the preceding keyframe and discards, so it stays frame-accurate)
+            cmd.extend([
+                '-ss', str(start_time),
+                '-t', str(exact_source_duration),
+                '-i', video_file
+            ])
 
         if text_overlay:
             cmd.extend(['-loop', '1', '-i', text_overlay[0]])
@@ -541,7 +601,7 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
     """
     output_file = os.path.join(temp_dir, f"segment_{segment_index:05d}.mov")
 
-    video_duration = get_video_duration(video_file)
+    video_duration = get_cached_video_duration(video_file)
     if video_duration <= 0:
         raise Exception(f"Invalid ProRes source duration: {video_file}")
 
@@ -549,21 +609,25 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
     if video_duration >= duration:
         max_start = max(0.0, video_duration - duration)
         if start_time is None:
-            start_time = random.uniform(0.0, max_start)
+            # Same seeded-RNG idiom as effects.py: identical inputs must pick
+            # identical source moments (deterministic renders).
+            seed_raw = f"prores_start|{segment_index}|{os.path.basename(video_file)}"
+            seed = int(hashlib.sha1(seed_raw.encode("utf-8", errors="ignore")).hexdigest()[:12], 16)
+            start_time = random.Random(seed).uniform(0.0, max_start)
         else:
             start_time = max(0.0, min(float(start_time), max_start))
     else:
         # Source is shorter than the segment: loop it so precise mode keeps
-        # its exact frame count instead of emitting a short clip.
+        # its exact frame count instead of emitting a short clip. start_time
+        # stays 0 here, so pairing -stream_loop with the input -ss below is
+        # safe (the per-iteration re-seek gotcha only bites for start > 0).
         start_time = 0.0
         loop_args, start_time = get_loop_input_args(video_file, start_time, duration)
 
     frame_count = max(1, seconds_to_frame_count(duration, fps))
     exact_duration = frame_count_to_seconds(frame_count, fps)
 
-    filters = [f"trim=duration={exact_duration}", "setpts=PTS-STARTPTS"]
-    filters.append(f"fps={fps}")
-    filter_complex = ",".join(filters)
+    filter_complex = ",".join(build_segment_pre_filters(exact_duration, fps))
 
     def build_cmd(fast_seek: bool) -> List[str]:
         cmd = [FFMPEG_PATH, '-nostdin', '-hide_banner']
@@ -628,13 +692,25 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
     concat_file = os.path.join(temp_dir, f'concat_list_{uuid.uuid4().hex}.txt')
     with open(concat_file, 'w', encoding='utf-8') as f:
         for video_file in video_files:
-            escaped_path = video_file.replace('\\', '/')
+            # Concat demuxer quoting: a literal ' inside the single-quoted
+            # path must be written as '\'' or the list fails to parse.
+            escaped_path = video_file.replace('\\', '/').replace("'", "'\\''")
             f.write(f"file '{escaped_path}'\n")
     
     is_prores = output_file.lower().endswith('.mov')
     temp_video = None
     temp_audio = None
-    
+
+    def add_audio_input(cmd: List[str]) -> None:
+        if not audio_file:
+            return
+        if end_time and end_time > start_time:
+            cmd.extend(['-ss', str(start_time), '-t', str(end_time - start_time), '-i', audio_file])
+        elif start_time > 0:
+            cmd.extend(['-ss', str(start_time), '-i', audio_file])
+        else:
+            cmd.extend(['-i', audio_file])
+
     try:
         if is_prores:
             # ProRes: concat with stream copy (lossless)
@@ -663,13 +739,9 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 
                 temp_audio = os.path.join(temp_dir, f'music_{uuid.uuid4().hex}.wav')
                 
-                audio_cmd = [FFMPEG_PATH, '-i', audio_file]
-                
-                if end_time and end_time > start_time:
-                    audio_cmd.extend(['-ss', str(start_time), '-t', str(end_time - start_time)])
-                elif start_time > 0:
-                    audio_cmd.extend(['-ss', str(start_time)])
-                
+                audio_cmd = [FFMPEG_PATH]
+                add_audio_input(audio_cmd)
+
                 audio_cmd.extend([
                     '-acodec', 'pcm_s24le',
                     '-ar', '48000',
@@ -715,16 +787,6 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
             # combination rejects stream copy, fall back to the old re-encode path.
             fast_concat_enabled = _env_flag('BEATSYNC_FAST_CONCAT_COPY', True)
 
-            def add_audio_input(cmd: List[str]) -> None:
-                if not audio_file:
-                    return
-                if end_time and end_time > start_time:
-                    cmd.extend(['-ss', str(start_time), '-t', str(end_time - start_time), '-i', audio_file])
-                elif start_time > 0:
-                    cmd.extend(['-ss', str(start_time), '-i', audio_file])
-                else:
-                    cmd.extend(['-i', audio_file])
-
             if fast_concat_enabled:
                 print(f"   🔗 Fast final assembly: concat stream-copy video + mux audio...")
                 copy_started = time.perf_counter()
@@ -744,7 +806,10 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 cmd.extend(['-c:v', 'copy'])
                 if audio_file:
                     cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000', '-shortest'])
-                cmd.extend(['-fflags', '+genpts', '-movflags', '+faststart', '-y', output_file])
+                cmd.extend(['-fflags', '+genpts'])
+                if output_file.lower().endswith(('.mp4', '.mov', '.m4v')):
+                    cmd.extend(['-movflags', '+faststart'])
+                cmd.extend(['-y', output_file])
 
                 result = _run_media_command(cmd, timeout=300)
                 if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:

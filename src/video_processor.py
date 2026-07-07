@@ -12,8 +12,8 @@ setup_environment()
 
 # NOW import other modules (after CUDA and Python environment is set)
 import argparse
-import random
 import shutil
+from dataclasses import dataclass, field
 from typing import TypeAlias, List, Dict, Tuple
 import numpy as np
 from pathlib import Path
@@ -39,6 +39,7 @@ from paths import (
 # Import FFmpeg processing module
 from ffmpeg_processing import (
     get_video_duration,
+    get_cached_video_duration,
     get_video_fps,
     get_video_resolution,
     convert_to_prores_proxy,
@@ -49,7 +50,7 @@ from ffmpeg_processing import (
     frame_count_to_seconds,
 )
 from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_clip_plan
-from effects import build_effect_filters
+from effects import build_effect_filters, _stable_rng
 from text_overlay import parse_text_entries, plan_text_windows, render_text_png
 
 # Import mode modules
@@ -275,7 +276,22 @@ def build_frame_aligned_cut_timeline(beat_times: BeatTimes, audio_duration: floa
     return cut_times, segment_frames, segment_durations, dropped_boundaries
 
 
-def create_clip_parallel(args):
+@dataclass
+class ClipJob:
+    """Everything one clip-extraction worker needs for one output segment."""
+    index: int
+    video_file: str
+    final_duration: float
+    target_size: Tuple[int, int]
+    use_nvenc: bool
+    gpu_encoder: str
+    temp_dir: str
+    fps: float
+    planned_clip: Dict | None = None
+    render_opts: Dict = field(default_factory=dict)
+
+
+def create_clip_parallel(job: ClipJob):
     """
     Wrapper function for parallel clip creation using FFmpeg.
 
@@ -283,24 +299,19 @@ def create_clip_parallel(args):
     available, this worker samples forward source content as a fallback.
     """
     clip_started = time.perf_counter()
-    planned_clip = None
-    render_opts = {}
-    if len(args) >= 10:
-        (i, video_file, final_duration, target_size,
-         use_nvenc, gpu_encoder, temp_dir, fps, planned_clip, render_opts) = args
-    elif len(args) >= 9:
-        (i, video_file, final_duration, target_size,
-         use_nvenc, gpu_encoder, temp_dir, fps, planned_clip) = args
-    else:
-        (i, video_file, final_duration, target_size,
-         use_nvenc, gpu_encoder, temp_dir, fps) = args
+    i = job.index
+    video_file = job.video_file
+    final_duration = job.final_duration
+    target_size = job.target_size
+    planned_clip = job.planned_clip
+    render_opts = job.render_opts
 
     try:
         # Sources shorter than the segment keep the full requested duration:
         # extraction loops them (-stream_loop) instead of emitting short clips.
         if planned_clip:
             video_file = planned_clip.get('video_file') or video_file
-            video_duration = get_video_duration(video_file)
+            video_duration = get_cached_video_duration(video_file)
             source_duration = max(0.05, float(planned_clip.get('source_duration', final_duration)))
             if video_duration >= source_duration:
                 max_start = max(0.0, video_duration - source_duration)
@@ -308,21 +319,22 @@ def create_clip_parallel(args):
             else:
                 clip_start = 0.0
         else:
-            # Random start time from video if visual planning is unavailable.
-            video_duration = get_video_duration(video_file)
+            # Seeded start time from video if visual planning is unavailable:
+            # same inputs + settings must always render the same video.
+            video_duration = get_cached_video_duration(video_file)
 
             source_duration = final_duration
 
             if video_duration >= source_duration:
                 max_start = video_duration - source_duration
-                clip_start = random.uniform(0, max_start)
+                clip_start = _stable_rng('clip_fallback', i, video_file).uniform(0.0, max_start)
             else:
                 clip_start = 0
 
         
         # Output file
-        temp_clip_path = os.path.join(temp_dir, f"temp_clip_{i}_{uuid.uuid4().hex}.mp4")
-        
+        temp_clip_path = os.path.join(job.temp_dir, f"temp_clip_{i}_{uuid.uuid4().hex}.mp4")
+
         opts = render_opts or {}
         effect_filters = build_effect_filters(
             planned_clip,
@@ -331,7 +343,7 @@ def create_clip_parallel(args):
             opts.get('tempo'),
             i,
             target_size,
-            fps=fps,
+            fps=job.fps,
         )
 
         extract_kwargs = {
@@ -339,10 +351,10 @@ def create_clip_parallel(args):
             'start_time': clip_start,
             'duration': source_duration,
             'output_file': temp_clip_path,
-            'fps': fps,
+            'fps': job.fps,
             'target_size': target_size,
-            'use_nvenc': use_nvenc,
-            'gpu_encoder': gpu_encoder,
+            'use_nvenc': job.use_nvenc,
+            'gpu_encoder': job.gpu_encoder,
             'fit_mode': opts.get('fit_mode', 'crop'),
             'extra_filters': effect_filters,
             'text_overlay': (opts.get('text_plan') or {}).get(i),
@@ -526,13 +538,20 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         # Use detected FPS for ProRes conversion
         prores_fps = fps
         print(f"🎞️ Using FPS: {prores_fps} (for frame-perfect precision)")
-        
+
+        # Mixed-resolution sources must not reach concat stream-copy: normalize
+        # every proxy to one target frame so all segment streams are identical.
+        target_size = get_max_resolution(video_files)
+        render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
+        print(f"🎞️ Target resolution: {target_size[0]}x{target_size[1]}")
+
         # Convert all input videos to ProRes (video only, no audio)
         prores_files = []
         prores_map = {}
         for idx, video_file in enumerate(video_files, 1):
             print(f"Converting {idx}/{len(video_files)}...")
-            prores_file = convert_to_prores_proxy(video_file, prores_dir, prores_fps)
+            prores_file = convert_to_prores_proxy(video_file, prores_dir, prores_fps,
+                                                  target_size=target_size, fit_mode=fit_mode)
             prores_files.append(prores_file)
             prores_map[os.path.abspath(video_file)] = prores_file
         
@@ -559,12 +578,21 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
 
             if planned_clip:
                 source_video = os.path.abspath(planned_clip.get('video_file', ''))
-                prores_file = prores_map.get(source_video, random.choice(prores_files))
+                prores_file = prores_map.get(source_video)
+                if prores_file is None:
+                    # A silent substitute here would mask a path-normalization
+                    # bug between the planner and the proxy map.
+                    print(f"   ⚠️  Planned source missing from ProRes map: {source_video}; "
+                          f"using deterministic fallback source")
+                    prores_file = _stable_rng('prores_fallback', i).choice(prores_files)
                 segment_start = float(planned_clip.get('start_time', 0.0))
             else:
-                # Randomly select ProRes file
-                prores_file = random.choice(prores_files)
-                segment_start = None
+                # Seeded ProRes source + start so precise mode renders the same
+                # video for the same inputs even without a visual plan.
+                prores_file = _stable_rng('prores_fallback', i).choice(prores_files)
+                prores_duration = get_cached_video_duration(prores_file)
+                max_start = max(0.0, prores_duration - float(exact_duration))
+                segment_start = _stable_rng('prores_start', i, prores_file).uniform(0.0, max_start)
 
             # Extract segment
             segment_file = extract_prores_segment_random(
@@ -659,7 +687,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             entries = parse_text_entries(text_entries)
             seg_map, schedule = plan_text_windows(
                 entries, selected_beats,
-                beat_times=(beat_info or {}).get('beat_times'),
+                beat_times=(beat_info or {}).get('times'),
                 planned_clip_sequence=planned_clip_sequence,
             )
             png_cache = {}
@@ -691,10 +719,13 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         for i, final_duration in enumerate(segment_durations):
             # Duration comes from the absolute frame-locked cut timeline.
             planned_clip = planned_clip_sequence[i] if planned_clip_sequence else None
-            video_file = planned_clip.get('video_file') if planned_clip else random.choice(video_files)
-            clip_args.append((i, video_file, final_duration,
-                            target_size, use_nvenc, gpu_encoder, session_temp_dir, fps,
-                            planned_clip, render_opts))
+            video_file = (planned_clip.get('video_file') if planned_clip
+                          else _stable_rng('source_fallback', i).choice(video_files))
+            clip_args.append(ClipJob(
+                index=i, video_file=video_file, final_duration=final_duration,
+                target_size=target_size, use_nvenc=use_nvenc, gpu_encoder=gpu_encoder,
+                temp_dir=session_temp_dir, fps=fps,
+                planned_clip=planned_clip, render_opts=render_opts))
         
         clip_files = [None] * len(clip_args)
         clip_timings: List[float] = []
@@ -711,13 +742,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
                 try:
-                    result_tuple = future.result()
-                    if len(result_tuple) >= 6:
-                        i, clip_path, new_target_size, temp_path, error, clip_elapsed = result_tuple
-                    else:
-                        i, clip_path, new_target_size, temp_path, error = result_tuple
-                        clip_elapsed = 0.0
-                    
+                    i, clip_path, new_target_size, temp_path, error, clip_elapsed = future.result()
+
                     if clip_elapsed:
                         clip_timings.append(float(clip_elapsed))
                     

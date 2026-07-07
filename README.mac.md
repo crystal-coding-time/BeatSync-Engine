@@ -50,11 +50,13 @@ The video dropzone stays empty and always accepts drops; loaded files accumulate
 
 ## Style controls
 
-- **Frame fit** — how sources with a different aspect ratio fill the frame: Smart crop (fill and center-crop, default), Blurred background (undistorted over a blurred fill), Letterbox, or Stretch (legacy). Output resolution/aspect follows the highest-resolution source (by pixel area).
+- **Frame fit** — how sources with a different aspect ratio fill the frame: Smart crop (fill and center-crop, default), Blurred background (undistorted over a blurred fill), Letterbox, or Stretch (legacy). Output resolution/aspect follows the highest-resolution source (by pixel area), and the output FPS follows that same source — set Custom FPS to override (so a low-fps GIF in the list can't drag the whole render down).
 - **Effect style** — Clean (no effects), AMV, or Hype. Effects are beat-aware: zoom punches and flashes on drop cuts, saturation pulsing at the song's tempo, plus shake/vignette/grain in Hype. Same inputs always render the same video.
 - **Effect intensity** — scales all effect strengths.
 
-Effects apply to the H.264/HEVC modes only; ProRes precise mode stays untouched for external editing.
+Effects apply to the H.264/HEVC modes only; ProRes precise mode stays untouched for external editing. Precise mode handles mixed-resolution sources: everything is normalized to the target resolution during the ProRes proxy conversion so the lossless assembly stays valid.
+
+Every run writes its full pipeline output (including ffmpeg errors) to `output/render_<timestamp>.log` — if a render fails, the error message points at that log.
 
 ## Text overlays
 
