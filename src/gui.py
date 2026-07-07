@@ -765,7 +765,7 @@ def create_ui() -> gr.Blocks:
                     fit_mode_input = gr.Radio(
                         choices=[('Smart crop', 'crop'), ('Blurred background', 'blur'), ('Letterbox', 'pad'), ('Stretch', 'stretch')],
                         value='crop', label='Frame fit',
-                        info='How sources with a different aspect ratio fill the frame')
+                        info='How sources with a different aspect ratio fill the frame. Smart crop trims at most ~15%; bigger mismatches keep the full shot over a blurred fill.')
                     effect_style_input = gr.Radio(
                         choices=[('Clean', 'clean'), ('AMV', 'amv'), ('Hype', 'hype')],
                         value='clean', label='Effect style',

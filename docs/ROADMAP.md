@@ -22,6 +22,15 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
 - `get_fit_filters` / `build_blur_fit_graph` in `ffmpeg_processing.py`; `setsar=1` normalizes
   sample aspect across heterogeneous sources
 - Target resolution/aspect = highest-resolution source by pixel area (`get_max_resolution`); a dominant vertical source makes a vertical video
+- Smart crop is a **limited-crop hybrid** (2026-07-06, owner feedback: pure fill-crop
+  over-cropped): mild mismatches keep the classic fill-and-center-crop, but at most
+  `MAX_CROP_PER_AXIS` (15%) of the source may be cropped away — beyond that the source is
+  composited over the blurred-background fill instead (a 9:16 source in a 16:9 target keeps
+  ≥85% of its content instead of 31%). `plan_source_fit`/`plan_smart_crop` in
+  `ffmpeg_processing.py`; ProRes proxies use the same chain (`build_source_fit_chain`)
+- Anamorphic sources (SAR ≠ 1) are resampled to square pixels before fitting —
+  `scale=force_original_aspect_ratio` compares storage dimensions, so they previously
+  rendered distorted
 
 ## Phase 2 — beat-aware effects engine ✅ (2026-07-06)
 - `src/effects.py`: per-segment filter chains driven by stage 6 planner metadata
@@ -30,6 +39,11 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
   beat frequency, chromatic aberration occasionally on hard cuts; hype adds shake, vignette, grain
 - GUI: Effect style Clean (default) / AMV / Hype + intensity slider
 - Deterministic (seeded per segment); ffmpeg gotcha encoded in code comments: `crop` can't animate w/h → zoom uses `zoompan`
+- Effects recipe pack (2026-07-06): pixelize bursts, negative-flash strobes and posterize
+  flashes on Hype drop cuts; directional zoom-blur smears on drops; `tmix`/`lagfun` motion
+  trails on calm segments; hue sweeps through build-ups; rare subtle fisheye (Hype).
+  Core filters only, every recipe verified frame-count-safe, capped at 2 (AMV) / 3 (Hype)
+  pack effects per segment (`shuffleframes`/`elbg` deliberately excluded — see effects.py)
 - Not included by design: speed ramps (`setpts` would break the zero-drift frame-locked timeline); effects don't apply in ProRes precise mode (kept pristine for external editing)
 
 ## Phase 3 — text overlay system ✅ (2026-07-06)

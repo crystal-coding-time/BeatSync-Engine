@@ -168,11 +168,21 @@ def get_hwaccel_args(use_hw_encoder: bool, gpu_encoder: str) -> List[str]:
 
 FIT_MODES = ('crop', 'blur', 'pad', 'stretch')
 
+# Smart crop caps how much of a source the fill-and-center-crop may discard.
+# Mild mismatches keep the classic full-frame crop (best-looking, loses
+# little); beyond the cap the source is scaled so at most this fraction of
+# the cropped axis is lost and the rest of the frame is filled with the
+# blurred background instead (a vertical 9:16 source in a 16:9 target would
+# otherwise lose ~69% of its content).
+MAX_CROP_PER_AXIS = 0.15
+
 
 def get_fit_filters(target_size: Tuple[int, int], fit_mode: str) -> List[str]:
     """Aspect-ratio handling for sources that don't match the target frame.
 
-    crop    – scale to fill, center-crop overflow (no distortion, default)
+    crop    – scale to fill, center-crop overflow (no distortion, default;
+              callers with a probed source size upgrade big mismatches to the
+              limited-crop hybrid via plan_source_fit)
     pad     – letterbox/pillarbox with black bars
     stretch – legacy distorting scale
     blur    – handled separately (needs a filter graph, see caller)
@@ -193,18 +203,139 @@ def get_fit_filters(target_size: Tuple[int, int], fit_mode: str) -> List[str]:
     ]
 
 
-def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
-                         post_filters: List[str], out_label: str = 'outv') -> str:
-    """Filter graph for blur fit: blurred fill in back, undistorted fit in front."""
+_SOURCE_DISPLAY_INFO_CACHE: dict = {}
+
+
+def get_cached_display_info(video_file: str):
+    """(display_w, display_h, sar) with a per-run cache; None if the probe fails.
+
+    Display dimensions fold the sample aspect ratio in (storage width × SAR),
+    which is what fit decisions must compare — scale's
+    force_original_aspect_ratio only looks at storage dimensions.
+    """
+    cached = _SOURCE_DISPLAY_INFO_CACHE.get(video_file)
+    if cached is not None:
+        return cached
+    try:
+        probe_cmd = [
+            FFPROBE_PATH,
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height,sample_aspect_ratio',
+            '-of', 'json',
+            video_file,
+        ]
+        result = _run_media_command(probe_cmd, timeout=10)
+        if result.returncode != 0:
+            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
+        stream = json.loads(result.stdout)['streams'][0]
+        width = int(stream['width'])
+        height = int(stream['height'])
+        sar = 1.0
+        raw_sar = str(stream.get('sample_aspect_ratio') or '')
+        if ':' in raw_sar:
+            num, den = raw_sar.split(':', 1)
+            if float(num) > 0 and float(den) > 0:
+                sar = float(num) / float(den)
+        info = (width * sar, float(height), sar)
+        _SOURCE_DISPLAY_INFO_CACHE[video_file] = info
+        return info
+    except Exception as e:
+        print(f"   ⚠️  Could not probe display size ({os.path.basename(video_file)}): {e}")
+        return None
+
+
+def plan_smart_crop(display_size: Tuple[float, float],
+                    target_size: Tuple[int, int]):
+    """Foreground geometry for the limited-crop hybrid, or None to keep the
+    plain fill-and-center-crop chain.
+
+    Returns (fg_w, fg_h, crop_w, crop_h): the source is scaled to fg_w×fg_h
+    (losing at most MAX_CROP_PER_AXIS of the overflowing axis to the centered
+    crop) and composited over the blurred fill.
+    """
+    sw, sh = display_size
+    tw, th = target_size
+    if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
+        return None
+    f_fit = min(tw / sw, th / sh)
+    f_fill = max(tw / sw, th / sh)
+    crop_loss = 1.0 - f_fit / f_fill
+    if crop_loss <= MAX_CROP_PER_AXIS:
+        return None
+    f = min(f_fill, f_fit / (1.0 - MAX_CROP_PER_AXIS))
+    fg_w = max(2, int(round(sw * f / 2)) * 2)
+    fg_h = max(2, int(round(sh * f / 2)) * 2)
+    return fg_w, fg_h, min(fg_w, tw), min(fg_h, th)
+
+
+def plan_source_fit(video_file: str, target_size: Tuple[int, int],
+                    fit_mode: str) -> Tuple[List[str], object]:
+    """Per-source fit decisions: (sar_fix_filters, hybrid_fg_geometry_or_None).
+
+    sar_fix resamples anamorphic sources to square pixels before the fit
+    chain — force_original_aspect_ratio compares storage dimensions and the
+    fit chains end in setsar=1, so non-square SAR would render distorted.
+    hybrid_fg upgrades Smart crop to the limited-crop hybrid when the plain
+    chain would discard more than MAX_CROP_PER_AXIS.
+    """
+    sar_fix: List[str] = []
+    hybrid_fg = None
+    if not target_size or fit_mode not in ('crop', 'blur', 'pad'):
+        return sar_fix, hybrid_fg
+    info = get_cached_display_info(video_file)
+    if not info:
+        return sar_fix, hybrid_fg
+    disp_w, disp_h, sar = info
+    if abs(sar - 1.0) > 0.01:
+        sar_fix = ["scale=iw*sar:ih", "setsar=1"]
+    if fit_mode == 'crop':
+        hybrid_fg = plan_smart_crop((disp_w, disp_h), target_size)
+    return sar_fix, hybrid_fg
+
+
+def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None) -> str:
+    """Single-input chain: blurred fill in back, foreground centered on top.
+
+    Works in both -vf and -filter_complex (a linear chain with an internal
+    split). The default foreground is the undistorted full fit (pure blur
+    mode); the limited-crop hybrid passes its own scale+crop chain.
+    """
     w, h = target_size
+    if fg_filters is None:
+        fg_filters = [f"scale={w}:{h}:force_original_aspect_ratio=decrease"]
+    return (
+        f"split=2[bg][fg];"
+        f"[bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},gblur=sigma=16[bgb];"
+        f"[fg]{','.join(fg_filters)}[fgs];"
+        f"[bgb][fgs]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,setsar=1"
+    )
+
+
+def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
+                         post_filters: List[str], out_label: str = 'outv',
+                         fg_filters: List[str] = None) -> str:
+    """Filter graph for blur fit: blurred fill in back, foreground in front."""
     pre = ",".join(pre_filters)
     post = ("," + ",".join(post_filters)) if post_filters else ""
-    return (
-        f"[0:v]{pre},split=2[bg][fg];"
-        f"[bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},gblur=sigma=16[bgb];"
-        f"[fg]scale={w}:{h}:force_original_aspect_ratio=decrease[fgs];"
-        f"[bgb][fgs]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,setsar=1{post}[{out_label}]"
-    )
+    return f"[0:v]{pre},{_blur_fit_chain(target_size, fg_filters)}{post}[{out_label}]"
+
+
+def build_source_fit_chain(video_file: str, target_size: Tuple[int, int],
+                           fit_mode: str) -> str:
+    """-vf chain fitting a whole source to target_size (SAR normalization plus
+    blur/limited-crop handling) — used by ProRes proxy conversion so lossless
+    mode fits sources the same way the standard pipeline does."""
+    sar_fix, hybrid_fg = plan_source_fit(video_file, target_size, fit_mode)
+    if fit_mode == 'blur' or hybrid_fg:
+        fg_filters = None
+        if hybrid_fg:
+            fg_w, fg_h, crop_w, crop_h = hybrid_fg
+            fg_filters = [f"scale={fg_w}:{fg_h}", f"crop={crop_w}:{crop_h}"]
+        chain = _blur_fit_chain(target_size, fg_filters)
+    else:
+        chain = ",".join(get_fit_filters(target_size, fit_mode))
+    return ",".join(sar_fix + [chain]) if sar_fix else chain
 
 
 def build_text_overlay_graph(base_graph: str, fade_in_start: float,
@@ -413,10 +544,10 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None,
         '-map', '0:v:0',
     ]
     if target_size:
-        # Blur fit needs a filter graph; proxies use get_fit_filters' default
-        # crop chain for it instead (proxy normalization only needs identical
-        # dimensions, not the blurred-background look).
-        cmd.extend(['-vf', ','.join(get_fit_filters(target_size, fit_mode))])
+        # Same fit behavior as the standard pipeline (SAR normalization,
+        # blur fit, limited-crop hybrid) — -vf accepts the internal-split
+        # graph because it stays single-input/single-output.
+        cmd.extend(['-vf', build_source_fit_chain(video_file, target_size, fit_mode)])
     cmd.extend([
         '-c:v', 'prores',  # ProRes encoder
         '-profile:v', '0',  # Proxy quality (0=Proxy, 1=LT, 2=Standard, 3=HQ)
@@ -494,17 +625,27 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
             exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0)
         post_filters = list(extra_filters or [])
 
+        # Per-source fit decisions: SAR normalization for anamorphic inputs,
+        # and the limited-crop hybrid when plain Smart crop would discard more
+        # than MAX_CROP_PER_AXIS of the source.
+        sar_fix, hybrid_fg = plan_source_fit(video_file, target_size, fit_mode)
+        pre_filters.extend(sar_fix)
+
         # text_overlay: (png_path, fade_in_start, fade_in_duration,
         # fade_out_start) in this segment's local clock — see
         # text_overlay.plan_text_windows.
-        use_blur_graph = bool(target_size) and fit_mode == 'blur'
+        use_blur_graph = bool(target_size) and (fit_mode == 'blur' or hybrid_fg is not None)
         use_graph = use_blur_graph or bool(text_overlay)
         filter_graph = None
         filter_complex = None
         base_label = 'basev' if text_overlay else 'outv'
         if use_blur_graph:
+            fg_filters = None
+            if hybrid_fg:
+                fg_w, fg_h, crop_w, crop_h = hybrid_fg
+                fg_filters = [f"scale={fg_w}:{fg_h}", f"crop={crop_w}:{crop_h}"]
             filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters,
-                                                out_label=base_label)
+                                                out_label=base_label, fg_filters=fg_filters)
         else:
             filters = list(pre_filters)
             if target_size:

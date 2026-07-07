@@ -84,6 +84,59 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
         shift = 3 if hype else 2
         filters.append(f"rgbashift=rh={shift}:bh=-{shift}")
 
+    # Recipe pack: capped so hype doesn't turn into soup. All entries are
+    # single-stream and frame-count-safe; shuffleframes is deliberately
+    # excluded (drops trailing frames when its pattern doesn't divide the
+    # segment frame count) and elbg is excluded (single-threaded, very slow).
+    # Commas inside enable='...' are protected by the filter-arg quoting.
+    pack_cap = 3 if hype else 2
+    pack = 0
+
+    # Pixelize burst right at hype drop cuts, decaying quickly.
+    if hype and target == 'drop' and pack < pack_cap and rng.random() < 0.45 * k:
+        block = max(8, int(round(12 + 20 * k)))
+        filters.append(f"pixelize=w={block}:h={block}:enable='lt(t,0.25)'")
+        pack += 1
+
+    # Directional smear standing in for zoom blur on drop cuts.
+    if target == 'drop' and pack < pack_cap and rng.random() < 0.30 * k:
+        radius = max(4, int(round(10 * k * (0.5 + 0.5 * energy))))
+        filters.append(f"dblur=angle=90:radius={radius}:enable='lt(t,0.3)'")
+        pack += 1
+
+    # Negative-flash strobe, hype drops with strong impacts only: two
+    # inverted frames out of every eight, and only in the first 0.6s.
+    if hype and target == 'drop' and energy > 0.75 and pack < pack_cap and rng.random() < 0.25 * k:
+        filters.append("negate=enable='lt(mod(n,8),2)*lt(t,0.6)'")
+        pack += 1
+
+    # Motion trails on calmer segments: frame-mix echo, or lagfun
+    # light-paint for hype.
+    if target in ('flow', 'soft') and pack < pack_cap and rng.random() < 0.30 * k:
+        if hype and rng.random() < 0.5:
+            filters.append(f"lagfun=decay={0.9 + 0.05 * k:.3f}")
+        else:
+            frames = 6 if energy > 0.5 else 4
+            weights = ' '.join(str(w) for w in range(frames, 0, -1))
+            filters.append(f"tmix=frames={frames}:weights='{weights}'")
+        pack += 1
+
+    # Slow hue sweep through build-ups.
+    if hype and target == 'build' and pack < pack_cap and rng.random() < 0.35 * k:
+        rate = 30 + int(round(60 * k))
+        filters.append(f"hue=h={rate}*t")
+        pack += 1
+
+    # Rare subtle fisheye bulge for the hype look.
+    if hype and pack < pack_cap and rng.random() < 0.12 * k:
+        filters.append(f"lenscorrection=k1={-0.15 * k:.3f}:k2=-0.05:i=bilinear")
+        pack += 1
+
+    # Rare posterize flash on hype drops (8 luma levels, first 0.3s).
+    if hype and target == 'drop' and pack < pack_cap and rng.random() < 0.15 * k:
+        filters.append("lutyuv=y='floor(val/32)*32+16':enable='lt(t,0.3)'")
+        pack += 1
+
     # Hype look: vignette always, grain sometimes.
     if hype:
         filters.append("vignette=PI/5")
