@@ -408,6 +408,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        look_cube: str = '',
                        variety: float = 0.4,
                        speed_ramps: bool = False,
+                       split_screen: bool = True,
                        text_entries: str = '', text_position: str = 'bottom',
                        text_scale: float = 1.0,
                        settings: dict | None = None,
@@ -428,6 +429,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             look_cube = settings.get('look_cube', look_cube)
             variety = settings.get('variety', variety)
             speed_ramps = settings.get('speed_ramps', speed_ramps)
+            split_screen = settings.get('split_screen', split_screen)
             text_entries = settings.get('text_entries', text_entries)
             text_position = settings.get('text_position', text_position)
             text_scale = settings.get('text_scale', text_scale)
@@ -551,6 +553,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             'look_cube': (None if is_prores else (look_cube or None)),
             'variety': variety,
             'speed_ramps': bool(speed_ramps),
+            'split_screen': bool(split_screen),
             'text_entries': [line.strip() for line in (text_entries or '').splitlines() if line.strip()],
             'text_position': text_position,
             'text_scale': text_scale,
@@ -638,6 +641,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  effect_intensity: float, effect_mode: str,
                  effect_palette: List[str], effect_seed: float,
                  look_cube: str, variety: float, speed_ramps: bool,
+                 split_screen: bool,
                  text_entries: str, text_position: str,
                  text_scale: float, session_state: dict) -> Iterator[StatusResult]:
     status_queue: queue.Queue[str | None] = queue.Queue()
@@ -659,6 +663,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
         'look_cube': look_cube,
         'variety': variety,
         'speed_ramps': bool(speed_ramps),
+        'split_screen': bool(split_screen),
         'text_entries': text_entries,
         'text_position': text_position,
         'text_scale': text_scale,
@@ -831,26 +836,34 @@ def create_ui() -> gr.Blocks:
                     outputs=[video_state, video_list, remove_videos_btn, clear_videos_btn],
                 )
 
+                # Tier 1 — creative intents only. Mechanical knobs live in the
+                # Advanced accordion below; the engine's defaults are the real UI.
                 with gr.Group():
-                    gr.Markdown('### ⚙️ Video Settings')
-                    custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
-
-                with gr.Group():
-                    gr.Markdown('### 🎨 Style')
+                    gr.Markdown('### 🎨 Create')
+                    effect_style_input = gr.Radio(
+                        choices=[('Minimal (clean cuts)', 'clean'), ('Music video (AMV)', 'amv'), ('Hype', 'hype')],
+                        value='clean', label='Style',
+                        info='How energetic the edit feels. Beat-aware effects: zooms and flashes on drops, saturation pulses on the beat. Minimal disables effects in every mode.')
+                    look_input = gr.Dropdown(
+                        choices=list_looks(), value='', label='Look',
+                        info='Color grade for the whole video (baked LUTs: film, warm/cool, day-for-night). H.264/HEVC modes only; ProRes stays ungraded.')
                     output_format_input = gr.Dropdown(
                         choices=[(label, key) for key, (label, _) in OUTPUT_FORMATS.items()],
                         value=DEFAULT_OUTPUT_FORMAT, label='Output canvas',
                         info='The frame every render targets. Fixed canvases keep one odd portrait clip from flipping the whole video; "Match best source" is the old behavior (highest-resolution source decides).')
-                    fit_mode_input = gr.Radio(
-                        choices=[('Smart crop', 'crop'), ('Blurred background', 'blur'), ('Letterbox', 'pad'), ('Stretch', 'stretch')],
-                        value='crop', label='Frame fit',
-                        info='How sources with a different aspect ratio fill the frame. Smart crop follows the detected subject and trims at most ~15%; bigger mismatches get a graded blur fill, and extreme ones (e.g. vertical phone clips) a slow scanning pan.')
-                    effect_style_input = gr.Radio(
-                        choices=[('Clean', 'clean'), ('AMV', 'amv'), ('Hype', 'hype')],
-                        value='clean', label='Effect style',
-                        info='Beat-aware effects: zooms and flashes on drops, saturation pulses on the beat. Clean disables effects in every mode.')
-                    effect_intensity_input = gr.Slider(0.0, 1.0, value=0.7, step=0.05,
-                                                       label='Effect intensity')
+
+                with gr.Group():
+                    gr.Markdown('### 📝 Text Overlays')
+                    text_entries_input = gr.Textbox(
+                        label='Text entries (one per line)', lines=4, value='',
+                        placeholder='Leave empty for no text.\nEach line appears once, spread evenly across the video.\nPin an entry to a time with @: "@15 Finish strong" or "@1:23 Halfway"',
+                        info='Quotes, captions, titles — any text. Every line gets its own beat-snapped time window; @ pins one to a timestamp.')
+
+                # Tier 2 — deliberate overrides of decisions the engine already
+                # makes well. Everything keeps its variable name and values;
+                # only the container (and some labels) changed.
+                with gr.Accordion('⚙️ Advanced', open=False):
+                    gr.Markdown('**Effects**')
                     effect_mode_input = gr.Radio(
                         choices=[('Curated', 'curated'), ('Custom', 'custom'), ('Surprise shuffle', 'shuffle')],
                         value='curated', label='Effect mode',
@@ -862,15 +875,8 @@ def create_ui() -> gr.Blocks:
                     effect_seed_input = gr.Number(
                         value=0, precision=0, visible=False, label='Shuffle seed',
                         info='0 = derived from the song. Change it to re-roll the palette; renders stay reproducible.')
-                    look_input = gr.Dropdown(
-                        choices=list_looks(), value='', label='Look',
-                        info='Color grade for the whole video (baked LUTs: film, warm/cool, day-for-night). H.264/HEVC modes only; ProRes stays ungraded.')
-                    variety_input = gr.Slider(
-                        0.0, 1.0, value=0.4, step=0.05, label='Source variety',
-                        info='0 = pure quality picks (some uploads may never appear). Higher guarantees every source at least one moment and spreads usage more evenly.')
-                    speed_ramps_input = gr.Checkbox(
-                        value=False, label='Speed ramps (experimental)',
-                        info='Beat-aware retiming: slow-mo drifts on calm parts, rushes through builds, decel ramps and freeze hits on drops. Frame counts stay exact; H.264/HEVC modes only.')
+                    effect_intensity_input = gr.Slider(0.0, 1.0, value=0.7, step=0.05,
+                                                       label='Effect intensity')
 
                     def _effect_mode_updates(mode):
                         return (
@@ -884,20 +890,24 @@ def create_ui() -> gr.Blocks:
                         outputs=[effect_palette_input, effect_seed_input],
                     )
 
-                with gr.Group():
-                    gr.Markdown('### 📝 Text Overlays')
-                    text_entries_input = gr.Textbox(
-                        label='Text entries (one per line)', lines=4, value='',
-                        placeholder='Leave empty for no text.\nEach line appears once, spread evenly across the video.\nPin an entry to a time with @: "@15 Finish strong" or "@1:23 Halfway"',
-                        info='Quotes, captions, titles — any text. Every line gets its own beat-snapped time window; @ pins one to a timestamp.')
-                    with gr.Row():
-                        text_position_input = gr.Radio(
-                            choices=[('Lower third', 'bottom'), ('Center', 'center'), ('Top', 'top')],
-                            value='bottom', label='Position')
-                        text_scale_input = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label='Text size')
+                    gr.Markdown('**Editing**')
+                    variety_input = gr.Slider(
+                        0.0, 1.0, value=0.4, step=0.05, label='Source variety',
+                        info='0 = pure quality picks (some uploads may never appear). Higher guarantees every source at least one moment and spreads usage more evenly.')
+                    speed_ramps_input = gr.Checkbox(
+                        value=False, label='Speed ramps (experimental)',
+                        info='Beat-aware retiming: slow-mo drifts on calm parts, rushes through builds, decel ramps and freeze hits on drops. Frame counts stay exact; H.264/HEVC modes only.')
+                    split_screen_input = gr.Checkbox(
+                        value=True, label='Pair vertical clips (split screen)',
+                        info='Renders some high-energy segments as two vertical clips side by side. Needs two or more vertical sources; fires on hard cuts only. H.264/HEVC modes only.')
 
-                with gr.Group():
-                    gr.Markdown(f'### 🎬 Processing Mode')
+                    gr.Markdown('**Framing**')
+                    fit_mode_input = gr.Radio(
+                        choices=[('Auto (smart)', 'crop'), ('Blurred background', 'blur'), ('Letterbox', 'pad')],
+                        value='crop', label='Frame fit',
+                        info='How sources with a different aspect ratio fill the frame. Auto picks per clip: a subject-tracked crop for small mismatches (trims at most ~15%), a graded blur fill for bigger ones, and a slow scanning pan for extreme ones (e.g. vertical phone clips). Blurred background and Letterbox force that single look on every clip.')
+
+                    gr.Markdown('**Output**')
                     if NVENC_AVAILABLE:
                         processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
                     elif VIDEOTOOLBOX_AVAILABLE:
@@ -905,10 +915,13 @@ def create_ui() -> gr.Blocks:
                     else:
                         processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
                     gr.Markdown('*ProRes Precise Mode keeps footage pristine for external editing: effects, text overlays, looks and speed ramps are **not** applied there.*')
-
-                with gr.Group():
-                    gr.Markdown('### 📁 Output Settings')
+                    custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
                     output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
+                    with gr.Row():
+                        text_position_input = gr.Radio(
+                            choices=[('Lower third', 'bottom'), ('Center', 'center'), ('Top', 'top')],
+                            value='bottom', label='Text position')
+                        text_scale_input = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label='Text size')
 
                 process_btn = gr.Button('🎬 Create Music Video', variant='primary', size='lg')
 
@@ -934,6 +947,7 @@ def create_ui() -> gr.Blocks:
                 effect_style_input, effect_intensity_input,
                 effect_mode_input, effect_palette_input, effect_seed_input,
                 look_input, variety_input, speed_ramps_input,
+                split_screen_input,
                 text_entries_input, text_position_input, text_scale_input,
                 session_state
             ],

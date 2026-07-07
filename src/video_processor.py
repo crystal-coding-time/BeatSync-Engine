@@ -379,6 +379,7 @@ def create_clip_parallel(job: ClipJob):
         # Sources shorter than the segment keep the full requested duration:
         # extraction loops them (-stream_loop) instead of emitting short clips.
         retime = None
+        partner = None
         if planned_clip:
             video_file = planned_clip.get('video_file') or video_file
             video_duration = get_cached_video_duration(video_file)
@@ -401,6 +402,37 @@ def create_clip_parallel(job: ClipJob):
                     clip_start = max(0.0, min(float(planned_clip.get('start_time', 0.0)), max_start))
                 else:
                     clip_start = 0.0
+
+            # Duo segments: clamp the partner's start against its own probed
+            # duration (same policy as the primary above). Any doubt about the
+            # partner drops it and renders the primary solo — a bad probe must
+            # not kill the segment.
+            partner = planned_clip.get('partner')
+            if partner and retime:
+                # The planner strips partners from retimed clips; belt-and-braces.
+                print(f"   ⚠️  Partner dropped for clip {i + 1}: retimed segments never pair")
+                partner = None
+            if partner:
+                partner_file = partner.get('video_file')
+                if not partner_file or not os.path.exists(partner_file):
+                    print(f"   ⚠️  Partner dropped for clip {i + 1}: partner source missing ({partner_file})")
+                    partner = None
+                else:
+                    partner_duration = get_cached_video_duration(partner_file)
+                    if partner_duration <= 0:
+                        print(f"   ⚠️  Partner dropped for clip {i + 1}: could not probe partner duration")
+                        partner = None
+                    else:
+                        # Copy before clamping: the planned clip dict is shared
+                        # state (plan summaries, determinism re-runs).
+                        partner = dict(partner)
+                        partner_source = max(0.05, float(partner.get('source_duration', source_duration)))
+                        if partner_duration >= partner_source:
+                            partner_max_start = max(0.0, partner_duration - partner_source)
+                            partner['start_time'] = max(
+                                0.0, min(float(partner.get('start_time', 0.0)), partner_max_start))
+                        else:
+                            partner['start_time'] = 0.0
         else:
             # Seeded start time from video if visual planning is unavailable:
             # same inputs + settings must always render the same video.
@@ -462,6 +494,7 @@ def create_clip_parallel(job: ClipJob):
             'look_cube': opts.get('look_cube'),
             'retime': retime,
             'anchor': (planned_clip or {}).get('subject_anchor'),
+            'partner': partner,
         }
 
         success = extract_clip_segment_ffmpeg(**extract_kwargs)
@@ -493,6 +526,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                       text_entries: List[str] = None, text_position: str = 'bottom',
                       text_scale: float = 1.0, variety: float = 0.4,
                       speed_ramps: bool = False,
+                      split_screen: bool = True,
                       settings: Dict = None) -> str:
     """
     Creates a music video with video clips cut to detected beats.
@@ -539,6 +573,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         text_scale = settings.get('text_scale', text_scale)
         variety = settings.get('variety', variety)
         speed_ramps = settings.get('speed_ramps', speed_ramps)
+        split_screen = settings.get('split_screen', split_screen)
 
     video_creation_started = time.perf_counter()
 
@@ -640,6 +675,11 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     print(f"⏱️  Cut timeline: {len(selected_beats)} boundaries, {sum(segment_frames)} frames")
     if dropped_boundaries:
         print(f"   ⚠️  Dropped {dropped_boundaries} duplicate/too-close cut boundaries after frame quantization")
+    # Resolve the output canvas before planning: the planner needs it to decide
+    # duo pairing orientation (portrait panes on a landscape canvas, or the
+    # converse). Both render branches below reuse this same resolution.
+    target_size = resolve_target_resolution(output_format, video_files)
+    render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
     planned_clip_sequence = build_planned_clip_sequence(
         cut_times=selected_beats,
         segment_durations=segment_durations,
@@ -649,6 +689,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         speed_ramps=speed_ramps,
         lossless=lossless_mode,
         fps=fps,
+        # Belt-and-braces on top of the planner's own lossless gate: ProRes
+        # precise mode never pairs clips, so don't even ask for duos there.
+        split_screen=split_screen and not lossless_mode,
+        target_size=target_size,
     )
     if planned_clip_sequence:
         plan_summary = summarize_clip_plan(
@@ -691,9 +735,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         print(f"🎞️ Using FPS: {prores_fps} (for frame-perfect precision)")
 
         # Mixed-resolution sources must not reach concat stream-copy: normalize
-        # every proxy to one target frame so all segment streams are identical.
-        target_size = resolve_target_resolution(output_format, video_files)
-        render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
+        # every proxy to one target frame (resolved above, before planning) so
+        # all segment streams are identical. Planned clips in this branch only
+        # feed extract_prores_segment_random (source + start): partner dicts
+        # never reach the ProRes path.
 
         # Convert all input videos to ProRes (video only, no audio)
         prores_files = []
@@ -818,11 +863,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     
     # STANDARD MODE - Direct parallel processing (NO BATCHES)
     else:
-        # Resolve the output canvas from the chosen format (fixed 16:9/9:16
-        # presets, or legacy best-source matching).
-        target_size = resolve_target_resolution(output_format, video_files)
-        render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
-        
+        # Output canvas (target_size) was resolved above, before planning.
         print(f"\n{'='*60}")
         print(f"🎬 PROCESSING ALL CLIPS (No batch processing with FFmpeg)")
         print(f"   Total clips: {total_clips}")

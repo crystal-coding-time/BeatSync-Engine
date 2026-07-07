@@ -248,6 +248,13 @@ SCAN_CROP_LOSS = 0.40
 # average speed). Too-short segments shrink the travel instead.
 SCAN_MAX_SPEED_FRAC = 0.40
 
+# Split-screen duo panes deliberately crop past MAX_CROP_PER_AXIS (an 8:9
+# pane of a 9:16 source loses ~37% of its height) — acceptable only because
+# the window is subject-anchored/tracked (design doc Option A). Beyond this
+# cap the pane falls back to the echo blur fit at pane size instead of a
+# blind extreme crop (rare: a landscape source landing in a pane).
+PANE_MAX_CROP = 0.40
+
 # Anchors below this confidence are ignored (treated as "no anchor" →
 # centered behavior identical to the pre-anchor engine).
 ANCHOR_MIN_CONFIDENCE = 0.2
@@ -796,7 +803,8 @@ def _echo_bg_filters(target_size: Tuple[int, int], duration: float = None,
 
 
 def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None,
-                    *, duration: float = None, source_key: str = None) -> str:
+                    *, duration: float = None, source_key: str = None,
+                    label_suffix: str = '') -> str:
     """Single-input chain: echo blur fill in back, foreground centered on top.
 
     Works in both -vf and -filter_complex (a linear chain with an internal
@@ -804,17 +812,20 @@ def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None,
     mode); the limited-crop hybrid passes its own scale+crop chain (which may
     carry an anchor offset — the fg compositing itself stays centered).
     duration/source_key feed the background drift; both default to the
-    static-background behavior.
+    static-background behavior. label_suffix keeps the internal labels
+    unique when the chain appears more than once in one filter_complex
+    (split-screen panes); the default '' keeps solo graphs byte-identical.
     """
     w, h = target_size
     if fg_filters is None:
         fg_filters = [f"scale={w}:{h}:force_original_aspect_ratio=decrease"]
     bg = ",".join(_echo_bg_filters(target_size, duration, source_key))
+    ls = label_suffix
     return (
-        f"split=2[bg][fg];"
-        f"[bg]{bg}[bgb];"
-        f"[fg]{','.join(fg_filters)}[fgs];"
-        f"[bgb][fgs]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,setsar=1"
+        f"split=2[bg{ls}][fg{ls}];"
+        f"[bg{ls}]{bg}[bgb{ls}];"
+        f"[fg{ls}]{','.join(fg_filters)}[fgs{ls}];"
+        f"[bgb{ls}][fgs{ls}]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,setsar=1"
     )
 
 
@@ -875,10 +886,127 @@ def build_source_fit_chain(video_file: str, target_size: Tuple[int, int],
     return ",".join(sar_fix + [chain]) if sar_fix else chain
 
 
+# --- Split-screen duo panes (design doc: docs/DESIGN_split_screen.md) --------
+
+def _pane_sizes(target_size: Tuple[int, int]):
+    """((w0, h0), (w1, h1), 'hstack'|'vstack') pane geometry for a duo.
+
+    Landscape canvas → side-by-side panes (hstack); portrait/square →
+    stacked (vstack). The first pane takes the even-rounded half of the
+    split axis, the second takes the remainder (may differ by 2 px —
+    stacking only requires the shared axis to match).
+    """
+    tw, th = target_size
+    if tw >= th:
+        w0 = max(2, (tw // 2) // 2 * 2)
+        return (w0, th), (tw - w0, th), 'hstack'
+    h0 = max(2, (th // 2) // 2 * 2)
+    return (tw, h0), (tw, th - h0), 'vstack'
+
+
+def _pane_fit_chain(video_file: str, pane_size: Tuple[int, int], anchor: dict,
+                    duration: float, label_suffix: str) -> str | None:
+    """Filter chain fitting one duo input into its pane, or None when the
+    source can't be probed (the caller drops the partner and renders solo —
+    never a blind pane crop; the 15%-crop lesson, pane edition).
+
+    Pane policy (Option A): SAR fix, then fill-and-crop at pane size with
+    the anchored/tracked window as long as crop_loss stays within
+    PANE_MAX_CROP; beyond that (rare — a landscape source in a pane) the
+    pane falls back to the echo blur fit at pane size. No scan inside panes.
+    """
+    info = get_cached_display_info(video_file)
+    if not info:
+        return None
+    disp_w, disp_h, sar = info
+    parts: List[str] = []
+    if abs(sar - 1.0) > 0.01:
+        parts.extend(["scale=iw*sar:ih", "setsar=1"])
+    pw, ph = pane_size
+    if _crop_loss((disp_w, disp_h), pane_size) > PANE_MAX_CROP:
+        parts.append(_blur_fit_chain(pane_size, None, duration=duration,
+                                     source_key=video_file,
+                                     label_suffix=label_suffix))
+        return ",".join(parts)
+    crop = None
+    if duration and isinstance(anchor, dict) and anchor.get(PAN_PATH_KEY):
+        hx, hy = _fill_crop_headroom((disp_w, disp_h), pane_size)
+        crop = _tracked_crop(pw, ph, anchor, duration, hx, hy)
+    if crop is None:
+        crop = _anchored_crop(pw, ph, anchor)
+    parts.extend([
+        f"scale={pw}:{ph}:force_original_aspect_ratio=increase",
+        crop,
+        "setsar=1",
+    ])
+    return ",".join(parts)
+
+
+def _duo_input_plan(video_file: str, start_time: float, exact_duration: float,
+                    fps: float, anchor: dict, pane_size: Tuple[int, int],
+                    label_suffix: str):
+    """(input_args, branch_chain) for one duo input, or None if unplannable.
+
+    Mirrors the solo input logic exactly: each input gets its own loop/seek
+    decision (get_loop_input_args; a looped nonzero start seeks via
+    trim=start= in the chain, never input-side -ss — the -stream_loop
+    gotcha) and its own build_segment_pre_filters head, then the pane fit.
+    """
+    try:
+        start_time = max(0.0, float(start_time))
+    except (TypeError, ValueError):
+        return None
+    pane_fit = _pane_fit_chain(video_file, pane_size, anchor, exact_duration,
+                               label_suffix)
+    if pane_fit is None:
+        return None
+    loop_args, start_time = get_loop_input_args(video_file, start_time,
+                                                exact_duration)
+    filter_seek = bool(loop_args) and start_time > 0
+    pre_filters = build_segment_pre_filters(
+        exact_duration, fps, trim_start=start_time if filter_seek else 0.0)
+    input_args = list(loop_args)
+    if filter_seek:
+        input_args.extend(['-i', video_file])
+    else:
+        input_args.extend(['-ss', str(start_time), '-t', str(exact_duration),
+                           '-i', video_file])
+    return input_args, ",".join(pre_filters + [pane_fit])
+
+
+def _plan_duo_render(primary_file: str, primary_start: float, primary_anchor,
+                     partner: dict, exact_duration: float, fps: float,
+                     target_size: Tuple[int, int]):
+    """Plan the two-input split-screen render.
+
+    Returns ([input_args0, input_args1], [branch0, branch1],
+    'hstack'|'vstack'), or None — with a printed warning — when either input
+    can't be planned; the caller then renders the primary solo. Never
+    raises: a bad partner must not kill a segment. Deterministic: pure
+    probe-and-math, no rng.
+    """
+    try:
+        pane0, pane1, stack = _pane_sizes(target_size)
+        plan0 = _duo_input_plan(primary_file, primary_start, exact_duration,
+                                fps, primary_anchor, pane0, '0')
+        plan1 = _duo_input_plan(partner.get('video_file'),
+                                partner.get('start_time', 0.0),
+                                exact_duration, fps,
+                                partner.get('subject_anchor'), pane1, '1')
+        if plan0 is None or plan1 is None:
+            raise ValueError("pane planning failed (probe or start time)")
+        return [plan0[0], plan1[0]], [plan0[1], plan1[1]], stack
+    except Exception as e:
+        pname = os.path.basename(str((partner or {}).get('video_file') or '?'))
+        print(f"   ⚠️  Partner dropped ({pname}): {e} — rendering solo")
+        return None
+
+
 def build_text_overlay_graph(base_graph: str, fade_in_start: float,
                              fade_in_duration: float, fade_out_start: float,
-                             fade: float = 0.35) -> str:
-    """Composite input 1 (a looped transparent PNG) over the [basev] stream.
+                             fade: float = 0.35,
+                             text_input_index: int = 1) -> str:
+    """Composite the looped transparent PNG input over the [basev] stream.
 
     Text is rendered by Pillow (see text_overlay.py) because this ffmpeg
     build has no drawtext; overlay/fade/format are core filters. Fade
@@ -887,6 +1015,10 @@ def build_text_overlay_graph(base_graph: str, fade_in_start: float,
     duration means the fade completed in an earlier segment, so the filter
     is omitted (fade rejects st<0 and d=0); a fade-in with st>0 also keeps
     the text invisible before st, handling windows that open mid-segment.
+
+    text_input_index is the PNG's input position: 1 for solo segments
+    (default, byte-identical to the historic graph), 2 for split-screen
+    duos where inputs 0 and 1 are the two video sources.
     """
     txt_chain = ["format=rgba"]
     if fade_in_duration > 0.001:
@@ -894,7 +1026,7 @@ def build_text_overlay_graph(base_graph: str, fade_in_start: float,
     txt_chain.append(f"fade=t=out:st={max(0.0, fade_out_start):.4f}:d={fade:.4f}:alpha=1")
     return (
         f"{base_graph};"
-        f"[1:v]{','.join(txt_chain)}[txt];"
+        f"[{text_input_index}:v]{','.join(txt_chain)}[txt];"
         f"[basev][txt]overlay=0:0[outv]"
     )
 
@@ -1306,7 +1438,8 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                                 text_overlay: Tuple[str, float, float, float] = None,
                                 look_cube: str = None,
                                 retime: dict = None,
-                                *, anchor: dict = None) -> bool:
+                                *, anchor: dict = None,
+                                partner: dict = None) -> bool:
     """
     Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
 
@@ -1325,6 +1458,17 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
     it as a tracked pan; anchors without it (or failing any pan gate) keep
     the exact static behavior. The scan-fit tier never animates on the path
     (its own sweep would compound with the pan).
+
+    partner (optional, from the stage6 duo planner): {"video_file",
+    "start_time", "source_duration", "candidate_id", "source_name",
+    "subject_anchor"} — a second source rendered split-screen beside the
+    primary (hstack on a landscape canvas, vstack on portrait). Each input
+    keeps its own loop/seek/pre-filter logic and gets a pane-sized
+    anchored/tracked crop (PANE_MAX_CROP); effects/look/text apply to the
+    composed frame. Duos never combine with retimes or still images, and
+    any partner planning or render failure drops the partner and renders
+    the primary solo — a partner can never fail a segment. partner=None is
+    byte-identical to the pre-duo engine.
     """
     try:
         # ✅ FRAME-ACCURATE: Calculate exact output frame count first; the
@@ -1340,6 +1484,88 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         if retime and image_source:
             retime = None
             exact_source_duration = exact_output_duration
+
+        post_filters = list(extra_filters or [])
+        if look_cube:
+            # Color grade last so the look sits on top of the effects; text
+            # overlays composite after this, so text stays ungraded (white
+            # text keeps reading white on a day-for-night grade).
+            post_filters.append(_lut3d_filter(look_cube))
+
+        # Split-screen duo guards — the planner already enforces all of
+        # these; the strips below are belt-and-braces for external callers,
+        # mirroring the retime strips. A dropped partner NEVER fails the
+        # segment: the primary just renders solo through the normal ladder.
+        if partner is not None and (not isinstance(partner, dict)
+                                    or not partner.get('video_file')
+                                    or not target_size):
+            print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: invalid partner spec")
+            partner = None
+        if partner is not None and retime:
+            # A warped clock breaks the per-pane tracked pan and doubles the
+            # runway math; duos live on hard cuts at natural speed.
+            print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: retime and split-screen never combine")
+            partner = None
+        if partner is not None and (image_source
+                                    or is_image_source(partner['video_file'])):
+            print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: still images render solo")
+            partner = None
+
+        if partner is not None:
+            duo_plan = _plan_duo_render(video_file, start_time, anchor,
+                                        partner, exact_output_duration, fps,
+                                        target_size)
+            if duo_plan is None:
+                partner = None  # warning printed inside; render solo below
+            else:
+                duo_inputs, duo_branches, duo_stack = duo_plan
+                base_label = 'basev' if text_overlay else 'outv'
+                post = ("," + ",".join(post_filters)) if post_filters else ""
+                filter_graph = (
+                    f"[0:v]{duo_branches[0]}[pane0];"
+                    f"[1:v]{duo_branches[1]}[pane1];"
+                    f"[pane0][pane1]{duo_stack},setsar=1{post}[{base_label}]"
+                )
+                if text_overlay:
+                    _, fade_in_start, fade_in_duration, fade_out_start = text_overlay
+                    filter_graph = build_text_overlay_graph(
+                        filter_graph, fade_in_start, fade_in_duration,
+                        fade_out_start, text_input_index=2)
+                cmd = [FFMPEG_PATH]
+                cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
+                cmd.extend(duo_inputs[0])
+                cmd.extend(duo_inputs[1])
+                if text_overlay:
+                    cmd.extend(['-loop', '1', '-i', text_overlay[0]])
+                cmd.extend(['-filter_complex', filter_graph, '-map', '[outv]'])
+                # -vframes caps the COMPOSED stream; hstack/vstack pad a
+                # briefly-short branch by repeating its last frame
+                # (framesync default), so the cap — not the shortest branch —
+                # stays the frame-count authority.
+                cmd.extend(['-vframes', str(output_frame_count)])
+                if use_nvenc:
+                    cmd.extend(get_gpu_quality_args(gpu_encoder, include_pix_fmt=True))
+                else:
+                    cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
+                cmd.extend([
+                    '-an',
+                    '-fps_mode', 'cfr',
+                    '-r', str(fps),
+                    '-fflags', '+genpts',
+                    '-movflags', '+faststart',
+                    '-y',
+                    output_file
+                ])
+                result = _run_media_command(cmd, timeout=120)
+                if (result.returncode == 0
+                        and os.path.exists(output_file)
+                        and os.path.getsize(output_file) > 0
+                        and _verify_segment_frames(output_file, output_frame_count)):
+                    return True
+                detail = (_short_ffmpeg_error(result.stderr, 400)
+                          if result.returncode != 0 else "output verification failed")
+                print(f"   ⚠️  Duo render failed for {os.path.basename(output_file)} ({detail}) — retrying solo")
+                partner = None
 
         # Loop sources shorter than the segment (GIFs, short clips) so the
         # frame count stays exact instead of drifting. ffmpeg gotcha: with
@@ -1363,12 +1589,6 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         pre_filters = build_segment_pre_filters(
             exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0,
             retime=retime, output_duration=exact_output_duration)
-        post_filters = list(extra_filters or [])
-        if look_cube:
-            # Color grade last so the look sits on top of the effects; text
-            # overlays composite after this, so text stays ungraded (white
-            # text keeps reading white on a day-for-night grade).
-            post_filters.append(_lut3d_filter(look_cube))
 
         # Per-source fit decisions: SAR normalization for anamorphic inputs,
         # the limited-crop hybrid when plain Smart crop would discard more

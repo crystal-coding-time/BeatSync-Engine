@@ -155,7 +155,7 @@ QUICK_START_GUIDE = """### 💡 Quick Start
 3. Done! Automatic audio-visual cuts
 
 **🎯 Lossless (ProRes):**
-- Select **ProRes 422 Proxy** mode for frame-perfect quality
+- Select **ProRes 422 Proxy** under ⚙️ Advanced for frame-perfect quality
 
 ---
 

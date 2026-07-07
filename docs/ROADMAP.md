@@ -171,6 +171,38 @@ whole video to portrait). The output canvas is now fixed and the fit engine foll
   known segment duration — ProRes proxies (whole-file, duration-less) keep static centered
   framing per the precise-mode-stays-pristine rule
 
+## Phase 4.6 — split-screen vertical pairing ✅ (2026-07-07)
+Design doc: `docs/DESIGN_split_screen.md`. Two portrait clips share one landscape frame
+(concert-multicam idiom) instead of each fighting the fit ladder — **on by default**
+(owner call; GUI "Pair vertical clips" checkbox disables):
+- Planner (`stage6_av_planner.py`): duos fire on drop/rhythm segments (impact ≥ 0.5),
+  seeded ~1 in 4 eligible, never adjacent; the partner is a mini-auction over a *different*
+  portrait source (score minus the standard penalties, brightness-coherence gate, anchor
+  preferred). Partner counts toward usage + source coverage. `split_screen`/`target_size`
+  kwargs on `build_planned_clip_sequence`; off = byte-identical legacy plans. Duos never
+  combine with retimes or stills; generalizes to landscape pairs stacked on a 9:16 canvas
+- Renderer (`ffmpeg_processing.py`): two-input filter_complex — per-input loop/seek +
+  pre-filters, pane fit via the anchored/tracked crop at `PANE_MAX_CROP` (0.40; a pane crop
+  is a deliberate style, and the subject anchor is what makes it safe), hstack/vstack,
+  effects/look/text on the composed frame (`build_text_overlay_graph` gained
+  `text_input_index`). Every failure path degrades to a solo render — a bad partner never
+  kills a segment. ProRes precise mode never sees duos
+- Plumbing (`gui.py`/`video_processor.py`): checkbox → planner; partner start-clamp +
+  drop-to-solo fallbacks in `create_clip_parallel`; `resolve_target_resolution` hoisted
+  above planning so the planner knows the canvas
+
+## Phase 4.7 — intent-based UI ✅ (2026-07-07)
+Design doc: `docs/DESIGN_ui_redesign.md` (owner: no preset picker; Stretch removed from the
+UI, engine value kept). Pure layout reorg of `create_ui()` — zero engine/signature changes,
+the process inputs list order untouched by construction:
+- Tier 1: files, Style (relabeled Minimal / Music video / Hype — values frozen), Look,
+  Output canvas, Text entries
+- Tier 2: one collapsed ⚙️ Advanced accordion (effect mode/palette/seed/intensity, variety,
+  speed ramps, split-screen, frame fit, processing mode + ProRes note, custom FPS,
+  filename, text position/size)
+- Frame fit is now Auto (the smart ladder) / Blurred background / Letterbox; `'stretch'`
+  survives for headless/settings callers only
+
 ## Phase 5 — full automation ⬜
 - Watch-folder mode built on the existing `video_processor.py` CLI: drop audio + clips, video appears in `output/`
 - launchd job on macOS; candidate for running on the-all-thing server later

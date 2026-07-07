@@ -27,6 +27,25 @@ def _stable_rng(*parts) -> random.Random:
     return random.Random(seed)
 
 
+# --- Split-screen duo segments (see docs/DESIGN_split_screen.md) -------------
+# A duo pairs the auction's primary clip with a partner clip from a different
+# cross-orientation source (portrait sources on a landscape canvas, or the
+# converse). The planner only ever ADDS a "partner" key: primary selection,
+# reservations and transitions are bit-identical with split_screen off.
+
+# Seeded rarity cap: ~1 in 4 eligible segments becomes a duo.
+DUO_RATE = 0.25
+# Duos live on hard cuts: drop/rhythm targets with at least this impact.
+DUO_TARGETS = frozenset({"drop", "rhythm"})
+DUO_MIN_IMPACT = 0.5
+# Brightness-coherence gate: panes whose mean brightness differs by more than
+# this clash side by side, so such partners are skipped outright.
+DUO_BRIGHTNESS_MAX_DELTA = 0.30
+# Partners whose subject anchor is below ANCHOR_MIN_CONFIDENCE still compete,
+# but at a deficit — the pane crop should land on a subject.
+DUO_LOW_ANCHOR_PENALTY = 0.12
+
+
 def build_planned_clip_sequence(
     cut_times: Sequence[float],
     segment_durations: Sequence[float],
@@ -36,6 +55,8 @@ def build_planned_clip_sequence(
     speed_ramps: bool = False,
     lossless: bool = False,
     fps: float = 30.0,
+    split_screen: bool = False,
+    target_size: tuple | None = None,
 ) -> List[Dict]:
     """Build exact source clip choices for every output segment.
 
@@ -46,6 +67,15 @@ def build_planned_clip_sequence(
     weak sources can lose every pick). Any variety>0 reserves one segment per
     source so everything the user uploaded appears at least once, and scales
     the per-source reuse penalty toward an even spread at 1.0.
+
+    split_screen=False (the default) produces byte-identical plans to the
+    pre-duo planner. When True, some eligible drop/rhythm segments gain an
+    additive "partner" dict (a second, cross-orientation source for a 2-up
+    pane composite); everything else about the plan is unchanged apart from
+    the partner's usage accounting. target_size is the output canvas
+    (width, height) used only to decide pairing orientation — the caller
+    (video_processor, wave 7C) passes its resolved target resolution; None is
+    treated as a landscape 16:9 canvas.
     """
     beat_info = beat_info or {}
     video_analysis = beat_info.get("video_analysis") or {}
@@ -75,6 +105,14 @@ def build_planned_clip_sequence(
         file_cap = float("inf")
         reservations = _plan_coverage_reservations(candidates, profiles)
 
+    # Duo pairing needs ≥2 distinct cross-orientation, non-still sources; the
+    # context is None whenever duos are impossible (including lossless mode:
+    # the ProRes branch must stay pristine), which keeps every plan bit-equal
+    # to the split_screen=False path.
+    duo_pair_files = None
+    if split_screen and not lossless:
+        duo_pair_files = _duo_pair_files(candidates, target_size)
+
     recent_ids = deque(maxlen=10)
     recent_videos = deque(maxlen=5)
     usage = Counter()
@@ -102,11 +140,35 @@ def build_planned_clip_sequence(
             profile=profile,
             index=i,
         )
+        partner_candidate = None
+        if duo_pair_files is not None:
+            partner_candidate = _maybe_choose_duo_partner(
+                candidates=candidates,
+                profile=profile,
+                primary=candidate,
+                planned=planned,
+                index=i,
+                pair_files=duo_pair_files,
+                recent_ids=recent_ids,
+                recent_videos=recent_videos,
+                usage=usage,
+                file_rate=file_rate,
+                file_cap=file_cap,
+            )
+        if partner_candidate is not None:
+            planned_clip["partner"] = _materialize_partner(
+                partner_candidate, profile)
         planned.append(planned_clip)
         recent_ids.append(candidate.get("id"))
         recent_videos.append(candidate.get("video_file"))
         usage[candidate.get("id")] += 1
         usage[candidate.get("video_file")] += 1
+        if partner_candidate is not None:
+            # A pane appearance is an appearance: the partner pays the same
+            # reuse/recency costs going forward and counts for coverage.
+            recent_videos.append(partner_candidate.get("video_file"))
+            usage[partner_candidate.get("id")] += 1
+            usage[partner_candidate.get("video_file")] += 1
 
     if len(planned) != len(durations_arr):
         return []
@@ -138,6 +200,10 @@ def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
 
     by_id = {c.get("id"): c for c in candidates}
     for clip in planned:
+        if "partner" in clip:
+            # Duo segments never retime: a warped clock breaks both panes'
+            # tracked crops and doubles the source-runway math.
+            continue
         video_file = clip.get("video_file")
         final_duration = float(clip.get("final_duration", 0.0))
         if not video_file or is_image_source(video_file):
@@ -341,7 +407,12 @@ def summarize_clip_plan(plan: Sequence[Dict],
         return {"clip_count": 0, "targets": {}, "ai_tagged": 0}
     targets = Counter(str(item.get("target", "flow")) for item in plan)
     ai_tagged = sum(1 for item in plan if item.get("ai_analyzed"))
-    source_count = len(set(item.get("video_file") for item in plan))
+    # A source seen in a duo pane has been seen: partners count for coverage.
+    seen_files = [item.get("video_file") for item in plan]
+    seen_files += [item["partner"].get("video_file") for item in plan
+                   if isinstance(item.get("partner"), dict)]
+    source_count = len(set(seen_files))
+    duo_count = sum(1 for item in plan if item.get("partner"))
     transitions = Counter(
         str((item.get("transition_out") or {}).get("type"))
         for item in plan if item.get("transition_out")
@@ -358,10 +429,11 @@ def summarize_clip_plan(plan: Sequence[Dict],
         "transitions": dict(transitions),
         "retimes": dict(retimes),
     }
+    if duo_count:
+        summary["duos"] = duo_count
     if video_files is not None:
         import os
-        usage = Counter(os.path.basename(str(item.get("video_file")))
-                        for item in plan)
+        usage = Counter(os.path.basename(str(f)) for f in seen_files)
         candidate_files = {os.path.basename(str(c.get("video_file")))
                            for c in (candidates or [])}
         all_files = [os.path.basename(str(p)) for p in video_files]
@@ -581,9 +653,14 @@ def _rebase_subject_anchor(candidate: Dict, start_time: float,
     return out
 
 
-def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
-    final_duration = max(0.05, float(profile["duration"]))
-    source_duration = final_duration
+def _plan_source_window(candidate: Dict, profile: Dict) -> tuple:
+    """(start_time, source_duration) for a candidate serving a segment.
+
+    This is the single authority for source-window semantics — the primary
+    clip (_materialize_clip) and a duo partner (_materialize_partner) must
+    place their windows identically, so the math lives here once.
+    """
+    source_duration = max(0.05, float(profile["duration"]))
     video_duration = max(source_duration, float(candidate.get("video_duration", source_duration)))
     target = profile.get("target", "flow")
 
@@ -602,6 +679,13 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
 
     start_time = anchor - source_duration * align
     start_time = max(0.0, min(start_time, max(0.0, video_duration - source_duration)))
+    return start_time, source_duration
+
+
+def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
+    final_duration = max(0.05, float(profile["duration"]))
+    start_time, source_duration = _plan_source_window(candidate, profile)
+    target = profile.get("target", "flow")
 
     return {
         "index": index,
@@ -621,4 +705,142 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
         "audio_end": profile.get("end"),
         "wave": profile.get("wave"),
         "impact": profile.get("impact"),
+    }
+
+
+def _duo_pair_files(candidates: Sequence[Dict], target_size) -> set | None:
+    """Sources eligible to occupy a duo pane, or None when duos are impossible.
+
+    A pane source must be cross-orientation relative to the canvas (portrait
+    display AR < 1.0 on a landscape canvas; the converse stacks on a portrait
+    canvas), a real video (still images are a v1 exclusion — no Ken Burns
+    interplay inside panes), and probeable. Display AR comes from the shared
+    ffprobe cache so orientation matches what the renderer's fit ladder sees
+    (SAR folded in). Fewer than two such sources means no segment can ever
+    pair, so the whole feature short-circuits to None.
+    """
+    from ffmpeg_processing import get_cached_display_info, is_image_source
+
+    tw, th = (1920.0, 1080.0)
+    if target_size:
+        try:
+            tw, th = float(target_size[0]), float(target_size[1])
+        except (TypeError, ValueError, IndexError):
+            tw, th = (1920.0, 1080.0)
+    want_portrait = tw >= th  # landscape (or square) canvas pairs portrait sources
+
+    pair_files: set = set()
+    for video_file in sorted({str(c.get("video_file")) for c in candidates
+                              if c.get("video_file")}):
+        if is_image_source(video_file):
+            continue
+        info = get_cached_display_info(video_file)
+        if not info or info[1] <= 0:
+            continue
+        aspect = info[0] / info[1]
+        if (aspect < 1.0) if want_portrait else (aspect > 1.0):
+            pair_files.add(video_file)
+    if len(pair_files) < 2:
+        return None
+    return pair_files
+
+
+def _maybe_choose_duo_partner(
+    candidates: Sequence[Dict],
+    profile: Dict,
+    primary: Dict,
+    planned: List[Dict],
+    index: int,
+    pair_files: set,
+    recent_ids: deque,
+    recent_videos: deque,
+    usage: Counter,
+    file_rate: float,
+    file_cap: float,
+) -> Dict | None:
+    """Partner candidate for a duo segment, or None to render the primary solo.
+
+    Eligibility gates (all deterministic), then a seeded rarity roll, then a
+    mini-auction over candidates from OTHER pane-eligible sources. The primary
+    pick is never touched — this only decides whether it gets a pane-mate.
+    """
+    if str(profile.get("target", "flow")) not in DUO_TARGETS:
+        return None
+    if _clamp(profile.get("impact", 0.0), default=0.0) < DUO_MIN_IMPACT:
+        return None
+    # Never two duo segments adjacent: a run of split screens reads as a
+    # wall, not an accent. (planned[-1] is the previous output segment.)
+    if planned and "partner" in planned[-1]:
+        return None
+    primary_file = primary.get("video_file")
+    if primary_file not in pair_files:
+        # The idiom pairs two cross-orientation clips; a landscape primary on
+        # a landscape canvas keeps its normal solo fit.
+        return None
+
+    rng = _stable_rng("duo", index, profile.get("start"), profile.get("target"))
+    if rng.random() >= DUO_RATE:
+        return None
+
+    from ffmpeg_processing import ANCHOR_MIN_CONFIDENCE
+
+    primary_brightness = _clamp(primary.get("brightness", 0.5), default=0.5)
+    best_candidate = None
+    best_score = -999.0
+    for candidate in candidates:
+        video_file = candidate.get("video_file")
+        if video_file == primary_file or video_file not in pair_files:
+            continue
+        brightness = _clamp(candidate.get("brightness", 0.5), default=0.5)
+        if abs(brightness - primary_brightness) > DUO_BRIGHTNESS_MAX_DELTA:
+            continue
+
+        # Same shape as the primary auction: fit score minus recent-use and
+        # usage penalties (plus the short-source penalty — a looping pane on
+        # a drop is worse than no pane at all).
+        score = _score_candidate(candidate, profile)
+        cid = candidate.get("id")
+        if cid in recent_ids:
+            score -= 0.28
+        if video_file in recent_videos:
+            score -= 0.10
+        score -= min(0.28, usage[cid] * 0.10)
+        score -= min(file_cap, usage[video_file] * file_rate)
+        required_source = max(0.05, profile["duration"])
+        candidate_duration = max(0.05, float(candidate.get("duration", required_source)))
+        if candidate_duration < required_source * 0.55:
+            score -= 0.18
+
+        anchor = candidate.get("subject_anchor")
+        try:
+            confidence = float((anchor or {}).get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < ANCHOR_MIN_CONFIDENCE:
+            score -= DUO_LOW_ANCHOR_PENALTY
+
+        score += rng.random() * 0.015
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+
+    return best_candidate
+
+
+def _materialize_partner(candidate: Dict, profile: Dict) -> Dict:
+    """The additive "partner" payload carried by a duo's planned clip.
+
+    Window semantics are identical to the primary's (_plan_source_window is
+    shared), and the subject anchor is rebased onto the segment clock exactly
+    as for the primary so the pane crop can track the subject.
+    """
+    start_time, source_duration = _plan_source_window(candidate, profile)
+    return {
+        "video_file": candidate.get("video_file"),
+        "start_time": start_time,
+        "source_duration": source_duration,
+        "candidate_id": candidate.get("id"),
+        "source_name": candidate.get("source_name"),
+        "subject_anchor": _rebase_subject_anchor(candidate, start_time,
+                                                 source_duration),
     }
