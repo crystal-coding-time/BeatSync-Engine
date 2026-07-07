@@ -50,7 +50,7 @@ from ffmpeg_processing import (
 )
 from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_clip_plan
 from effects import build_effect_filters
-from text_overlay import plan_text_overlays, render_text_png, overlay_fade_times
+from text_overlay import parse_text_entries, plan_text_windows, render_text_png
 
 # Import mode modules
 from auto_mode import analyze_beats_auto
@@ -656,9 +656,14 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         
         text_plan = {}
         if text_entries:
-            windows = plan_text_overlays(text_entries, segment_durations, planned_clip_sequence)
+            entries = parse_text_entries(text_entries)
+            seg_map, schedule = plan_text_windows(
+                entries, selected_beats,
+                beat_times=(beat_info or {}).get('beat_times'),
+                planned_clip_sequence=planned_clip_sequence,
+            )
             png_cache = {}
-            for seg_idx, (text, offset, window_dur) in windows.items():
+            for seg_idx, (text, fade_in_start, fade_in_duration, fade_out_start) in seg_map.items():
                 png = png_cache.get(text)
                 if png is None:
                     png_path = os.path.join(session_temp_dir, f"text_{len(png_cache):03d}.png")
@@ -666,10 +671,9 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                                           position=text_position, scale=text_scale)
                     png_cache[text] = png
                 if png:
-                    fade_in_duration, fade_out_start = overlay_fade_times(offset, window_dur)
-                    text_plan[seg_idx] = (png, fade_in_duration, fade_out_start)
-            if text_plan:
-                print(f"   Text overlays: 📝 {len(png_cache)} entries across {len(text_plan)} segments")
+                    text_plan[seg_idx] = (png, fade_in_start, fade_in_duration, fade_out_start)
+            for text, ws, we in schedule:
+                print(f"   Text overlay: 📝 {ws:6.2f}s–{we:6.2f}s  {text[:60]!r}")
 
         render_opts = {
             'fit_mode': fit_mode,

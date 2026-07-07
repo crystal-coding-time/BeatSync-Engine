@@ -102,56 +102,144 @@ def render_text_png(text: str, target_size: Tuple[int, int], out_path: str,
     return out_path
 
 
-def plan_text_overlays(texts: Sequence[str], segment_durations: Sequence[float],
-                       planned_clip_sequence: Optional[Sequence[Dict]]) -> Dict[int, Tuple[str, float, float]]:
-    """Map segment index -> (text, window_offset, window_duration).
+def parse_text_entries(lines: Sequence[str]) -> List[Tuple[str, Optional[float]]]:
+    """Parse entry lines into (text, pinned_time_seconds_or_None).
 
-    Entries are spread chronologically (one per equal timeline bin). Each is
-    anchored on the longest non-drop segment in its bin and extended across
-    following unclaimed segments until readable (~3s).
+    A line starting with '@<time> ' pins the entry: '@15 Finish strong' or
+    '@1:23 Halfway there'. Anything else is auto-placed.
     """
-    total = len(segment_durations)
-    if not texts or total == 0:
-        return {}
+    entries: List[Tuple[str, Optional[float]]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        pin = None
+        if line.startswith('@'):
+            head, _, rest = line.partition(' ')
+            stamp = head[1:]
+            try:
+                if ':' in stamp:
+                    minutes, seconds = stamp.split(':', 1)
+                    pin = int(minutes) * 60 + float(seconds)
+                else:
+                    pin = float(stamp)
+                line = rest.strip()
+            except ValueError:
+                pin = None
+        if line:
+            entries.append((line, pin))
+    return entries
 
-    def is_drop(i: int) -> bool:
+
+def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
+                      cut_times: Sequence[float],
+                      beat_times: Optional[Sequence[float]] = None,
+                      planned_clip_sequence: Optional[Sequence[Dict]] = None,
+                      ) -> Tuple[Dict[int, Tuple[str, float, float, float]], List[Tuple[str, float, float]]]:
+    """Plan text on the global audio timeline, then project onto segments.
+
+    Every entry gets its own disjoint time window: unpinned entries are
+    centered in equal timeline shares, pinned entries go where asked; window
+    starts snap to the nearest beat (preferring non-drop segments). Windows
+    are then projected onto every segment they intersect, with fade timings
+    translated into each segment's local clock.
+
+    Returns (seg_map, schedule):
+      seg_map:  segment index -> (text, fade_in_start, fade_in_duration, fade_out_start)
+      schedule: [(text, window_start, window_end)] for logging.
+    """
+    cut_times = [float(t) for t in cut_times]
+    if not entries or len(cut_times) < 2:
+        return {}, []
+    timeline_start, timeline_end = cut_times[0], cut_times[-1]
+    total = timeline_end - timeline_start
+    if total <= 0.5:
+        return {}, []
+
+    def segment_at(time_s: float) -> int:
+        for i in range(len(cut_times) - 1):
+            if cut_times[i] <= time_s < cut_times[i + 1]:
+                return i
+        return len(cut_times) - 2
+
+    def is_drop_segment(i: int) -> bool:
         if not planned_clip_sequence or i >= len(planned_clip_sequence):
             return False
-        clip = planned_clip_sequence[i] or {}
-        return str(clip.get('target', '')) == 'drop'
+        return str((planned_clip_sequence[i] or {}).get('target', '')) == 'drop'
 
-    plan: Dict[int, Tuple[str, float, float]] = {}
-    n = len(texts)
-    for t_idx, text in enumerate(texts):
-        lo = round(t_idx * total / n)
-        hi = max(lo + 1, round((t_idx + 1) * total / n))
-        candidates = [i for i in range(lo, min(hi, total)) if i not in plan]
-        if not candidates:
+    snap_points = sorted(float(b) for b in (beat_times if beat_times is not None and len(beat_times) else cut_times))
+
+    def snap(time_s: float, radius: float) -> float:
+        nearby = [b for b in snap_points if abs(b - time_s) <= radius]
+        if not nearby:
+            return time_s
+        # Prefer beats that don't start on a drop cut, then the closest.
+        return min(nearby, key=lambda b: (is_drop_segment(segment_at(b)), abs(b - time_s)))
+
+    n = len(entries)
+    share = total / n
+    duration_cap = max(1.0, min(MIN_READABLE_SECONDS + 2 * FADE_SECONDS, share * 0.95))
+
+    placed: List[Tuple[str, float, float]] = []
+
+    def overlapping(start: float, end: float) -> Optional[Tuple[str, float, float]]:
+        for w in placed:
+            if min(end, w[2]) - max(start, w[1]) > 0.0:
+                return w
+        return None
+
+    # Pinned entries claim their time first; auto entries then flow around them.
+    for text, pin in entries:
+        if pin is None:
             continue
-        anchor = max(candidates, key=lambda i: (not is_drop(i), segment_durations[i]))
+        start = snap(max(timeline_start, min(pin, timeline_end - duration_cap)), radius=1.5)
+        end = min(start + duration_cap, timeline_end)
+        clash = overlapping(start, end)
+        while clash is not None:
+            start = clash[2] + 0.15
+            end = start + duration_cap
+            clash = overlapping(start, end) if end <= timeline_end else None
+        if end > timeline_end or end - start < 0.8:
+            print(f"   ⚠️  Text overlay skipped (no room at pinned time): {text[:40]!r}")
+            continue
+        placed.append((text, start, end))
 
-        window = [anchor]
-        acc = segment_durations[anchor]
-        j = anchor + 1
-        while acc < MIN_READABLE_SECONDS and j < total and j not in plan:
-            window.append(j)
-            acc += segment_durations[j]
-            j += 1
+    for k, (text, pin) in enumerate(entries):
+        if pin is not None:
+            continue
+        share_start = timeline_start + k * share
+        start = snap(share_start + (share - duration_cap) / 2, radius=share / 3)
+        end = start + duration_cap
+        clash = overlapping(start, end)
+        if clash is not None:
+            # Try after the clashing window, then before it.
+            after = (clash[2] + 0.15, clash[2] + 0.15 + duration_cap)
+            before = (clash[1] - 0.15 - duration_cap, clash[1] - 0.15)
+            if after[1] <= timeline_end and overlapping(*after) is None:
+                start, end = after
+            elif before[0] >= timeline_start and overlapping(*before) is None:
+                start, end = before
+            else:
+                print(f"   ⚠️  Text overlay skipped (no room left on timeline): {text[:40]!r}")
+                continue
+        placed.append((text, start, end))
 
-        offset = 0.0
-        for i in window:
-            plan[i] = (text, offset, acc)
-            offset += segment_durations[i]
-    return plan
+    schedule = sorted(placed, key=lambda w: w[1])
 
-
-def overlay_fade_times(window_offset: float, window_duration: float) -> Tuple[float, float]:
-    """(fade_in_duration, fade_out_start) in the segment's local clock.
-
-    ffmpeg's fade filter rejects negative start times, so the fade-in always
-    starts at 0: continuation segments (offset past the fade) get duration 0,
-    meaning "skip the fade-in filter"; partial overlaps get the remainder.
-    """
-    fade_in_duration = max(0.0, min(FADE_SECONDS, FADE_SECONDS - window_offset))
-    fade_out_start = max(0.0, (window_duration - window_offset) - FADE_SECONDS)
-    return fade_in_duration, fade_out_start
+    seg_map: Dict[int, Tuple[str, float, float, float]] = {}
+    for text, ws, we in schedule:
+        for i in range(len(cut_times) - 1):
+            seg_start, seg_end = cut_times[i], cut_times[i + 1]
+            if min(we, seg_end) - max(ws, seg_start) <= 0.01:
+                continue
+            local_start = ws - seg_start
+            local_end = we - seg_start
+            if local_start >= 0:
+                fade_in_start, fade_in_duration = local_start, FADE_SECONDS
+            else:
+                # Fade began in an earlier segment; only the remainder (if
+                # any) plays here. ffmpeg's fade rejects st<0.
+                fade_in_start, fade_in_duration = 0.0, max(0.0, FADE_SECONDS + local_start)
+            fade_out_start = max(0.0, local_end - FADE_SECONDS)
+            seg_map[i] = (text, fade_in_start, fade_in_duration, fade_out_start)
+    return seg_map, schedule

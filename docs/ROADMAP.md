@@ -34,7 +34,8 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
 
 ## Phase 3 — text overlay system ✅ (2026-07-06)
 - General-purpose text over the video at planned moments (quotes, captions, titles — any text), entered one-per-line in the GUI
-- `src/text_overlay.py`: entries spread chronologically, anchored on the longest non-drop segment of each timeline bin, spanning consecutive segments until readable (~3s), alpha fades aligned to cuts
+- `src/text_overlay.py`: planning happens on the **global audio timeline**, not segment indexes — every entry gets its own disjoint, beat-snapped time window (guaranteed to appear), which is then projected onto whatever segments it intersects with fades translated to each segment's local clock
+- `@<time>` prefix pins an entry (`@15 Finish strong`, `@1:23 Halfway`); pinned windows take priority, auto-placed entries flow around them
 - Rendering: **Pillow → transparent PNG → ffmpeg `overlay`** (core filter), NOT drawtext — Homebrew ffmpeg ships without libfreetype/libass. Bonus: real word wrapping, stroke + shadow, any TTF (auto-detects Arial Bold on macOS; `BEATSYNC_FONT` overrides)
 - GUI: text entries box, position (lower third/center/top), size slider
 - Gotcha encoded in code: ffmpeg `fade` rejects negative `st` — continuation segments omit the fade-in filter instead

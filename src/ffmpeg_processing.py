@@ -206,19 +206,23 @@ def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
     )
 
 
-def build_text_overlay_graph(base_graph: str, fade_in_duration: float,
-                             fade_out_start: float, fade: float = 0.35) -> str:
+def build_text_overlay_graph(base_graph: str, fade_in_start: float,
+                             fade_in_duration: float, fade_out_start: float,
+                             fade: float = 0.35) -> str:
     """Composite input 1 (a looped transparent PNG) over the [basev] stream.
 
     Text is rendered by Pillow (see text_overlay.py) because this ffmpeg
-    build has no drawtext; overlay/fade/format are core filters. A zero
-    fade-in duration means the fade completed in an earlier segment of the
-    text window, so the filter is omitted (fade rejects st<0 and d=0).
+    build has no drawtext; overlay/fade/format are core filters. Fade
+    timings are in the segment's local clock (text_overlay.plan_text_windows
+    projects the global text window onto each segment). A zero fade-in
+    duration means the fade completed in an earlier segment, so the filter
+    is omitted (fade rejects st<0 and d=0); a fade-in with st>0 also keeps
+    the text invisible before st, handling windows that open mid-segment.
     """
     txt_chain = ["format=rgba"]
     if fade_in_duration > 0.001:
-        txt_chain.append(f"fade=t=in:st=0:d={fade_in_duration:.4f}:alpha=1")
-    txt_chain.append(f"fade=t=out:st={fade_out_start:.4f}:d={fade:.4f}:alpha=1")
+        txt_chain.append(f"fade=t=in:st={max(0.0, fade_in_start):.4f}:d={fade_in_duration:.4f}:alpha=1")
+    txt_chain.append(f"fade=t=out:st={max(0.0, fade_out_start):.4f}:d={fade:.4f}:alpha=1")
     return (
         f"{base_graph};"
         f"[1:v]{','.join(txt_chain)}[txt];"
@@ -415,7 +419,7 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                                 gpu_encoder: str = 'h264_nvenc',
                                 fit_mode: str = 'crop',
                                 extra_filters: List[str] = None,
-                                text_overlay: Tuple[str, float, float] = None) -> bool:
+                                text_overlay: Tuple[str, float, float, float] = None) -> bool:
     """
     Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
     
@@ -433,8 +437,9 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         pre_filters = [f"trim=duration={exact_source_duration}", "setpts=PTS-STARTPTS", f"fps={fps}"]
         post_filters = list(extra_filters or [])
 
-        # text_overlay: (png_path, fade_in_start, fade_out_start) in this
-        # segment's local clock — see text_overlay.overlay_fade_times.
+        # text_overlay: (png_path, fade_in_start, fade_in_duration,
+        # fade_out_start) in this segment's local clock — see
+        # text_overlay.plan_text_windows.
         use_blur_graph = bool(target_size) and fit_mode == 'blur'
         use_graph = use_blur_graph or bool(text_overlay)
         filter_graph = None
@@ -452,8 +457,9 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
             if use_graph:
                 filter_graph = f"[0:v]{filter_complex}[{base_label}]"
         if text_overlay:
-            _, fade_in_duration, fade_out_start = text_overlay
-            filter_graph = build_text_overlay_graph(filter_graph, fade_in_duration, fade_out_start)
+            _, fade_in_start, fade_in_duration, fade_out_start = text_overlay
+            filter_graph = build_text_overlay_graph(filter_graph, fade_in_start,
+                                                    fade_in_duration, fade_out_start)
         
         # Build FFmpeg command
         cmd = [FFMPEG_PATH]

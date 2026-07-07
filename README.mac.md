@@ -58,7 +58,7 @@ Effects apply to the H.264/HEVC modes only; ProRes precise mode stays untouched 
 
 ## Text overlays
 
-Enter lines in the "Text entries" box (one entry per line — quotes, captions, titles, anything). Entries are spread across the video chronologically, shown on calmer segments (never anchored on a drop cut), kept on screen ~3 seconds spanning cuts, and faded in/out. Position (lower third/center/top) and size are configurable. Text renders via Pillow with Arial Bold by default; set `BEATSYNC_FONT=/path/to/font.ttf` to change the font. Like effects, text applies to H.264/HEVC modes only.
+Enter lines in the "Text entries" box (one entry per line — quotes, captions, titles, anything). Every line is guaranteed its own time window: entries are spaced evenly across the video, window starts snap to beats (preferring non-drop moments), each stays on screen ~3 seconds spanning cuts, fading in/out. Pin an entry to a moment with `@`: `@15 Finish strong` or `@1:23 Halfway there` — pins win, auto-placed entries move around them. The render log prints the exact schedule. Position (lower third/center/top) and size are configurable. Text renders via Pillow with Arial Bold by default; set `BEATSYNC_FONT=/path/to/font.ttf` to change the font. Like effects, text applies to H.264/HEVC modes only.
 
 ## Docs
 

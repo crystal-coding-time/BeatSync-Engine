@@ -718,8 +718,8 @@ def create_ui() -> gr.Blocks:
                     gr.Markdown('### 📝 Text Overlays')
                     text_entries_input = gr.Textbox(
                         label='Text entries (one per line)', lines=4, value='',
-                        placeholder='Leave empty for no text.\nEach line appears once, spread across the video.',
-                        info='Quotes, captions, titles — any text. Shown on calmer segments, fading on beat cuts.')
+                        placeholder='Leave empty for no text.\nEach line appears once, spread evenly across the video.\nPin an entry to a time with @: "@15 Finish strong" or "@1:23 Halfway"',
+                        info='Quotes, captions, titles — any text. Every line gets its own beat-snapped time window; @ pins one to a timestamp.')
                     with gr.Row():
                         text_position_input = gr.Radio(
                             choices=[('Lower third', 'bottom'), ('Center', 'center'), ('Top', 'top')],
