@@ -20,6 +20,7 @@ the same video (same seeding approach as the stage 6 planner).
 """
 
 import hashlib
+import math
 import os
 import random
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -99,6 +100,60 @@ def _fx_push_pull_zoom(ctx) -> None:
         f"zoompan=z='{zoom_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
         f":s={ctx['target_size'][0]}x{ctx['target_size'][1]}:fps={ctx['fps']}"
     )
+
+
+def _fx_dutch_tilt(ctx) -> None:
+    # Dutch tilt: rotate the already-fit frame a few degrees and overscan so
+    # no corners/background show — reads as extra energy on hard cuts. The
+    # overscan scale is the closed-form cover bound for a WxH frame rotated
+    # by angle a: s = cos(a) + max(W/H, H/W)*sin(a) satisfies both axes
+    # (W*s >= W*cos+H*sin and H*s >= H*cos+W*sin), so one factor covers
+    # landscape and portrait canvases alike. scale/rotate/crop are all 1:1
+    # per-frame filters, so the segment frame count is untouched.
+    #
+    # IMPORTANT: this builder never touches ctx['rng'] — it draws from its
+    # own stable rng so inserting it into the curated sequence cannot shift
+    # the historical styles' draw order (see _CURATED_SEQUENCE note).
+    if not ctx['target_size'] or ctx['pack'] >= ctx['pack_cap']:
+        return
+    if ctx['target'] not in ('drop', 'rhythm'):
+        return
+    seed_parts = ['fx_dutch', ctx['segment_index'], ctx['clip'].get('video_file', ''), ctx['style']]
+    if not ctx['curated']:
+        seed_parts.extend([ctx['mode'], ctx['palette_seed']])
+    tilt_rng = _stable_rng(*seed_parts)
+    # Rare in curated mode (~1 in 6 eligible drop/rhythm segments, and only
+    # AMV/Hype ever reach the builders); boosted in custom/shuffle so a
+    # ticked palette entry actually shows up.
+    chance = (1.0 / 6.0) if ctx['curated'] else 0.5 * ctx['k']
+    if tilt_rng.random() >= chance:
+        return
+    # 4-8 degrees at full intensity, scaled by k like the other primitives'
+    # amplitudes; floored (shake-style) so a fired tilt is never invisible.
+    deg = max(1.5, tilt_rng.uniform(4.0, 8.0) * ctx['k'])
+    rad = math.radians(deg)
+    sign = 1.0 if ctx['segment_index'] % 2 == 0 else -1.0  # alternate by parity
+    w, h = ctx['target_size']
+    cover = math.cos(rad) + max(w / h, h / w) * math.sin(rad)
+    cover *= 1.005  # rounding margin
+    sw = int(math.ceil(w * cover / 2.0)) * 2
+    sh = int(math.ceil(h * cover / 2.0)) * 2
+    beats = ctx['beats']
+    if len(beats) >= 2:
+        # Beat-alternating flavor: the sign flips every inter-beat interval
+        # (same span construction as beat_flip). rotate evaluates 'a' per
+        # frame, so this stays a pure expression — no frame-count risk.
+        spans = []
+        for j in range(0, len(beats), 2):
+            span_end = beats[j + 1] if j + 1 < len(beats) else beats[j] + (beats[j] - beats[j - 1])
+            spans.append(f"between(t,{beats[j]:.4f},{span_end:.4f})")
+        a_expr = f"{sign * rad:.6f}*(1-2*({'+'.join(spans)}))"
+    else:
+        a_expr = f"{sign * rad:.6f}"
+    ctx['filters'].append(
+        f"scale={sw}:{sh},rotate=a='{a_expr}':c=black,crop={w}:{h}"
+    )
+    ctx['pack'] += 1
 
 
 def _fx_shake(ctx) -> None:
@@ -398,6 +453,7 @@ _PRIMITIVES = [
     ('punch_zoom', 'Punch-in zoom (drop hits)', _fx_punch_zoom),
     ('push_in', 'Slow push-in (builds)', _fx_push_pull_zoom),
     ('pull_out', 'Slow pull-out (calm releases)', _fx_push_pull_zoom),
+    ('dutch_tilt', 'Dutch tilt (hard cuts)', _fx_dutch_tilt),
     ('shake', 'Camera shake (drops)', _fx_shake),
     ('white_flash', 'White flash (drop cuts)', _fx_white_flash),
     ('sat_pulse', 'Saturation pulse (on the beat)', _fx_sat_pulse),
@@ -417,9 +473,11 @@ _PRIMITIVES = [
 
 EFFECT_REGISTRY = {pid: {'label': label, 'builder': builder} for pid, label, builder in _PRIMITIVES}
 
-# The classic style pipeline, in its exact historical order.
+# The classic style pipeline, in its exact historical order. dutch_tilt is a
+# later insertion, but it draws only from its own stable rng (never
+# ctx['rng']), so the historical draw order below is unchanged.
 _CURATED_SEQUENCE = (
-    'punch_zoom', 'shake', 'white_flash', 'sat_pulse', 'chroma_shift',
+    'punch_zoom', 'dutch_tilt', 'shake', 'white_flash', 'sat_pulse', 'chroma_shift',
     'pixelize_burst', 'zoom_blur', 'strobe', 'trails', 'hue_sweep',
     'fisheye', 'posterize_flash', 'vignette_grain',
 )
@@ -529,6 +587,10 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
         'k': k,
         'rng': rng,
         'hype': hype,
+        'style': style,
+        'mode': mode,
+        'segment_index': segment_index,
+        'palette_seed': palette_seed,
         'tempo': tempo_bpm,
         'beats': beats,
         'target_size': target_size,

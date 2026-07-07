@@ -252,6 +252,30 @@ SCAN_MAX_SPEED_FRAC = 0.40
 # centered behavior identical to the pre-anchor engine).
 ANCHOR_MIN_CONFIDENCE = 0.2
 
+# --- Tracked pan (subject-following crop) -----------------------------------
+# PAN_PATH_KEY is the trigger: stage6 rebases the analysis subject path onto
+# the segment's local clock and stores it under this key as
+# [[t_seg_seconds, cx, cy], ...] (t_seg = 0 at the segment's first frame,
+# cx/cy normalized 0..1). Anchors carrying only the raw candidate-relative
+# "path" (wave-5 shape, external callers) never animate — they keep the exact
+# static offset crop, so an unrebased path can't pan on a wrong clock.
+PAN_PATH_KEY = 'path_seg'
+# Cap on emitted knots so the crop expression stays compact.
+PAN_MAX_KNOTS = 6
+# Centered moving-average window over path samples (in samples).
+PAN_SMOOTH_WINDOW = 3
+# Consecutive smoothed samples closer than this (normalized distance) merge.
+PAN_DUP_EPS = 0.01
+# Below this total travel (fraction of the frame on a pannable axis) the
+# static crop is visually indistinguishable and cheaper → static fallback.
+PAN_MIN_TRAVEL = 0.03
+# Motion-sickness guard: the crop window may move at most this fraction of
+# the axis crop headroom (scaled_dim − crop_dim) per second; faster hops get
+# pulled toward the previous knot.
+PAN_MAX_SPEED = 0.25
+# Knots closer in time than this merge (also guards near-zero lerp slopes).
+PAN_MIN_KNOT_DT = 0.05
+
 # Echo blur fill: background overscan (fraction of cover) that gives the
 # drifting crop window room to move, and how far it drifts over the segment
 # (fraction of the target dimension).
@@ -297,6 +321,189 @@ def _anchored_crop(w: int, h: int, anchor=None) -> str:
         f":x='clip(iw*{cx:.6f}-ow/2\\,0\\,iw-ow)'"
         f":y='clip(ih*{cy:.6f}-oh/2\\,0\\,ih-oh)'"
     )
+
+
+def _pan_knots(anchor, duration: float, headroom_x: float, headroom_y: float):
+    """Usable tracked-pan knots [(t, cx, cy), ...] or None (→ static crop).
+
+    None whenever any gate fails: no rebased path under PAN_PATH_KEY,
+    confidence below ANCHOR_MIN_CONFIDENCE, unknown duration, no crop
+    headroom on either axis, fewer than 2 knots after clamp/smooth/merge, or
+    total travel under PAN_MIN_TRAVEL. Pure deterministic math on the anchor
+    dict — same inputs always yield the same knots.
+    """
+    if _resolve_anchor(anchor) is None:
+        return None
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        return None
+    if duration <= 0:
+        return None
+    hx = max(0.0, float(headroom_x))
+    hy = max(0.0, float(headroom_y))
+    if hx <= 1e-6 and hy <= 1e-6:
+        return None
+    raw = anchor.get(PAN_PATH_KEY)
+    if not isinstance(raw, (list, tuple)):
+        return None
+
+    # Clamp samples to the segment window (rebase already dropped far-out
+    # samples; slight overhang clamps to the edges).
+    samples = []
+    for item in raw:
+        try:
+            t = float(item[0])
+            cx = float(item[1])
+            cy = float(item[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (math.isfinite(t) and math.isfinite(cx) and math.isfinite(cy)):
+            continue
+        samples.append((min(duration, max(0.0, t)),
+                        min(1.0, max(0.0, cx)),
+                        min(1.0, max(0.0, cy))))
+    if len(samples) < 2:
+        return None
+    samples.sort(key=lambda s: s[0])
+
+    # Moving-average smoothing (window PAN_SMOOTH_WINDOW, centered, edges
+    # shrink) knocks single-sample detector jitter out of the pan.
+    half = PAN_SMOOTH_WINDOW // 2
+    smoothed = []
+    for i in range(len(samples)):
+        lo, hi = max(0, i - half), min(len(samples), i + half + 1)
+        n = hi - lo
+        smoothed.append((samples[i][0],
+                         sum(s[1] for s in samples[lo:hi]) / n,
+                         sum(s[2] for s in samples[lo:hi]) / n))
+
+    # Collapse near-duplicates (in time or position) into the earlier knot.
+    knots = [smoothed[0]]
+    for t, cx, cy in smoothed[1:]:
+        pt, px, py = knots[-1]
+        if t - pt < PAN_MIN_KNOT_DT or math.hypot(cx - px, cy - py) < PAN_DUP_EPS:
+            continue
+        knots.append((t, cx, cy))
+    if len(knots) < 2:
+        return None
+
+    # Cap the knot count (always keeping the first and last).
+    if len(knots) > PAN_MAX_KNOTS:
+        idx = sorted({round(i * (len(knots) - 1) / (PAN_MAX_KNOTS - 1))
+                      for i in range(PAN_MAX_KNOTS)})
+        knots = [knots[i] for i in idx]
+
+    # Speed cap: pull each knot toward its predecessor so the window never
+    # moves faster than PAN_MAX_SPEED of the axis headroom per second.
+    capped = [knots[0]]
+    for t, cx, cy in knots[1:]:
+        pt, px, py = capped[-1]
+        dt = max(PAN_MIN_KNOT_DT, t - pt)
+        max_dx = PAN_MAX_SPEED * hx * dt
+        max_dy = PAN_MAX_SPEED * hy * dt
+        cx = px + max(-max_dx, min(max_dx, cx - px))
+        cy = py + max(-max_dy, min(max_dy, cy - py))
+        capped.append((t, cx, cy))
+    knots = capped
+
+    travel_x = (max(k[1] for k in knots) - min(k[1] for k in knots)) if hx > 1e-6 else 0.0
+    travel_y = (max(k[2] for k in knots) - min(k[2] for k in knots)) if hy > 1e-6 else 0.0
+    if max(travel_x, travel_y) < PAN_MIN_TRAVEL:
+        return None
+    return knots
+
+
+def _pan_axis_expr(dim_var: str, out_var: str, knots, axis: int,
+                   static_frac: float, animate: bool) -> str:
+    """clip()-wrapped crop position expression for one axis.
+
+    animate=False emits the exact static expression _anchored_crop uses (the
+    anchor's cx/cy), so a non-panning axis stays byte-identical to the static
+    crop. The animated form is piecewise-linear via summed clip() ramps:
+    c(t) = c0 + Σ Δc_i·clip((t−t_i)/(t_{i+1}−t_i), 0, 1) — monotonic knot
+    times make each ramp contribute only inside its own span. Commas are
+    escaped (\\,) for -vf parsing; the caller single-quotes the whole
+    expression, same idiom as _anchored_crop and the scan-fit sweep.
+    """
+    if not animate:
+        return f"clip({dim_var}*{static_frac:.6f}-{out_var}/2\\,0\\,{dim_var}-{out_var})"
+    terms = [f"{knots[0][axis]:.6f}"]
+    for a, b in zip(knots, knots[1:]):
+        dc = b[axis] - a[axis]
+        if abs(dc) < 1e-6:
+            continue
+        dt = max(PAN_MIN_KNOT_DT, b[0] - a[0])
+        terms.append(f"{dc:+.6f}*clip((t-{a[0]:.4f})/{dt:.4f}\\,0\\,1)")
+    pos = "".join(terms)
+    return f"clip({dim_var}*({pos})-{out_var}/2\\,0\\,{dim_var}-{out_var})"
+
+
+def _tracked_crop(w: int, h: int, anchor, duration: float,
+                  headroom_x: float, headroom_y: float):
+    """crop=w:h whose window follows the rebased subject path over the
+    segment, or None when the static _anchored_crop should be used instead.
+
+    headroom_x/y are the crop slack per axis as fractions of the SCALED
+    frame ((scaled_dim − crop_dim) / scaled_dim); they gate which axes may
+    animate and feed the PAN_MAX_SPEED cap. The emitted expressions keep the
+    same clip(dim*frac − out/2, 0, dim − out) shape as the static crop, so
+    edge anchors still degrade to edge-aligned windows.
+    """
+    knots = _pan_knots(anchor, duration, headroom_x, headroom_y)
+    if knots is None:
+        return None
+    cx, cy = _resolve_anchor(anchor)  # non-None: _pan_knots gated on it
+    animate_x = (headroom_x > 1e-6
+                 and max(k[1] for k in knots) - min(k[1] for k in knots) >= 1e-6)
+    animate_y = (headroom_y > 1e-6
+                 and max(k[2] for k in knots) - min(k[2] for k in knots) >= 1e-6)
+    if not (animate_x or animate_y):
+        return None
+    x_expr = _pan_axis_expr('iw', 'ow', knots, 1, cx, animate_x)
+    y_expr = _pan_axis_expr('ih', 'oh', knots, 2, cy, animate_y)
+    return f"crop={w}:{h}:x='{x_expr}':y='{y_expr}'"
+
+
+def _fill_crop_headroom(display_size: Tuple[float, float],
+                        target_size: Tuple[int, int]) -> Tuple[float, float]:
+    """Crop slack of the plain fill-and-crop, per axis, as fractions of the
+    scaled frame — how far the crop window can slide. (0, 0) on bad input."""
+    sw, sh = display_size
+    tw, th = target_size
+    if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
+        return 0.0, 0.0
+    f_fill = max(tw / sw, th / sh)
+    scaled_w = sw * f_fill
+    scaled_h = sh * f_fill
+    return (max(0.0, (scaled_w - tw) / scaled_w),
+            max(0.0, (scaled_h - th) / scaled_h))
+
+
+def _fit_filters_with_pan(video_file: str, target_size: Tuple[int, int],
+                          fit_mode: str, anchor: dict,
+                          duration: float) -> List[str]:
+    """get_fit_filters, upgraded to a tracked pan when the anchor carries a
+    usable rebased path (PAN_PATH_KEY) and the segment duration is known.
+
+    Every fallback path returns exactly what get_fit_filters emits today, so
+    anchors without a rebased path (or failing any _pan_knots gate) stay
+    byte-identical to the static engine.
+    """
+    if (fit_mode == 'crop' and target_size and duration
+            and isinstance(anchor, dict) and anchor.get(PAN_PATH_KEY)):
+        info = get_cached_display_info(video_file)
+        if info:
+            hx, hy = _fill_crop_headroom((info[0], info[1]), target_size)
+            w, h = target_size
+            tracked = _tracked_crop(w, h, anchor, duration, hx, hy)
+            if tracked:
+                return [
+                    f"scale={w}:{h}:force_original_aspect_ratio=increase",
+                    tracked,
+                    "setsar=1",
+                ]
+    return get_fit_filters(target_size, fit_mode, anchor=anchor)
 
 
 def get_fit_filters(target_size: Tuple[int, int], fit_mode: str, *,
@@ -623,11 +830,23 @@ def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
     return f"[0:v]{pre},{chain}{post}[{out_label}]"
 
 
-def _hybrid_fg_filters(hybrid_fg, anchor: dict = None) -> List[str]:
+def _hybrid_fg_filters(hybrid_fg, anchor: dict = None, *,
+                       duration: float = None) -> List[str]:
     """Foreground scale+crop for the limited-crop hybrid; the crop window
-    honors the anchor (offset, never enlarged) when one is usable."""
+    honors the anchor (offset, never enlarged) when one is usable, and — when
+    the anchor carries a rebased subject path (PAN_PATH_KEY) and the segment
+    duration is known — follows it as a tracked pan. Fallbacks emit the exact
+    static _anchored_crop, and the foreground dims are known here, so the
+    pan headroom is exact."""
     fg_w, fg_h, crop_w, crop_h = hybrid_fg
-    return [f"scale={fg_w}:{fg_h}", _anchored_crop(crop_w, crop_h, anchor)]
+    crop = None
+    if duration and isinstance(anchor, dict) and anchor.get(PAN_PATH_KEY):
+        hx = max(0.0, (fg_w - crop_w) / float(fg_w))
+        hy = max(0.0, (fg_h - crop_h) / float(fg_h))
+        crop = _tracked_crop(crop_w, crop_h, anchor, duration, hx, hy)
+    if crop is None:
+        crop = _anchored_crop(crop_w, crop_h, anchor)
+    return [f"scale={fg_w}:{fg_h}", crop]
 
 
 def build_source_fit_chain(video_file: str, target_size: Tuple[int, int],
@@ -646,11 +865,13 @@ def build_source_fit_chain(video_file: str, target_size: Tuple[int, int],
     if scan_plan:
         chain = ",".join(scan_plan['filters'])
     elif fit_mode == 'blur' or hybrid_fg:
-        fg_filters = _hybrid_fg_filters(hybrid_fg, anchor) if hybrid_fg else None
+        fg_filters = (_hybrid_fg_filters(hybrid_fg, anchor, duration=duration)
+                      if hybrid_fg else None)
         chain = _blur_fit_chain(target_size, fg_filters, duration=duration,
                                 source_key=video_file)
     else:
-        chain = ",".join(get_fit_filters(target_size, fit_mode, anchor=anchor))
+        chain = ",".join(_fit_filters_with_pan(video_file, target_size,
+                                               fit_mode, anchor, duration))
     return ",".join(sar_fix + [chain]) if sar_fix else chain
 
 
@@ -1098,7 +1319,12 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
 
     anchor (optional, from the analysis stage): {"cx","cy","confidence",...}
     normalized subject center; offsets fit-crop windows and biases the
-    scan-fit sweep. None or low confidence keeps centered framing.
+    scan-fit sweep. None or low confidence keeps centered framing. When the
+    planner attached a segment-local subject path under "path_seg" (see
+    PAN_PATH_KEY), the offset-crop and hybrid-foreground crop windows follow
+    it as a tracked pan; anchors without it (or failing any pan gate) keep
+    the exact static behavior. The scan-fit tier never animates on the path
+    (its own sweep would compound with the pan).
     """
     try:
         # ✅ FRAME-ACCURATE: Calculate exact output frame count first; the
@@ -1164,8 +1390,16 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         filter_graph = None
         filter_complex = None
         base_label = 'basev' if text_overlay else 'outv'
+        # Tracked pan clock guard: the crop expressions run on the OUTPUT
+        # clock (after setpts/fps), which only matches the rebased path's
+        # source-local clock when the segment is not retimed. The planner
+        # already drops the path from retimed clips; this belt-and-braces
+        # covers retimes attached by external callers.
+        pan_duration = None if retime else exact_output_duration
         if use_blur_graph:
-            fg_filters = _hybrid_fg_filters(hybrid_fg, anchor) if hybrid_fg else None
+            fg_filters = (_hybrid_fg_filters(hybrid_fg, anchor,
+                                             duration=pan_duration)
+                          if hybrid_fg else None)
             filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters,
                                                 out_label=base_label, fg_filters=fg_filters,
                                                 duration=exact_output_duration,
@@ -1175,7 +1409,9 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
             if scan_plan:
                 filters.extend(scan_plan['filters'])
             elif target_size:
-                filters.extend(get_fit_filters(target_size, fit_mode, anchor=anchor))
+                filters.extend(_fit_filters_with_pan(video_file, target_size,
+                                                     fit_mode, anchor,
+                                                     pan_duration))
             filters.extend(post_filters)
             filter_complex = ",".join(filters)
             if use_graph:

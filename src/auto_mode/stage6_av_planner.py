@@ -204,6 +204,17 @@ def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
             continue
         clip["start_time"] = max(lo, min(start, hi))
         clip["retime"] = retime
+        # Retiming warps the segment's local clock (setpts sits between the
+        # source trim and the output fps=), so a source-time subject path no
+        # longer lines up with the `t` the renderer's crop expressions see —
+        # and this branch also re-anchors start_time, which the path was
+        # rebased against. Drop the tracked path and let the static anchor
+        # offset stand for retimed segments.
+        anchor = clip.get("subject_anchor")
+        if isinstance(anchor, dict) and "path_seg" in anchor:
+            anchor = dict(anchor)
+            anchor.pop("path_seg")
+            clip["subject_anchor"] = anchor
 
 
 def _plan_coverage_reservations(candidates: Sequence[Dict],
@@ -524,6 +535,52 @@ def _score_candidate(candidate: Dict, profile: Dict) -> float:
     return _clamp(match + tag_bonus + 0.12 * quality - visibility_penalty, lo=-1.0, hi=2.0)
 
 
+def _rebase_subject_anchor(candidate: Dict, start_time: float,
+                           source_duration: float):
+    """Copy the candidate's subject_anchor with a segment-local tracked path.
+
+    The analysis path ("path", from video_analysis) is timestamped relative
+    to the CANDIDATE's start in the source, but the extractor only knows the
+    segment's start_time. The rebased samples go under the key "path_seg":
+    a list of [t_seg, cx, cy] where t_seg = (candidate_start + t_rel) -
+    start_time, i.e. seconds from the segment's first frame, cx/cy still
+    normalized 0..1. Samples outside [-0.5, source_duration + 0.5] are
+    dropped.
+
+    "path_seg" (not "path") is deliberately the renderer's trigger for the
+    tracked pan: an anchor that still carries only the raw candidate-relative
+    "path" (older plans, external callers) simply keeps the static offset
+    crop instead of panning on a wrong clock. The shared candidate dict is
+    never mutated — the copy happens only when a rebase actually attaches.
+    """
+    anchor = candidate.get("subject_anchor")
+    if not isinstance(anchor, dict):
+        return anchor
+    path = anchor.get("path")
+    if not isinstance(path, (list, tuple)) or not path:
+        return anchor
+    try:
+        cand_start = float(candidate.get("start", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        cand_start = 0.0
+    rebased = []
+    for sample in path:
+        try:
+            t_rel = float(sample[0])
+            cx = float(sample[1])
+            cy = float(sample[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        t_seg = (cand_start + t_rel) - float(start_time)
+        if -0.5 <= t_seg <= float(source_duration) + 0.5:
+            rebased.append([round(t_seg, 4), cx, cy])
+    if not rebased:
+        return anchor
+    out = dict(anchor)
+    out["path_seg"] = rebased
+    return out
+
+
 def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
     final_duration = max(0.05, float(profile["duration"]))
     source_duration = final_duration
@@ -557,7 +614,8 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
         "score": _score_candidate(candidate, profile),
         "candidate_id": candidate.get("id"),
         "tags": list(candidate.get("tags", [])),
-        "subject_anchor": candidate.get("subject_anchor"),
+        "subject_anchor": _rebase_subject_anchor(candidate, start_time,
+                                                 source_duration),
         "ai_analyzed": bool(candidate.get("ai_analyzed")),
         "audio_start": profile.get("start"),
         "audio_end": profile.get("end"),

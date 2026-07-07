@@ -56,6 +56,10 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
   palette; seed 0 derives from the song filename, same seed → identical video). The applied
   recipe is printed into the render log. New primitives: half/quad mirrors, beat-flip,
   sustained push-in/pull-out zooms
+- Dutch tilt (2026-07-07): `dutch_tilt` primitive — a few degrees of rotation scaled to
+  cover (no black corners on any canvas), sign alternating per inter-beat interval when the
+  beat grid is present. Curated: AMV/Hype, drop/rhythm segments only, ~1 in 6, seeded from a
+  dedicated rng stream so pre-existing render plans stay byte-identical
 - Effects don't apply in ProRes precise mode (kept pristine for external editing); the GUI
   now says so next to the mode picker
 - ~~Not included by design: speed ramps~~ superseded — see Phase 4 speed ramps below: the
@@ -150,6 +154,13 @@ whole video to portrait). The output canvas is now fixed and the fit engine foll
   `MAX_CROP_PER_AXIS` (15%) still governs. Anchors below `ANCHOR_MIN_CONFIDENCE` (0.2) are
   ignored (centered, byte-identical to legacy). Threaded stage6 → `ClipJob.planned_clip`
   → `extract_clip_segment_ffmpeg(anchor=...)`
+- **Tracked pan** (2026-07-07, v2 of the reframe): the crop window *follows* the subject
+  through the shot. Stage6 rebases `subject_anchor.path` onto the segment clock
+  (`path_seg`; retimed segments drop it — a warped clock would desync the pan), and the fit
+  engine emits speed-clamped piecewise-linear crop expressions (`PAN_*` constants:
+  ≤6 knots, ≤25% of crop headroom/second, <3% travel → static). Applies to the offset-crop
+  and hybrid tiers; scan-fit keeps its own sweep (motions never compound). Anchors without
+  `path_seg` (or any fallback condition) reproduce the wave-5 static offset exactly
 - **"Echo" blur fill**: the blurred background behind hybrid/blur fits is now graded
   (110% overscan, darker, desaturated, vignette) with a slow ~3% drift over the segment
   (direction seeded from the source path — deterministic)
