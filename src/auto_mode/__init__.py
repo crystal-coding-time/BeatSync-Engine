@@ -284,15 +284,33 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
 
     _notify_progress(progress_callback, 1)
     print("   🥁 Step 1: Detecting stable beat grid...")
-    beat_times, tempo, beat_frames, onset_env = detect_master_beat_grid(y_percussive, sr, cfg)
+    beat_times, tempo, beat_frames, onset_env, downbeat_times = detect_master_beat_grid(
+        y_percussive, sr, cfg, y_full=y
+    )
     if len(beat_times) < 2:
         raise ValueError("Auto Mode could not detect enough rhythmic events to build a cut plan.")
     print(f"      ✓ {len(beat_times)} beats detected at {tempo:.1f} BPM")
     _notify_console(console_callback, 1, f"Beat grid: {len(beat_times)} beats at {tempo:.1f} BPM")
+    if downbeat_times.size:
+        print(f"      ✓ {downbeat_times.size} downbeats (beat-this)")
+        _notify_console(console_callback, 1, f"Downbeats: {downbeat_times.size} (beat-this)")
 
     _notify_progress(progress_callback, 2)
     print("   🌊 Step 2: Reading energy waves and rhythm impacts...")
     features = analyze_wave_features(y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu)
+    if downbeat_times.size:
+        # Real downbeats replace the naive every-4th-beat grid: bar anchors are
+        # the model's downbeats, phrase anchors every second downbeat. This
+        # feeds the existing anchor_bonus scoring in stage 4 unchanged.
+        is_downbeat = np.min(
+            np.abs(beat_times[:, None] - downbeat_times[None, :]), axis=1
+        ) <= 0.05
+        if is_downbeat.any():
+            features["is_bar_anchor"] = is_downbeat
+            phrase = np.zeros_like(is_downbeat)
+            phrase_idx = np.where(is_downbeat)[0][::2]
+            phrase[phrase_idx] = True
+            features["is_phrase_anchor"] = phrase
     wave = np.asarray(features.get("wave", []), dtype=float)
     impact = np.asarray(features.get("impact_score", []), dtype=float)
     rhythm = np.asarray(features.get("rhythm_score", []), dtype=float)
@@ -418,6 +436,7 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
 
     beat_info = {
         "times": beat_times,
+        "downbeat_times": downbeat_times,
         "selected_times": selected_beats,
         "tempo": tempo,
         "sections": sections,
@@ -463,7 +482,7 @@ def analyze_beats_auto_fallback(audio_file: str, start_time: float = 0.0,
 
     y, sr = librosa.load(audio_file, sr=CONFIG.sr, offset=start_time, duration=duration, mono=True)
     y = librosa.util.normalize(y)
-    beat_times, tempo, _, _ = detect_master_beat_grid(y, sr, CONFIG)
+    beat_times, tempo, _, _, _ = detect_master_beat_grid(y, sr, CONFIG)
     selected = _unique_sorted(beat_times[::4], CONFIG.low_energy_min_interval)
     beat_info = {
         "times": beat_times,

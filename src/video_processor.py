@@ -14,7 +14,7 @@ setup_environment()
 import argparse
 import shutil
 from dataclasses import dataclass, field
-from typing import TypeAlias, List, Dict, Tuple
+from typing import TypeAlias, List, Dict, Tuple, Optional
 import numpy as np
 from pathlib import Path
 import gc
@@ -48,6 +48,10 @@ from ffmpeg_processing import (
     concatenate_videos_ffmpeg,
     seconds_to_frame_count,
     frame_count_to_seconds,
+    is_image_source,
+    build_ken_burns_filter,
+    count_video_frames,
+    retime_source_window,
 )
 from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_clip_plan
 from effects import build_effect_filters, _stable_rng
@@ -102,6 +106,25 @@ def _effective_clip_workers(requested_workers: int, use_nvenc: bool) -> int:
         lo=1,
         hi=requested_workers,
     )
+
+
+def _assert_output_frames(output_file: str, render_info: Dict) -> None:
+    """Run-level zero-drift guard: the assembled video must hold exactly the
+    frame-locked timeline's frames. Per-segment counts are checked at extract
+    time; this catches anything the assembly stage could still lose."""
+    expected = int(render_info.get("timeline_frames") or 0)
+    if expected <= 0:
+        return
+    actual = count_video_frames(output_file)
+    if actual is None:
+        print("   ⚠️  Could not verify final frame count; skipping the assembly guard")
+        return
+    if actual != expected:
+        raise RuntimeError(
+            f"Assembled output has {actual} frames but the frame-locked timeline "
+            f"has {expected} — refusing to deliver a drifted video."
+        )
+    print(f"   ✓ Frame guard: output holds exactly {actual} timeline frames")
 
 
 def _summarize_clip_timings(timings: List[float], total_duration: float) -> None:
@@ -209,10 +232,49 @@ def get_max_resolution(video_files: VideoList) -> Tuple[int, int]:
     return (max(2, best[0] // 2 * 2), max(2, best[1] // 2 * 2))
 
 
+# Output canvas presets: key -> (human label, fixed WxH or None for legacy
+# "highest-resolution source wins" behavior). A fixed canvas keeps one portrait
+# phone clip from flipping the whole render; sources adapt via the frame-fit
+# mode, which is decided elsewhere (ffmpeg_processing).
+OUTPUT_FORMATS: Dict[str, Tuple[str, Optional[Tuple[int, int]]]] = {
+    '16:9_1080p': ('16:9 · 1080p (1920×1080)', (1920, 1080)),
+    '16:9_4k': ('16:9 · 4K (3840×2160)', (3840, 2160)),
+    '9:16_portrait': ('9:16 · Portrait (1080×1920)', (1080, 1920)),
+    'match_source': ('Match best source (legacy)', None),
+}
+DEFAULT_OUTPUT_FORMAT = '16:9_1080p'
+
+
+def resolve_target_resolution(output_format: str, video_files: VideoList) -> Tuple[int, int]:
+    """Resolve the output canvas from an OUTPUT_FORMATS key.
+
+    Fixed formats return their exact WxH regardless of sources; 'match_source'
+    keeps the legacy get_max_resolution() behavior. Unknown keys fall back to
+    the default so stale saved settings can't crash a render.
+    """
+    if output_format not in OUTPUT_FORMATS:
+        print(f"⚠️ Unknown output format {output_format!r}; using default {DEFAULT_OUTPUT_FORMAT}")
+        output_format = DEFAULT_OUTPUT_FORMAT
+    label, fixed_size = OUTPUT_FORMATS[output_format]
+    if fixed_size is not None:
+        target_size = fixed_size
+        # The label carries the WxH for the dropdown; the log already prints
+        # the dimensions, so keep just the aspect/name part here.
+        reason = label.split(' (')[0]
+    else:
+        target_size = get_max_resolution(video_files)
+        reason = 'matched best source, legacy'
+    print(f"🖼️ Output canvas: {target_size[0]}x{target_size[1]} ({reason})")
+    return target_size
+
+
 def get_video_files(directory : str) -> VideoList:
     video_extensions = ['.mp4', '.MP4', '.mkv', '.MKV', '.mov', '.MOV',
                         '.webm', '.WEBM', '.m4v', '.M4V', '.avi', '.AVI',
-                        '.gif', '.GIF']
+                        '.gif', '.GIF',
+                        # Still images (rendered with Ken Burns motion)
+                        '.jpg', '.JPG', '.jpeg', '.JPEG', '.png', '.PNG',
+                        '.webp', '.WEBP', '.bmp', '.BMP']
     video_files = []
 
     for ext in video_extensions:
@@ -255,6 +317,13 @@ def build_frame_aligned_cut_timeline(beat_times: BeatTimes, audio_duration: floa
     # cumulative drift caused by round((beat[i+1] - beat[i]) * fps) on each clip.
     end_frame = max(1, seconds_to_frame_count(audio_duration, fps))
     cut_frames = np.rint(raw_cut_times * fps).astype(int)
+    # Editor's cut-lead: interior cuts land a frame or two BEFORE the beat so
+    # the new shot is already onscreen when the transient hits. A uniform
+    # shift of interior boundaries only; first/last stay locked, so the total
+    # frame count is unchanged.
+    cut_lead = _env_int('BEATSYNC_CUT_LEAD_FRAMES', 1, lo=0, hi=2)
+    if cut_lead and cut_frames.size > 2:
+        cut_frames[1:-1] = cut_frames[1:-1] - cut_lead
     cut_frames = np.clip(cut_frames, 0, end_frame)
     cut_frames[0] = 0
     cut_frames[-1] = end_frame
@@ -309,15 +378,29 @@ def create_clip_parallel(job: ClipJob):
     try:
         # Sources shorter than the segment keep the full requested duration:
         # extraction loops them (-stream_loop) instead of emitting short clips.
+        retime = None
         if planned_clip:
             video_file = planned_clip.get('video_file') or video_file
             video_duration = get_cached_video_duration(video_file)
             source_duration = max(0.05, float(planned_clip.get('source_duration', final_duration)))
-            if video_duration >= source_duration:
-                max_start = max(0.0, video_duration - source_duration)
-                clip_start = max(0.0, min(float(planned_clip.get('start_time', 0.0)), max_start))
-            else:
-                clip_start = 0.0
+            retime = planned_clip.get('retime')
+            if retime:
+                # A retimed segment consumes source_window seconds of source;
+                # if the clamped window can't fit, strip the ramp instead of
+                # looping it (deterministic: depends only on probed duration).
+                window = retime_source_window(source_duration, retime, job.fps)
+                if video_duration >= window:
+                    max_start = max(0.0, video_duration - window)
+                    clip_start = max(0.0, min(float(planned_clip.get('start_time', 0.0)), max_start))
+                else:
+                    print(f"   ⚠️  Retime dropped for clip {i + 1}: source too short for the ramp window")
+                    retime = None
+            if not retime:
+                if video_duration >= source_duration:
+                    max_start = max(0.0, video_duration - source_duration)
+                    clip_start = max(0.0, min(float(planned_clip.get('start_time', 0.0)), max_start))
+                else:
+                    clip_start = 0.0
         else:
             # Seeded start time from video if visual planning is unavailable:
             # same inputs + settings must always render the same video.
@@ -344,7 +427,25 @@ def create_clip_parallel(job: ClipJob):
             i,
             target_size,
             fps=job.fps,
+            mode=opts.get('effect_mode', 'curated'),
+            palette=opts.get('effect_palette'),
+            palette_seed=opts.get('effect_seed', 0),
+            local_beats=(opts.get('segment_beats') or {}).get(i),
+            transitions=opts.get('transitions', True),
         )
+
+        if is_image_source(video_file):
+            # Stills: any start shows the same frame, and each segment gets
+            # deterministic Ken Burns motion so the photo reads as footage —
+            # unless the effect chain already zooms (avoid double zoompan).
+            clip_start = 0.0
+            if not any('zoompan' in f for f in effect_filters):
+                frame_count = max(1, seconds_to_frame_count(source_duration, job.fps))
+                ken_burns = build_ken_burns_filter(
+                    _stable_rng('kenburns', i, video_file),
+                    target_size, job.fps, frame_count,
+                )
+                effect_filters = [ken_burns] + effect_filters
 
         extract_kwargs = {
             'video_file': video_file,
@@ -358,6 +459,9 @@ def create_clip_parallel(job: ClipJob):
             'fit_mode': opts.get('fit_mode', 'crop'),
             'extra_filters': effect_filters,
             'text_overlay': (opts.get('text_plan') or {}).get(i),
+            'look_cube': opts.get('look_cube'),
+            'retime': retime,
+            'anchor': (planned_clip or {}).get('subject_anchor'),
         }
 
         success = extract_clip_segment_ffmpeg(**extract_kwargs)
@@ -380,10 +484,16 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                       beat_info: dict = None,
                       lossless_mode: bool = False, use_gpu: bool = False,
                       gpu_encoder: str = 'h264_nvenc', fps: float = None,
-                      fit_mode: str = 'crop', effect_style: str = 'clean',
+                      fit_mode: str = 'crop',
+                      output_format: str = DEFAULT_OUTPUT_FORMAT,
+                      effect_style: str = 'clean',
                       effect_intensity: float = 0.7,
+                      effect_mode: str = 'curated', effect_palette: List[str] = None,
+                      effect_seed: int = 0, look_cube: str = None,
                       text_entries: List[str] = None, text_position: str = 'bottom',
-                      text_scale: float = 1.0) -> str:
+                      text_scale: float = 1.0, variety: float = 0.4,
+                      speed_ramps: bool = False,
+                      settings: Dict = None) -> str:
     """
     Creates a music video with video clips cut to detected beats.
     
@@ -413,6 +523,23 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     if len(beat_times) == 0:
         raise ValueError("No beats were detected. Cannot create video.")
 
+    # A settings dict (GUI path) overrides the individual style kwargs — the
+    # positional chain grew past the point where order mistakes are survivable.
+    if settings:
+        fit_mode = settings.get('fit_mode', fit_mode)
+        output_format = settings.get('output_format', output_format)
+        effect_style = settings.get('effect_style', effect_style)
+        effect_intensity = settings.get('effect_intensity', effect_intensity)
+        effect_mode = settings.get('effect_mode', effect_mode)
+        effect_palette = settings.get('effect_palette', effect_palette)
+        effect_seed = settings.get('effect_seed', effect_seed)
+        look_cube = settings.get('look_cube', look_cube)
+        text_entries = settings.get('text_entries', text_entries)
+        text_position = settings.get('text_position', text_position)
+        text_scale = settings.get('text_scale', text_scale)
+        variety = settings.get('variety', variety)
+        speed_ramps = settings.get('speed_ramps', speed_ramps)
+
     video_creation_started = time.perf_counter()
 
     if max_workers is None:
@@ -420,10 +547,16 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
 
     # Determine FPS to use
     if fps is None:
-        # Auto-detect from first video file
+        # Auto-detect from the first real video file. Stills have no timebase
+        # of their own, so they must never decide the render fps.
         try:
-            fps = get_video_fps(video_files[0])
-            print(f"🎞️ Auto-detected FPS from input video: {fps}")
+            fps_source = next((f for f in video_files if not is_image_source(f)), None)
+            if fps_source is None:
+                fps = 30.0
+                print(f"🎞️ All sources are still images; using default FPS: {fps}")
+            else:
+                fps = get_video_fps(fps_source)
+                print(f"🎞️ Auto-detected FPS from input video: {fps}")
         except Exception as e:
             fps = 30.0
             print(f"⚠️ Could not detect FPS, using default: {fps}")
@@ -512,16 +645,34 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         segment_durations=segment_durations,
         beat_info=beat_info,
         video_files=video_files,
+        variety=variety,
+        speed_ramps=speed_ramps,
+        lossless=lossless_mode,
+        fps=fps,
     )
     if planned_clip_sequence:
-        plan_summary = summarize_clip_plan(planned_clip_sequence)
+        plan_summary = summarize_clip_plan(
+            planned_clip_sequence, video_files=video_files,
+            candidates=((beat_info or {}).get('video_analysis') or {}).get('candidates'))
         if beat_info is not None:
             beat_info['clip_plan_summary'] = plan_summary
             render_info["plan_summary"] = plan_summary
         print(f"🧠 Auto visual planner: {plan_summary['clip_count']} planned clips")
-        print(f"   Sources used: {plan_summary.get('source_count', 0)}")
+        print(f"   Sources used: {plan_summary.get('source_count', 0)} (variety {variety:.2f})")
         print(f"   Targets: {plan_summary.get('targets', {})}")
         print(f"   AI-tagged source moments used: {plan_summary.get('ai_tagged', 0)}")
+        if plan_summary.get('retimes'):
+            print(f"   Speed ramps: {plan_summary['retimes']}")
+        usage_hist = plan_summary.get('source_usage') or {}
+        if usage_hist:
+            print("   Source usage: " + ", ".join(
+                f"{name}×{count}" for name, count in usage_hist.items()))
+        if plan_summary.get('sources_never_selected'):
+            print("   ⚠️  Never selected (had candidates): "
+                  + ", ".join(plan_summary['sources_never_selected']))
+        if plan_summary.get('sources_without_candidates'):
+            print("   ⚠️  No usable candidates found: "
+                  + ", ".join(plan_summary['sources_without_candidates']))
     else:
         print("🎲 Visual planner fallback: source moments will use legacy random sampling")
 
@@ -541,9 +692,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
 
         # Mixed-resolution sources must not reach concat stream-copy: normalize
         # every proxy to one target frame so all segment streams are identical.
-        target_size = get_max_resolution(video_files)
+        target_size = resolve_target_resolution(output_format, video_files)
         render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
-        print(f"🎞️ Target resolution: {target_size[0]}x{target_size[1]}")
 
         # Convert all input videos to ProRes (video only, no audio)
         prores_files = []
@@ -618,9 +768,12 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             start_time=start_time,
             end_time=end_time,
             use_nvenc=False,  # ProRes uses stream copy
-            temp_dir=session_temp_dir
+            fps=prores_fps,
+            temp_dir=session_temp_dir,
+            total_frames=int(render_info.get("timeline_frames") or 0)
         )
-        
+        _assert_output_frames(output_file, render_info)
+
         print(f"\n{'='*60}")
         print(f"✅ LOSSLESS VIDEO CREATION COMPLETE!")
         print(f"   Output: {output_file}")
@@ -665,10 +818,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     
     # STANDARD MODE - Direct parallel processing (NO BATCHES)
     else:
-        # Get target resolution from first video
-        target_size = get_max_resolution(video_files)
+        # Resolve the output canvas from the chosen format (fixed 16:9/9:16
+        # presets, or legacy best-source matching).
+        target_size = resolve_target_resolution(output_format, video_files)
         render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
-        print(f"🎞️ Target resolution: {target_size[0]}x{target_size[1]}")
         
         print(f"\n{'='*60}")
         print(f"🎬 PROCESSING ALL CLIPS (No batch processing with FFmpeg)")
@@ -703,12 +856,32 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             for text, ws, we in schedule:
                 print(f"   Text overlay: 📝 {ws:6.2f}s–{we:6.2f}s  {text[:60]!r}")
 
+        # Interior beat offsets per segment (in each segment's local clock) so
+        # beat-locked effects fire on real beats, not a tempo approximation.
+        segment_beats: Dict[int, List[float]] = {}
+        beat_grid = np.asarray((beat_info or {}).get('times', []), dtype=float)
+        beat_grid = beat_grid[np.isfinite(beat_grid)]
+        if beat_grid.size:
+            for i in range(total_clips):
+                seg_start, seg_end = selected_beats[i], selected_beats[i + 1]
+                local = beat_grid[(beat_grid >= seg_start - 1e-6) & (beat_grid < seg_end - 1e-6)] - seg_start
+                if local.size:
+                    segment_beats[i] = [round(float(b), 4) for b in local[:8]]
+
         render_opts = {
             'fit_mode': fit_mode,
             'effect_style': effect_style,
             'effect_intensity': effect_intensity,
+            'effect_mode': effect_mode,
+            'effect_palette': effect_palette,
+            'effect_seed': effect_seed,
+            'look_cube': look_cube,
             'tempo': (beat_info or {}).get('tempo'),
             'text_plan': text_plan,
+            'segment_beats': segment_beats,
+            # Split transitions ride the effects engine, so they follow the
+            # style: any non-clean style gets them.
+            'transitions': bool(effect_style and effect_style != 'clean'),
         }
         if effect_style and effect_style != 'clean':
             print(f"   Effects: 🎨 {effect_style} (intensity {effect_intensity:.2f}) | Frame fit: {fit_mode}")
@@ -797,11 +970,13 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             use_nvenc=use_nvenc,
             gpu_encoder=gpu_encoder,
             fps=fps,
-            temp_dir=session_temp_dir
+            temp_dir=session_temp_dir,
+            total_frames=int(render_info.get("timeline_frames") or 0)
         )
         assembly_seconds = time.perf_counter() - assembly_started
         render_info["final_assembly_seconds"] = float(assembly_seconds)
         print(f"   ⏱ Final assembly total: {_fmt_seconds(assembly_seconds)}")
+        _assert_output_frames(output_file, render_info)
  
         print(f"\n🧹 Cleaning up resources...")
         

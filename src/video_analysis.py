@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Sequence
@@ -28,13 +29,14 @@ from ffmpeg_processing import (
     get_video_duration,
     get_video_fps,
     get_video_resolution,
+    is_image_source,
 )
 from logger import ROOT_DIR, setup_environment
 
 
 setup_environment()
 
-ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"
+ANALYSIS_VERSION = "auto_av_analysis_v10_subject_anchor"
 DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models")
 DEFAULT_QWEN_GGUF_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "Qwen3VL-2B-Instruct-Q8_0.gguf")
 DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
@@ -507,58 +509,84 @@ def _analyze_single_video(
         f"{int(width)}x{int(height)} [{_fmt_seconds(timings['metadata_seconds'])}]"
     )
 
-    scene_use_gpu = _use_gpu_scene_detection(use_gpu)
-    if use_gpu and not scene_use_gpu:
-        print("      Scene detection mode: CPU FFmpeg scene filter (CUDA path is optional; default off)")
-
-    step_started = time.perf_counter()
-    scene_changes = detect_video_scene_changes(
-        video_file,
-        threshold=0.27,
-        use_gpu=scene_use_gpu,
-        analysis_fps=6.0,
-        analysis_width=384,
-    )
-    timings["scene_detection_seconds"] = time.perf_counter() - step_started
-    print(
-        f"      ⏱ Scene detection total: {_fmt_seconds(timings['scene_detection_seconds'])} "
-        f"({len(scene_changes)} scene cuts)"
-    )
-
-    step_started = time.perf_counter()
-    boundaries = _build_boundaries(scene_changes, duration)
-    windows = _make_candidate_windows(boundaries, duration)
-    timings["window_build_seconds"] = time.perf_counter() - step_started
-    print(
-        f"      Candidate windows: {len(windows)} from {len(boundaries)} boundaries "
-        f"[{_fmt_seconds(timings['window_build_seconds'])}]"
-    )
-
-    cap = _open_video_capture(video_file)
     candidates: List[Dict] = []
-    if cap.isOpened():
-        gpu_candidate_metrics = _use_gpu_candidate_metrics(use_gpu)
-        if gpu_candidate_metrics:
-            print("      Candidate scoring: GPU CuPy metrics + CPU frame decode")
-        else:
-            print("      Candidate scoring: CPU metrics")
+    if is_image_source(video_file):
+        # Stills: no scenes or motion to analyze — one candidate scored from
+        # the single frame. Its start/end are equal so the Qwen worker's
+        # mid-frame seek lands on frame 0 (the only frame); the planner-facing
+        # duration lets the still fill any segment, and the renderer gives
+        # each segment deterministic Ken Burns motion.
+        scene_changes: List[float] = []
+        timings["scene_detection_seconds"] = 0.0
         step_started = time.perf_counter()
-        window_metrics = _measure_windows(cap, fps, windows, use_gpu=gpu_candidate_metrics)
+        frame = cv2.imread(video_file)
+        if frame is None:
+            print(f"      Warning: OpenCV could not read image {name}; candidate analysis skipped.")
+        else:
+            frame = _resize_for_analysis(frame, max_width=360)
+            window = {"start": 0.0, "end": 0.0, "kind": "image"}
+            metrics = _measure_frame_samples([frame], np.asarray([0.0]), 0.0, 0.01, False)
+            if metrics:
+                candidate = _build_candidate(video_file, name, duration, 0, window, metrics)
+                candidate["duration"] = 5.0
+                candidates.append(candidate)
         timings["candidate_scoring_seconds"] = time.perf_counter() - step_started
-        valid_metrics = 0
-        for i, (window, metrics) in enumerate(zip(windows, window_metrics)):
-            if not metrics:
-                continue
-            valid_metrics += 1
-            candidate = _build_candidate(video_file, name, duration, i, window, metrics)
-            candidates.append(candidate)
-        cap.release()
         print(
-            f"      ⏱ Candidate scoring total: {_fmt_seconds(timings['candidate_scoring_seconds'])} "
-            f"({valid_metrics}/{len(windows)} windows usable)"
+            f"      Still image: {len(candidates)} candidate "
+            f"[{_fmt_seconds(timings['candidate_scoring_seconds'])}]"
         )
     else:
-        print(f"      Warning: OpenCV could not open {name}; candidate analysis skipped.")
+        scene_use_gpu = _use_gpu_scene_detection(use_gpu)
+        if use_gpu and not scene_use_gpu:
+            print("      Scene detection mode: CPU FFmpeg scene filter (CUDA path is optional; default off)")
+
+        step_started = time.perf_counter()
+        scene_changes = detect_video_scene_changes(
+            video_file,
+            threshold=0.27,
+            use_gpu=scene_use_gpu,
+            analysis_fps=6.0,
+            analysis_width=384,
+        )
+        timings["scene_detection_seconds"] = time.perf_counter() - step_started
+        print(
+            f"      ⏱ Scene detection total: {_fmt_seconds(timings['scene_detection_seconds'])} "
+            f"({len(scene_changes)} scene cuts)"
+        )
+
+        step_started = time.perf_counter()
+        boundaries = _build_boundaries(scene_changes, duration)
+        windows = _make_candidate_windows(boundaries, duration)
+        timings["window_build_seconds"] = time.perf_counter() - step_started
+        print(
+            f"      Candidate windows: {len(windows)} from {len(boundaries)} boundaries "
+            f"[{_fmt_seconds(timings['window_build_seconds'])}]"
+        )
+
+        cap = _open_video_capture(video_file)
+        if cap.isOpened():
+            gpu_candidate_metrics = _use_gpu_candidate_metrics(use_gpu)
+            if gpu_candidate_metrics:
+                print("      Candidate scoring: GPU CuPy metrics + CPU frame decode")
+            else:
+                print("      Candidate scoring: CPU metrics")
+            step_started = time.perf_counter()
+            window_metrics = _measure_windows(cap, fps, windows, use_gpu=gpu_candidate_metrics)
+            timings["candidate_scoring_seconds"] = time.perf_counter() - step_started
+            valid_metrics = 0
+            for i, (window, metrics) in enumerate(zip(windows, window_metrics)):
+                if not metrics:
+                    continue
+                valid_metrics += 1
+                candidate = _build_candidate(video_file, name, duration, i, window, metrics)
+                candidates.append(candidate)
+            cap.release()
+            print(
+                f"      ⏱ Candidate scoring total: {_fmt_seconds(timings['candidate_scoring_seconds'])} "
+                f"({valid_metrics}/{len(windows)} windows usable)"
+            )
+        else:
+            print(f"      Warning: OpenCV could not open {name}; candidate analysis skipped.")
 
     qwen_seconds = 0.0
     if enable_ai and candidates and not defer_ai:
@@ -1054,7 +1082,11 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
 
     if use_gpu and GPU_AVAILABLE and cp is not None:
         try:
-            return _measure_frames_gpu(frames, sample_times, start, duration)
+            metrics = _measure_frames_gpu(frames, sample_times, start, duration)
+            # Anchor stays on CPU (numpy/cv2) even on the GPU metrics path so
+            # both paths emit an identical schema.
+            metrics["subject_anchor"] = _compute_subject_anchor(frames, sample_times, start)
+            return metrics
         except Exception:
             pass
 
@@ -1068,9 +1100,11 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
     sharpness = _clamp(np.mean(blur_values) / 520.0)
 
     motion_values = []
+    diff_maps: List[np.ndarray] = []
     peak_offset = duration * 0.5
     for i in range(1, len(gray_frames)):
         diff = cv2.absdiff(gray_frames[i], gray_frames[i - 1])
+        diff_maps.append(diff)
         motion = float(np.mean(diff) / 42.0)
         motion_values.append(motion)
     if motion_values:
@@ -1101,6 +1135,9 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
         "colorfulness": _clamp(colorfulness),
         "quality_score": quality,
         "peak_offset": _clamp(peak_offset, 0.0, duration, default=duration * 0.5),
+        "subject_anchor": _compute_subject_anchor(
+            frames, sample_times, start, gray_frames=gray_frames, diff_maps=diff_maps
+        ),
     }
 
 
@@ -1192,6 +1229,262 @@ def _resize_for_analysis(frame: np.ndarray, max_width: int) -> np.ndarray:
     return cv2.resize(frame, (max_width, max(2, int(h * scale))), interpolation=cv2.INTER_AREA)
 
 
+# ---------------------------------------------------------------------------
+# Subject anchor: per-candidate estimate of where the subject sits in frame,
+# so crops can follow the subject instead of always centering.
+#
+# Coordinate space: cx/cy are normalized 0..1 in the *decoded* frame
+# (cv2 storage pixels, pre-fit, SAR-unaware — cv2 does not apply the sample
+# aspect ratio, but normalized coordinates survive any later horizontal
+# scaling, so consumers can apply them after SAR correction safely).
+#
+# Priority: YuNet face detection (if the model is available) > motion
+# centroid (absdiff intensity) > detail centroid (gradient energy) for
+# static shots. All paths are deterministic and CPU/numpy-only.
+# ---------------------------------------------------------------------------
+
+YUNET_MODEL_ENV = "BEATSYNC_YUNET_MODEL"
+DEFAULT_YUNET_MODEL = os.path.join(ROOT_DIR, "models", "face_detection_yunet_2023mar.onnx")
+_YUNET_SCORE_THRESHOLD = 0.65
+_yunet_thread_local = threading.local()  # FaceDetectorYN is not thread-safe; one per worker thread
+_yunet_disabled = False
+
+_NEUTRAL_ANCHOR = {"cx": 0.5, "cy": 0.5, "confidence": 0.0, "source": "detail", "path": []}
+
+
+def _resolve_yunet_model_path() -> str:
+    env_path = os.environ.get(YUNET_MODEL_ENV, "").strip()
+    if env_path:
+        # Explicit override is authoritative: if it is missing/broken the
+        # face path is disabled (also serves as a kill switch) rather than
+        # silently falling back to the bundled model.
+        return env_path if os.path.isfile(env_path) else ""
+    return DEFAULT_YUNET_MODEL if os.path.isfile(DEFAULT_YUNET_MODEL) else ""
+
+
+def _get_yunet_detector():
+    global _yunet_disabled
+    if _yunet_disabled:
+        return None
+    detector = getattr(_yunet_thread_local, "detector", None)
+    if detector is not None:
+        return detector
+    if not hasattr(cv2, "FaceDetectorYN"):  # needs opencv>=4.5.4
+        _yunet_disabled = True
+        return None
+    model_path = _resolve_yunet_model_path()
+    if not model_path:
+        _yunet_disabled = True
+        return None
+    try:
+        detector = cv2.FaceDetectorYN.create(model_path, "", (320, 320), _YUNET_SCORE_THRESHOLD)
+    except Exception:
+        _yunet_disabled = True
+        return None
+    _yunet_thread_local.detector = detector
+    return detector
+
+
+def _detect_face_center(frame: np.ndarray):
+    """Weighted face center for one BGR frame: (cx, cy, weight) or None."""
+    detector = _get_yunet_detector()
+    if detector is None:
+        return None
+    h, w = frame.shape[:2]
+    if h < 16 or w < 16:
+        return None
+    try:
+        detector.setInputSize((int(w), int(h)))
+        _, faces = detector.detect(frame)
+    except Exception:
+        return None
+    if faces is None or len(faces) == 0:
+        return None
+    frame_area = float(w * h)
+    sum_w = 0.0
+    sum_x = 0.0
+    sum_y = 0.0
+    best_score = 0.0
+    for face in faces:
+        # YuNet row: x, y, w, h, 10 landmark coords, score (index 14).
+        score = float(face[14]) if len(face) > 14 else 1.0
+        if score < _YUNET_SCORE_THRESHOLD:
+            continue
+        bw = max(float(face[2]), 1.0)
+        bh = max(float(face[3]), 1.0)
+        cx = (float(face[0]) + bw * 0.5) / w
+        cy = (float(face[1]) + bh * 0.5) / h
+        weight = score * math.sqrt((bw * bh) / frame_area)  # larger faces dominate
+        sum_w += weight
+        sum_x += cx * weight
+        sum_y += cy * weight
+        best_score = max(best_score, score)
+    if sum_w <= 1e-9:
+        return None
+    return _clamp(sum_x / sum_w), _clamp(sum_y / sum_w), best_score
+
+
+def _map_centroid(magnitude: np.ndarray):
+    """Intensity centroid of a nonnegative 2D map: (cx, cy, concentration) or None.
+
+    concentration is 0 for a uniform map and approaches 1 for a point source
+    (spatial std of a uniform 2D distribution is ~0.408 in normalized units).
+    """
+    mag = magnitude.astype(np.float64, copy=False)
+    total = float(mag.sum())
+    if total <= 1e-6:
+        return None
+    h, w = mag.shape[:2]
+    xs = (np.arange(w, dtype=np.float64) + 0.5) / w
+    ys = (np.arange(h, dtype=np.float64) + 0.5) / h
+    col = mag.sum(axis=0) / total
+    row = mag.sum(axis=1) / total
+    cx = float(np.dot(col, xs))
+    cy = float(np.dot(row, ys))
+    variance = float(np.dot(col, (xs - cx) ** 2) + np.dot(row, (ys - cy) ** 2))
+    concentration = _clamp(1.0 - math.sqrt(max(variance, 0.0)) / 0.408)
+    return _clamp(cx), _clamp(cy), concentration
+
+
+def _robust_center(points: List[List[float]]):
+    """Outlier-rejecting weighted mean of [t, cx, cy, weight] samples.
+
+    Returns (cx, cy, agreement, kept_points). A single weird sample far from
+    the median is dropped before averaging.
+    """
+    kept = points
+    if len(points) >= 3:
+        med_x = float(np.median([p[1] for p in points]))
+        med_y = float(np.median([p[2] for p in points]))
+        filtered = [p for p in points if math.hypot(p[1] - med_x, p[2] - med_y) <= 0.28]
+        if filtered:
+            kept = filtered
+    total_w = sum(p[3] for p in kept)
+    if total_w <= 1e-9:
+        return 0.5, 0.5, 0.0, kept
+    cx = sum(p[1] * p[3] for p in kept) / total_w
+    cy = sum(p[2] * p[3] for p in kept) / total_w
+    if len(kept) > 1:
+        residual = sum(math.hypot(p[1] - cx, p[2] - cy) * p[3] for p in kept) / total_w
+        agreement = _clamp(1.0 - residual / 0.25)
+    else:
+        agreement = 0.6  # single sample: no cross-sample evidence either way
+    return _clamp(cx), _clamp(cy), agreement, kept
+
+
+def _compute_subject_anchor(frames: Sequence[np.ndarray], sample_times: np.ndarray,
+                            start: float, gray_frames: Sequence[np.ndarray] = None,
+                            diff_maps: Sequence[np.ndarray] = None) -> Dict:
+    """Estimate the subject position across the sampled frames.
+
+    Reuses the frames already decoded for candidate metrics (no extra
+    decoding); frames arrive downsampled to <=360px wide. Never raises.
+    """
+    try:
+        return _compute_subject_anchor_impl(frames, sample_times, start, gray_frames, diff_maps)
+    except Exception:
+        return dict(_NEUTRAL_ANCHOR, path=[])
+
+
+def _compute_subject_anchor_impl(frames, sample_times, start, gray_frames, diff_maps) -> Dict:
+    if not frames:
+        return dict(_NEUTRAL_ANCHOR, path=[])
+    if gray_frames is None:
+        gray_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
+    if diff_maps is None:
+        diff_maps = [cv2.absdiff(gray_frames[i], gray_frames[i - 1])
+                     for i in range(1, len(gray_frames))]
+
+    def t_rel(i: int) -> float:
+        if len(sample_times) > i:
+            return round(max(0.0, float(sample_times[i]) - start), 4)
+        return 0.0
+
+    # --- Face override -----------------------------------------------------
+    face_points: List[List[float]] = []
+    face_best_score = 0.0
+    for i, frame in enumerate(frames):
+        hit = _detect_face_center(frame)
+        if hit is not None:
+            cx, cy, score = hit
+            face_points.append([t_rel(i), cx, cy, score])
+            face_best_score = max(face_best_score, score)
+    face_fraction = len(face_points) / float(len(frames))
+    if face_points and (face_fraction >= 0.3 or len(face_points) >= 2):
+        cx, cy, agreement, kept = _robust_center(face_points)
+        confidence = _clamp((0.6 + 0.3 * agreement) * (0.55 + 0.45 * face_fraction)
+                            * (0.7 + 0.3 * face_best_score))
+        return {
+            "cx": cx,
+            "cy": cy,
+            "confidence": confidence,
+            "source": "face",
+            "path": [[p[0], round(p[1], 4), round(p[2], 4)] for p in kept],
+        }
+
+    # --- Motion centroid ---------------------------------------------------
+    motion_points: List[List[float]] = []
+    motion_strengths: List[float] = []
+    concentrations: List[float] = []
+    for i, diff in enumerate(diff_maps):
+        strength = float(np.mean(diff)) / 42.0
+        if strength < 0.02:  # near-static pair: absdiff is mostly sensor noise
+            continue
+        moving = np.maximum(diff.astype(np.float32) - 6.0, 0.0)  # floor out noise
+        moving *= moving  # square to concentrate on the strongest mover
+        centroid = _map_centroid(moving)
+        if centroid is None:
+            continue
+        cx, cy, concentration = centroid
+        motion_points.append([t_rel(i + 1), cx, cy, strength * (0.3 + 0.7 * concentration)])
+        motion_strengths.append(strength)
+        concentrations.append(concentration)
+    if motion_points and float(np.mean(motion_strengths)) >= 0.05:
+        cx, cy, agreement, kept = _robust_center(motion_points)
+        strength_factor = _clamp(float(np.mean(motion_strengths)) / 0.3)
+        confidence = _clamp(0.2 + 0.45 * strength_factor * float(np.mean(concentrations))
+                            + 0.15 * agreement, hi=0.75)
+        return {
+            "cx": cx,
+            "cy": cy,
+            "confidence": confidence,
+            "source": "motion",
+            "path": [[p[0], round(p[1], 4), round(p[2], 4)] for p in kept],
+        }
+
+    # --- Detail centroid fallback (static shots) ---------------------------
+    detail_points: List[List[float]] = []
+    energies: List[float] = []
+    concentrations = []
+    for i, gray in enumerate(gray_frames):
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad = gx * gx + gy * gy
+        centroid = _map_centroid(grad)
+        if centroid is None:
+            continue
+        cx, cy, concentration = centroid
+        energy = _clamp(float(np.mean(grad)) / 4000.0)
+        detail_points.append([t_rel(i), cx, cy, 0.2 + 0.8 * energy])
+        energies.append(energy)
+        concentrations.append(concentration)
+    if detail_points:
+        cx, cy, agreement, kept = _robust_center(detail_points)
+        # Low ceiling; near-zero for uniform frames so consumers ignore it.
+        confidence = _clamp(0.35 * float(np.mean(energies) ** 0.5)
+                            * (0.4 + 0.6 * float(np.mean(concentrations)))
+                            * (0.5 + 0.5 * agreement), hi=0.35)
+        return {
+            "cx": cx,
+            "cy": cy,
+            "confidence": confidence,
+            "source": "detail",
+            "path": [[p[0], round(p[1], 4), round(p[2], 4)] for p in kept],
+        }
+
+    return dict(_NEUTRAL_ANCHOR, path=[])
+
+
 def _colorfulness(frames: Sequence[np.ndarray]) -> float:
     values = []
     for frame in frames:
@@ -1263,6 +1556,7 @@ def _build_candidate(
         "sharpness": sharpness,
         "colorfulness": colorfulness,
         "quality_score": quality,
+        "subject_anchor": metrics.get("subject_anchor", dict(_NEUTRAL_ANCHOR, path=[])),
         "action_score": action,
         "beauty_score": beauty,
         "tension_score": tension,

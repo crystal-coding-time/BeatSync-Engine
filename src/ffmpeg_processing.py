@@ -168,6 +168,66 @@ def get_hwaccel_args(use_hw_encoder: bool, gpu_encoder: str) -> List[str]:
 
 FIT_MODES = ('crop', 'blur', 'pad', 'stretch')
 
+# Still images accepted as sources. HEIC is deliberately absent: this
+# machine's Homebrew ffmpeg build ships no HEIF demuxer/decoder.
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
+
+# Stills have no timeline of their own; the probe layer reports this synthetic
+# duration so the planner can place a still anywhere, and extraction serves it
+# with -loop 1 for exactly the frames each segment needs.
+SYNTHETIC_IMAGE_DURATION = 3600.0
+
+# ProRes proxies rendered from stills get a fixed runway comfortably longer
+# than the longest possible segment hold.
+IMAGE_PRORES_SECONDS = 60.0
+
+
+def is_image_source(path: str) -> bool:
+    """True for still-image sources (extension check; cheap and deterministic)."""
+    return os.path.splitext(str(path))[1].lower() in IMAGE_EXTENSIONS
+
+
+def count_video_frames(video_file: str) -> int | None:
+    """Frame count of the first video stream; None if it can't be determined.
+
+    Uses -count_packets (demux only, no decode — one packet per frame for
+    video streams), so this is cheap enough to run on every segment. It is
+    the runtime enforcement of the zero-drift contract: -vframes caps output
+    but never pads it, so a short source window would otherwise produce a
+    short segment that silently shifts every later cut against the audio.
+    """
+    try:
+        probe_cmd = [
+            FFPROBE_PATH,
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-count_packets',
+            '-show_entries', 'stream=nb_read_packets',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_file,
+        ]
+        result = _run_media_command(probe_cmd, timeout=30)
+        if result.returncode != 0:
+            return None
+        return int(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def _verify_segment_frames(output_file: str, expected: int) -> bool:
+    """Post-extract guard: the segment must hold exactly the planned frames."""
+    actual = count_video_frames(output_file)
+    if actual is None:
+        print(f"   ⚠️  Could not verify frame count of {os.path.basename(output_file)}; keeping it")
+        return True
+    if actual != expected:
+        print(
+            f"   ❌ Frame-count mismatch in {os.path.basename(output_file)}: "
+            f"expected {expected}, got {actual} — rejecting segment (timeline would drift)"
+        )
+        return False
+    return True
+
 # Smart crop caps how much of a source the fill-and-center-crop may discard.
 # Mild mismatches keep the classic full-frame crop (best-looking, loses
 # little); beyond the cap the source is scaled so at most this fraction of
@@ -176,13 +236,77 @@ FIT_MODES = ('crop', 'blur', 'pad', 'stretch')
 # otherwise lose ~69% of its content).
 MAX_CROP_PER_AXIS = 0.15
 
+# Above this crop_loss (fraction of the source a fill-crop would discard) the
+# limited-crop hybrid still wastes most of the frame on blur fill, so — when
+# the segment duration is known — the fit engine switches to scan-fit: fill
+# the target's short axis fully and sweep the crop window along the long axis
+# over the segment (smoothstep-eased crop expression, not zoompan).
+SCAN_CROP_LOSS = 0.40
 
-def get_fit_filters(target_size: Tuple[int, int], fit_mode: str) -> List[str]:
+# Motion-sickness guard for scan-fit: the sweep's PEAK speed may not exceed
+# this fraction of the overflow per second (smoothstep peaks at 1.5x the
+# average speed). Too-short segments shrink the travel instead.
+SCAN_MAX_SPEED_FRAC = 0.40
+
+# Anchors below this confidence are ignored (treated as "no anchor" →
+# centered behavior identical to the pre-anchor engine).
+ANCHOR_MIN_CONFIDENCE = 0.2
+
+# Echo blur fill: background overscan (fraction of cover) that gives the
+# drifting crop window room to move, and how far it drifts over the segment
+# (fraction of the target dimension).
+ECHO_BG_OVERSCAN = 1.10
+ECHO_DRIFT_TRAVEL = 0.03
+
+
+def _resolve_anchor(anchor) -> object:
+    """(cx, cy) in 0..1 from an analysis anchor dict, or None when unusable.
+
+    Anchor contract: {"cx": 0..1, "cy": 0..1, "confidence": 0..1, ...} in
+    normalized source coordinates (scale-safe, so the same fractions apply
+    before or after any scale). None / low confidence / malformed → None,
+    which every consumer maps to the exact legacy centered behavior.
+    """
+    if not isinstance(anchor, dict):
+        return None
+    try:
+        if float(anchor.get('confidence', 0.0)) < ANCHOR_MIN_CONFIDENCE:
+            return None
+        cx = min(1.0, max(0.0, float(anchor['cx'])))
+        cy = min(1.0, max(0.0, float(anchor['cy'])))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return cx, cy
+
+
+def _anchored_crop(w: int, h: int, anchor=None) -> str:
+    """crop=w:h centered on the anchor (clamped to frame bounds), or the
+    plain centered crop when there is no usable anchor.
+
+    The x/y expressions position the crop window's CENTER at (cx·iw, cy·ih);
+    clip() keeps the window inside the frame, so an anchor near an edge
+    degrades gracefully to an edge-aligned crop. Anchor=None emits the exact
+    legacy `crop=w:h` string so unchanged inputs stay byte-identical.
+    """
+    pt = _resolve_anchor(anchor)
+    if pt is None:
+        return f"crop={w}:{h}"
+    cx, cy = pt
+    return (
+        f"crop={w}:{h}"
+        f":x='clip(iw*{cx:.6f}-ow/2\\,0\\,iw-ow)'"
+        f":y='clip(ih*{cy:.6f}-oh/2\\,0\\,ih-oh)'"
+    )
+
+
+def get_fit_filters(target_size: Tuple[int, int], fit_mode: str, *,
+                    anchor: dict = None) -> List[str]:
     """Aspect-ratio handling for sources that don't match the target frame.
 
     crop    – scale to fill, center-crop overflow (no distortion, default;
               callers with a probed source size upgrade big mismatches to the
-              limited-crop hybrid via plan_source_fit)
+              limited-crop hybrid via plan_source_fit). An anchor moves WHERE
+              the crop window sits, never how much is cropped.
     pad     – letterbox/pillarbox with black bars
     stretch – legacy distorting scale
     blur    – handled separately (needs a filter graph, see caller)
@@ -198,7 +322,7 @@ def get_fit_filters(target_size: Tuple[int, int], fit_mode: str) -> List[str]:
         ]
     return [
         f"scale={w}:{h}:force_original_aspect_ratio=increase",
-        f"crop={w}:{h}",
+        _anchored_crop(w, h, anchor),
         "setsar=1",
     ]
 
@@ -245,14 +369,31 @@ def get_cached_display_info(video_file: str):
         return None
 
 
+def _crop_loss(display_size: Tuple[float, float],
+               target_size: Tuple[int, int]) -> float:
+    """Fraction of the source a fill-and-crop would discard (0 = perfect fit).
+
+    Negative/zero dimensions return 0.0 so callers fall back to the plain
+    chain without special-casing.
+    """
+    sw, sh = display_size
+    tw, th = target_size
+    if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
+        return 0.0
+    f_fit = min(tw / sw, th / sh)
+    f_fill = max(tw / sw, th / sh)
+    return 1.0 - f_fit / f_fill
+
+
 def plan_smart_crop(display_size: Tuple[float, float],
                     target_size: Tuple[int, int]):
     """Foreground geometry for the limited-crop hybrid, or None to keep the
     plain fill-and-center-crop chain.
 
     Returns (fg_w, fg_h, crop_w, crop_h): the source is scaled to fg_w×fg_h
-    (losing at most MAX_CROP_PER_AXIS of the overflowing axis to the centered
-    crop) and composited over the blurred fill.
+    (losing at most MAX_CROP_PER_AXIS of the overflowing axis to the crop —
+    centered by default, anchor-offset when the caller has one) and
+    composited over the blurred fill.
     """
     sw, sh = display_size
     tw, th = target_size
@@ -269,44 +410,202 @@ def plan_smart_crop(display_size: Tuple[float, float],
     return fg_w, fg_h, min(fg_w, tw), min(fg_h, th)
 
 
+def plan_scan_fit(display_size: Tuple[float, float],
+                  target_size: Tuple[int, int], duration: float,
+                  anchor: dict = None):
+    """Filter list for scan-fit, or None when it doesn't apply.
+
+    Scan-fit fills the target's short axis completely and sweeps the crop
+    window along the overflowing axis over the segment with smoothstep easing
+    (pos = travel·(3u²−2u³), u = t/duration) — a pure per-frame crop
+    expression, cheaper and frame-exact where zoompan is not. With an anchor
+    the sweep ENDS centered on the subject (starting from the far side);
+    without one it runs top→bottom / left→right. SCAN_MAX_SPEED_FRAC caps the
+    peak sweep speed; segments too short for the full travel shrink it and
+    center the covered range on the anchor (or frame center).
+    """
+    sw, sh = display_size
+    tw, th = target_size
+    if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
+        return None
+    if not duration or duration <= 0:
+        return None
+    src_ar = sw / sh
+    tgt_ar = tw / th
+    if src_ar < tgt_ar:
+        # Portrait-ish source in landscape-ish target: fill width, sweep
+        # vertically along the overflowing height.
+        scale_w = tw
+        scale_h = max(th, int(round(sh * (tw / sw) / 2)) * 2)
+        overflow = scale_h - th
+        sweep_y = True
+    elif src_ar > tgt_ar:
+        # The converse: fill height, sweep horizontally.
+        scale_h = th
+        scale_w = max(tw, int(round(sw * (th / sh) / 2)) * 2)
+        overflow = scale_w - tw
+        sweep_y = False
+    else:
+        return None
+    if overflow < 2:
+        return None
+
+    pt = _resolve_anchor(anchor)
+    if pt is not None:
+        frac = pt[1] if sweep_y else pt[0]
+        scaled_dim = scale_h if sweep_y else scale_w
+        out_dim = th if sweep_y else tw
+        focus = min(float(overflow), max(0.0, frac * scaled_dim - out_dim / 2.0))
+        end = focus
+        start = float(overflow) if end <= overflow / 2.0 else 0.0
+    else:
+        focus = overflow / 2.0
+        start, end = 0.0, float(overflow)
+
+    # Peak smoothstep speed is 1.5·travel/duration; keep it under the cap.
+    travel_max = SCAN_MAX_SPEED_FRAC * overflow * duration / 1.5
+    travel = abs(end - start)
+    if travel > travel_max:
+        travel = travel_max
+        lo = min(float(overflow) - travel, max(0.0, focus - travel / 2.0))
+        if end >= start:
+            start, end = lo, lo + travel
+        else:
+            start, end = lo + travel, lo
+    delta = end - start
+
+    pos_expr = (
+        f"'{start:.3f}+{delta:.3f}*"
+        f"(3*pow(clip(t/{duration:.6f}\\,0\\,1)\\,2)"
+        f"-2*pow(clip(t/{duration:.6f}\\,0\\,1)\\,3))'"
+    )
+    if sweep_y:
+        crop = f"crop={tw}:{th}:0:{pos_expr}"
+    else:
+        crop = f"crop={tw}:{th}:{pos_expr}:0"
+    return [f"scale={scale_w}:{scale_h}", crop, "setsar=1"]
+
+
 def plan_source_fit(video_file: str, target_size: Tuple[int, int],
-                    fit_mode: str) -> Tuple[List[str], object]:
-    """Per-source fit decisions: (sar_fix_filters, hybrid_fg_geometry_or_None).
+                    fit_mode: str, *, anchor: dict = None,
+                    duration: float = None) -> Tuple[List[str], object]:
+    """Per-source fit decisions: (sar_fix_filters, fit_plan).
 
     sar_fix resamples anamorphic sources to square pixels before the fit
     chain — force_original_aspect_ratio compares storage dimensions and the
     fit chains end in setsar=1, so non-square SAR would render distorted.
-    hybrid_fg upgrades Smart crop to the limited-crop hybrid when the plain
-    chain would discard more than MAX_CROP_PER_AXIS.
+
+    fit_plan is (unchanged defaults keep this identical to the pre-anchor
+    engine):
+      None ................................. plain get_fit_filters chain
+      (fg_w, fg_h, crop_w, crop_h) tuple ... limited-crop hybrid over blur
+                                             fill (crop_loss in
+                                             (MAX_CROP_PER_AXIS, SCAN_CROP_LOSS])
+      {'mode': 'scan', 'filters': [...]} ... scan-fit sweep (crop_loss >
+                                             SCAN_CROP_LOSS and duration
+                                             known; never chosen with the
+                                             default duration=None)
     """
     sar_fix: List[str] = []
-    hybrid_fg = None
+    fit_plan = None
     if not target_size or fit_mode not in ('crop', 'blur', 'pad'):
-        return sar_fix, hybrid_fg
+        return sar_fix, fit_plan
     info = get_cached_display_info(video_file)
     if not info:
-        return sar_fix, hybrid_fg
+        return sar_fix, fit_plan
     disp_w, disp_h, sar = info
     if abs(sar - 1.0) > 0.01:
         sar_fix = ["scale=iw*sar:ih", "setsar=1"]
     if fit_mode == 'crop':
-        hybrid_fg = plan_smart_crop((disp_w, disp_h), target_size)
-    return sar_fix, hybrid_fg
+        fit_plan = plan_smart_crop((disp_w, disp_h), target_size)
+        if (fit_plan is not None and duration
+                and _crop_loss((disp_w, disp_h), target_size) > SCAN_CROP_LOSS):
+            scan = plan_scan_fit((disp_w, disp_h), target_size, duration,
+                                 anchor=anchor)
+            if scan:
+                fit_plan = {'mode': 'scan', 'filters': scan}
+            # else: keep the hybrid — never a static extreme crop.
+    return sar_fix, fit_plan
 
 
-def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None) -> str:
-    """Single-input chain: blurred fill in back, foreground centered on top.
+# Drift directions for the echo background, indexed by a stable hash of the
+# source path — deterministic across runs (double-run framemd5 idiom), varied
+# across sources.
+_ECHO_DRIFT_DIRECTIONS = (
+    (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1),
+)
+
+
+def _echo_drift_direction(source_key: str) -> Tuple[int, int]:
+    """Deterministic drift direction from a stable hash of the source path."""
+    digest = hashlib.sha1((source_key or '').encode('utf-8')).hexdigest()
+    return _ECHO_DRIFT_DIRECTIONS[int(digest[:8], 16) % len(_ECHO_DRIFT_DIRECTIONS)]
+
+
+def _echo_bg_filters(target_size: Tuple[int, int], duration: float = None,
+                     source_key: str = None) -> List[str]:
+    """The 'echo' background: blurred overscanned fill with a deliberate
+    grade (darkened, desaturated, subtle vignette) and — when the segment
+    duration is known — a slow linear drift of the crop window (~3% of the
+    frame over the segment; steadier and cheaper than zoompan).
+
+    duration=None keeps today's static cover framing (grade still applies).
+    The vignette runs after the drifting crop so it stays centered on the
+    visible frame instead of wandering with the window.
+    """
+    w, h = target_size
+    grade = "eq=brightness=-0.08:saturation=0.6"
+    vignette = "vignette=angle=PI/8"
+    if not duration or duration <= 0:
+        return [
+            f"scale={w}:{h}:force_original_aspect_ratio=increase",
+            f"crop={w}:{h}",
+            "gblur=sigma=16",
+            grade,
+            vignette,
+        ]
+    bw = max(w + 2, int(round(w * ECHO_BG_OVERSCAN / 2)) * 2)
+    bh = max(h + 2, int(round(h * ECHO_BG_OVERSCAN / 2)) * 2)
+    dx, dy = _echo_drift_direction(source_key)
+    travel_x = min(bw - w, int(round(w * ECHO_DRIFT_TRAVEL))) * dx
+    travel_y = min(bh - h, int(round(h * ECHO_DRIFT_TRAVEL))) * dy
+
+    def _axis_expr(margin: int, travel: int) -> str:
+        if travel == 0:
+            return f"{margin / 2.0:.3f}"
+        start = margin / 2.0 - travel / 2.0
+        return f"'{start:.3f}+{travel:.3f}*clip(t/{duration:.6f}\\,0\\,1)'"
+
+    x_expr = _axis_expr(bw - w, travel_x)
+    y_expr = _axis_expr(bh - h, travel_y)
+    return [
+        f"scale={bw}:{bh}:force_original_aspect_ratio=increase",
+        f"crop={bw}:{bh}",
+        "gblur=sigma=16",
+        grade,
+        f"crop={w}:{h}:{x_expr}:{y_expr}",
+        vignette,
+    ]
+
+
+def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None,
+                    *, duration: float = None, source_key: str = None) -> str:
+    """Single-input chain: echo blur fill in back, foreground centered on top.
 
     Works in both -vf and -filter_complex (a linear chain with an internal
     split). The default foreground is the undistorted full fit (pure blur
-    mode); the limited-crop hybrid passes its own scale+crop chain.
+    mode); the limited-crop hybrid passes its own scale+crop chain (which may
+    carry an anchor offset — the fg compositing itself stays centered).
+    duration/source_key feed the background drift; both default to the
+    static-background behavior.
     """
     w, h = target_size
     if fg_filters is None:
         fg_filters = [f"scale={w}:{h}:force_original_aspect_ratio=decrease"]
+    bg = ",".join(_echo_bg_filters(target_size, duration, source_key))
     return (
         f"split=2[bg][fg];"
-        f"[bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},gblur=sigma=16[bgb];"
+        f"[bg]{bg}[bgb];"
         f"[fg]{','.join(fg_filters)}[fgs];"
         f"[bgb][fgs]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,setsar=1"
     )
@@ -314,27 +613,44 @@ def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None) 
 
 def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
                          post_filters: List[str], out_label: str = 'outv',
-                         fg_filters: List[str] = None) -> str:
-    """Filter graph for blur fit: blurred fill in back, foreground in front."""
+                         fg_filters: List[str] = None, *,
+                         duration: float = None, source_key: str = None) -> str:
+    """Filter graph for blur fit: echo blur fill in back, foreground in front."""
     pre = ",".join(pre_filters)
     post = ("," + ",".join(post_filters)) if post_filters else ""
-    return f"[0:v]{pre},{_blur_fit_chain(target_size, fg_filters)}{post}[{out_label}]"
+    chain = _blur_fit_chain(target_size, fg_filters, duration=duration,
+                            source_key=source_key)
+    return f"[0:v]{pre},{chain}{post}[{out_label}]"
+
+
+def _hybrid_fg_filters(hybrid_fg, anchor: dict = None) -> List[str]:
+    """Foreground scale+crop for the limited-crop hybrid; the crop window
+    honors the anchor (offset, never enlarged) when one is usable."""
+    fg_w, fg_h, crop_w, crop_h = hybrid_fg
+    return [f"scale={fg_w}:{fg_h}", _anchored_crop(crop_w, crop_h, anchor)]
 
 
 def build_source_fit_chain(video_file: str, target_size: Tuple[int, int],
-                           fit_mode: str) -> str:
+                           fit_mode: str, *, anchor: dict = None,
+                           duration: float = None) -> str:
     """-vf chain fitting a whole source to target_size (SAR normalization plus
-    blur/limited-crop handling) — used by ProRes proxy conversion so lossless
-    mode fits sources the same way the standard pipeline does."""
-    sar_fix, hybrid_fg = plan_source_fit(video_file, target_size, fit_mode)
-    if fit_mode == 'blur' or hybrid_fg:
-        fg_filters = None
-        if hybrid_fg:
-            fg_w, fg_h, crop_w, crop_h = hybrid_fg
-            fg_filters = [f"scale={fg_w}:{fg_h}", f"crop={crop_w}:{crop_h}"]
-        chain = _blur_fit_chain(target_size, fg_filters)
+    blur/limited-crop/scan handling) — used by ProRes proxy conversion so
+    lossless mode fits sources the same way the standard pipeline does.
+    duration/anchor are optional upgrades: duration enables the echo drift
+    and scan-fit, anchor offsets the crop windows; the defaults keep the
+    pre-anchor framing (plus the echo grade on blur fills)."""
+    sar_fix, fit_plan = plan_source_fit(video_file, target_size, fit_mode,
+                                        anchor=anchor, duration=duration)
+    scan_plan = fit_plan if isinstance(fit_plan, dict) else None
+    hybrid_fg = fit_plan if fit_plan is not None and scan_plan is None else None
+    if scan_plan:
+        chain = ",".join(scan_plan['filters'])
+    elif fit_mode == 'blur' or hybrid_fg:
+        fg_filters = _hybrid_fg_filters(hybrid_fg, anchor) if hybrid_fg else None
+        chain = _blur_fit_chain(target_size, fg_filters, duration=duration,
+                                source_key=video_file)
     else:
-        chain = ",".join(get_fit_filters(target_size, fit_mode))
+        chain = ",".join(get_fit_filters(target_size, fit_mode, anchor=anchor))
     return ",".join(sar_fix + [chain]) if sar_fix else chain
 
 
@@ -380,6 +696,10 @@ _SOURCE_DURATION_CACHE: dict = {}
 
 def get_cached_video_duration(video_file: str) -> float:
     """Duration lookup with a per-run cache (segments hit the same sources repeatedly)."""
+    if is_image_source(video_file):
+        # ffprobe reports one frame (~0.04s) for a still; the synthetic
+        # duration lets stills fill any segment (extraction loops them).
+        return SYNTHETIC_IMAGE_DURATION
     cached = _SOURCE_DURATION_CACHE.get(video_file)
     if cached is None:
         cached = _probe_video_duration(video_file)
@@ -435,12 +755,31 @@ def _probe_video_duration(video_file: str) -> float | None:
 
 def get_video_duration(video_file: str) -> float:
     """Get the duration of a video file using ffprobe."""
+    if is_image_source(video_file):
+        return SYNTHETIC_IMAGE_DURATION
     duration = _probe_video_duration(video_file)
     return 10.0 if duration is None else duration  # Default fallback
 
 
+_SOURCE_FPS_CACHE: dict = {}
+
+
+def get_cached_video_fps(video_file: str) -> float:
+    """fps lookup with a per-run cache (the planner probes per segment)."""
+    cached = _SOURCE_FPS_CACHE.get(video_file)
+    if cached is None:
+        cached = get_video_fps(video_file)
+        _SOURCE_FPS_CACHE[video_file] = cached
+    return cached
+
+
 def get_video_fps(video_file: str) -> float:
     """Get the FPS of a video file using ffprobe."""
+    if is_image_source(video_file):
+        # A still has no timebase; ffprobe would report the image2 demuxer
+        # default (25) which must not masquerade as a real source fps.
+        # Callers detecting output fps should skip image sources entirely.
+        return 30.0
     try:
         probe_cmd = [
             FFPROBE_PATH,
@@ -540,9 +879,15 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None,
         FFMPEG_PATH,
         '-nostdin',
         '-hide_banner',
+    ]
+    if is_image_source(video_file):
+        # A still becomes a fixed-length looped clip so precise mode's segment
+        # extraction and concat see a normal video stream.
+        cmd.extend(['-loop', '1', '-framerate', str(fps), '-t', str(IMAGE_PRORES_SECONDS)])
+    cmd.extend([
         '-i', video_file,
         '-map', '0:v:0',
-    ]
+    ])
     if target_size:
         # Same fit behavior as the standard pipeline (SAR normalization,
         # blur fit, limited-crop hybrid) — -vf accepts the internal-split
@@ -578,20 +923,157 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None,
         raise Exception(f"ProRes conversion error: {str(e)}")
 
 
+RETIME_MIN_SPEED = 0.4
+RETIME_MAX_SPEED = 2.5
+# Over-provision every retimed source window by this many OUTPUT frames of
+# source time. -vframes truncates the excess for free, while a window that
+# comes up even one source frame short yields a short segment (audit repro:
+# 59/60 and 23/60) that would silently drift the whole timeline.
+RETIME_SLACK_FRAMES = 2
+
+
+def _retime_speeds(retime: dict) -> Tuple[float, float]:
+    """(speed_start, speed_end) of a retime spec, clamped to the safe band."""
+    kind = retime.get('kind')
+    if kind == 'ramp':
+        s0 = float(retime.get('speed_start', 1.0))
+        s1 = float(retime.get('speed_end', 1.0))
+    else:
+        s0 = s1 = float(retime.get('speed', 1.0))
+    clamp = lambda s: max(RETIME_MIN_SPEED, min(RETIME_MAX_SPEED, s))
+    return clamp(s0), clamp(s1)
+
+
+def retime_source_window(output_duration: float, retime: dict | None,
+                         fps: float) -> float:
+    """Source seconds a segment must decode, slack included.
+
+    Shared by the planner (runway gating), the clip worker (start clamping)
+    and extraction (trim/-t) so the three can never disagree about how much
+    source a retimed segment consumes.
+    """
+    if not retime:
+        return output_duration
+    if retime.get('kind') == 'freeze':
+        out_frames = max(1, seconds_to_frame_count(output_duration, fps))
+        freeze = min(int(retime.get('freeze_frames', 0)), out_frames - 1)
+        content_frames = max(1, out_frames - freeze)
+        return content_frames / fps + RETIME_SLACK_FRAMES / fps
+    s0, s1 = _retime_speeds(retime)
+    avg = (s0 + s1) / 2.0
+    slack = (RETIME_SLACK_FRAMES / fps) * max(1.0, s0, s1)
+    return output_duration * avg + slack
+
+
+def _retime_filters(retime: dict, output_duration: float, fps: float) -> List[str]:
+    """Filter snippet realizing a retime spec.
+
+    Sits BETWEEN setpts=PTS-STARTPTS and the final fps= (see
+    build_segment_pre_filters): everything downstream of fps — effects,
+    transitions, text fades, zoompan, -vframes — sees the OUTPUT clock, so
+    beat-locked timing is untouched by how fast the content underneath runs.
+    """
+    kind = retime.get('kind')
+    if kind == 'freeze':
+        # loop repeats the last content frame but duplicates its PTS, which
+        # fps would then drop — re-linearize with setpts=N/FR/TB after it. The
+        # leading fps= normalizes to the output rate so frame indexes are in
+        # output units; the frame-exact trim guarantees nothing follows the
+        # frozen tail (the decode slack would otherwise leak in after the
+        # repeats), and looping slack extra repeats keeps -vframes fed even
+        # if the decode came up a frame short.
+        out_frames = max(1, seconds_to_frame_count(output_duration, fps))
+        freeze = min(int(retime.get('freeze_frames', 0)), out_frames - 1)
+        if freeze <= 0:
+            return []
+        content_frames = max(1, out_frames - freeze)
+        return [
+            f"fps={fps}",
+            f"trim=end_frame={content_frames}",
+            "setpts=PTS-STARTPTS",
+            f"loop=loop={freeze + RETIME_SLACK_FRAMES}:size=1:start={content_frames - 1}",
+            f"setpts=N/{fps}/TB",
+        ]
+    s0, s1 = _retime_speeds(retime)
+    if abs(s1 - s0) < 0.01:
+        return [f"setpts=PTS/{s0:.6f}"]
+    # Variable ramp: source time τ(t) = s0·t + a·t²/2 with a=(s1-s0)/T, so the
+    # output timestamp is the inverse t(τ) = (sqrt(s0²+2aτ) − s0)/a. Monotonic
+    # for any positive speeds, which fps= requires.
+    T = max(0.05, float(output_duration))
+    a = (s1 - s0) / T
+    expr = (
+        f"(sqrt({s0 * s0:.8f}+{2.0 * a:.8f}*PTS*TB)-{s0:.6f})/{a:.8f}/TB"
+    )
+    return [f"setpts='{expr}'"]
+
+
 def build_segment_pre_filters(exact_duration: float, fps: float,
-                              trim_start: float = 0.0) -> List[str]:
+                              trim_start: float = 0.0,
+                              retime: dict | None = None,
+                              output_duration: float = None) -> List[str]:
     """Shared trim/setpts/fps head of every segment's filter chain.
 
     Trim first so each extracted segment has exact timing; effects come after
     fps so their time expressions see the final frame timing. A nonzero
     trim_start seeks in the filter chain (used with -stream_loop, where an
     input-side -ss re-seeks on every loop iteration).
+
+    ORDERING INVARIANT: retime filters live between setpts=PTS-STARTPTS and
+    the final fps=. Moving them after fps would put every time-based effect
+    expression, segment_beats gate and zoompan counter on the RETIMED clock
+    and silently break beat alignment. exact_duration is the SOURCE window
+    (equal to the output duration when retime is None); output_duration is
+    what -vframes will enforce.
     """
     if trim_start > 0:
         trim_filter = f"trim=start={trim_start:.6f}:duration={exact_duration}"
     else:
         trim_filter = f"trim=duration={exact_duration}"
-    return [trim_filter, "setpts=PTS-STARTPTS", f"fps={fps}"]
+    filters = [trim_filter, "setpts=PTS-STARTPTS"]
+    if retime:
+        filters.extend(_retime_filters(retime, output_duration or exact_duration, fps))
+    filters.append(f"fps={fps}")
+    return filters
+
+
+def build_ken_burns_filter(rng, target_size: Tuple[int, int], fps: float,
+                           frame_count: int) -> str:
+    """Gentle deterministic pan/zoom so a still reads as footage.
+
+    Runs after the fit chain (frames are already target-sized), so zoompan's
+    output size matches the input and only the virtual camera moves. Callers
+    seed rng per segment; the same idiom as effects.py keeps renders
+    reproducible.
+    """
+    w, h = target_size
+    n = max(2, int(frame_count))
+    dz = 0.06 + 0.06 * rng.random()  # 6-12% zoom travel over the segment
+    if rng.random() < 0.5:
+        zoom_expr = f"1+{dz:.4f}*on/{n}"
+    else:
+        zoom_expr = f"{1 + dz:.4f}-{dz:.4f}*on/{n}"
+    pan = rng.choice(('lr', 'rl', 'tb', 'bt', 'center'))
+    x_expr = {
+        'lr': f"(iw-iw/zoom)*on/{n}",
+        'rl': f"(iw-iw/zoom)*(1-on/{n})",
+    }.get(pan, "(iw-iw/zoom)/2")
+    y_expr = {
+        'tb': f"(ih-ih/zoom)*on/{n}",
+        'bt': f"(ih-ih/zoom)*(1-on/{n})",
+    }.get(pan, "(ih-ih/zoom)/2")
+    return (
+        f"zoompan=z='{zoom_expr}':d=1:x='{x_expr}':y='{y_expr}'"
+        f":s={w}x{h}:fps={fps}"
+    )
+
+
+def _lut3d_filter(cube_path: str) -> str:
+    """lut3d with the path escaped for filter-arg parsing (\\ : ' are special)."""
+    escaped = (cube_path.replace('\\', '/')
+               .replace(':', '\\:')
+               .replace("'", "\\'"))
+    return f"lut3d=file='{escaped}'"
 
 
 def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: float,
@@ -600,35 +1082,78 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                                 gpu_encoder: str = 'h264_nvenc',
                                 fit_mode: str = 'crop',
                                 extra_filters: List[str] = None,
-                                text_overlay: Tuple[str, float, float, float] = None) -> bool:
+                                text_overlay: Tuple[str, float, float, float] = None,
+                                look_cube: str = None,
+                                retime: dict = None,
+                                *, anchor: dict = None) -> bool:
     """
     Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
-    
+
     ✅ FRAME-ACCURATE: Uses exact frame counts instead of floating-point seconds
     ✅ ZERO DRIFT: No cumulative timing errors
+
+    duration is the OUTPUT duration (what the timeline reserved). With a
+    retime spec the source window differs — retime_source_window() computes
+    it, over-provisioned so -vframes always has enough frames to cap.
+
+    anchor (optional, from the analysis stage): {"cx","cy","confidence",...}
+    normalized subject center; offsets fit-crop windows and biases the
+    scan-fit sweep. None or low confidence keeps centered framing.
     """
     try:
-        # ✅ FRAME-ACCURATE: Calculate exact source and output frame counts.
-        source_frame_count = max(1, seconds_to_frame_count(duration, fps))
-        exact_source_duration = frame_count_to_seconds(source_frame_count, fps)
-        output_frame_count = source_frame_count
+        # ✅ FRAME-ACCURATE: Calculate exact output frame count first; the
+        # source window derives from it (and the retime spec, if any).
+        output_frame_count = max(1, seconds_to_frame_count(duration, fps))
+        exact_output_duration = frame_count_to_seconds(output_frame_count, fps)
+        exact_source_duration = retime_source_window(exact_output_duration, retime, fps)
+
+        # Still images have no timeline: -loop 1 serves the single frame for
+        # exactly the segment window, so seeking, -stream_loop and retiming
+        # don't apply (retiming a static frame is a no-op with extra risk).
+        image_source = is_image_source(video_file)
+        if retime and image_source:
+            retime = None
+            exact_source_duration = exact_output_duration
 
         # Loop sources shorter than the segment (GIFs, short clips) so the
         # frame count stays exact instead of drifting. ffmpeg gotcha: with
         # -stream_loop, an input-side -ss re-seeks to the offset on EVERY loop
         # iteration (each pass yields only [start, EOF] instead of wrapping),
         # so looped seeks happen in the filter chain via trim=start= instead.
-        loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
+        if image_source:
+            loop_args, start_time = [], 0.0
+        else:
+            loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
+        if retime and loop_args:
+            # Ramps never loop: a loop seam mid-retime is jarring, and the
+            # planner already gates on runway — this is the deterministic
+            # belt-and-braces strip for anything that slipped through.
+            print(f"   ⚠️  Retime dropped for {os.path.basename(video_file)}: window would need looping")
+            retime = None
+            exact_source_duration = exact_output_duration
+            loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
         filter_seek = bool(loop_args) and start_time > 0
 
         pre_filters = build_segment_pre_filters(
-            exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0)
+            exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0,
+            retime=retime, output_duration=exact_output_duration)
         post_filters = list(extra_filters or [])
+        if look_cube:
+            # Color grade last so the look sits on top of the effects; text
+            # overlays composite after this, so text stays ungraded (white
+            # text keeps reading white on a day-for-night grade).
+            post_filters.append(_lut3d_filter(look_cube))
 
         # Per-source fit decisions: SAR normalization for anamorphic inputs,
-        # and the limited-crop hybrid when plain Smart crop would discard more
-        # than MAX_CROP_PER_AXIS of the source.
-        sar_fix, hybrid_fg = plan_source_fit(video_file, target_size, fit_mode)
+        # the limited-crop hybrid when plain Smart crop would discard more
+        # than MAX_CROP_PER_AXIS of the source, and the scan-fit sweep beyond
+        # SCAN_CROP_LOSS (the segment duration drives the sweep and the echo
+        # background drift; an anchor offsets every crop window).
+        sar_fix, fit_plan = plan_source_fit(video_file, target_size, fit_mode,
+                                            anchor=anchor,
+                                            duration=exact_output_duration)
+        scan_plan = fit_plan if isinstance(fit_plan, dict) else None
+        hybrid_fg = fit_plan if fit_plan is not None and scan_plan is None else None
         pre_filters.extend(sar_fix)
 
         # text_overlay: (png_path, fade_in_start, fade_in_duration,
@@ -640,16 +1165,17 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         filter_complex = None
         base_label = 'basev' if text_overlay else 'outv'
         if use_blur_graph:
-            fg_filters = None
-            if hybrid_fg:
-                fg_w, fg_h, crop_w, crop_h = hybrid_fg
-                fg_filters = [f"scale={fg_w}:{fg_h}", f"crop={crop_w}:{crop_h}"]
+            fg_filters = _hybrid_fg_filters(hybrid_fg, anchor) if hybrid_fg else None
             filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters,
-                                                out_label=base_label, fg_filters=fg_filters)
+                                                out_label=base_label, fg_filters=fg_filters,
+                                                duration=exact_output_duration,
+                                                source_key=video_file)
         else:
             filters = list(pre_filters)
-            if target_size:
-                filters.extend(get_fit_filters(target_size, fit_mode))
+            if scan_plan:
+                filters.extend(scan_plan['filters'])
+            elif target_size:
+                filters.extend(get_fit_filters(target_size, fit_mode, anchor=anchor))
             filters.extend(post_filters)
             filter_complex = ",".join(filters)
             if use_graph:
@@ -667,7 +1193,14 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
 
         cmd.extend(loop_args)
 
-        if filter_seek:
+        if image_source:
+            cmd.extend([
+                '-loop', '1',
+                '-framerate', str(fps),
+                '-t', str(exact_source_duration),
+                '-i', video_file,
+            ])
+        elif filter_seek:
             # Looped seek: no input-side -ss/-t (see gotcha above); trim=start=
             # in the filter chain positions the window and -vframes caps output.
             # Looped sources are short by definition, so the extra decode from
@@ -720,9 +1253,15 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         # Verify output exists and has content
         if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
             return False
-        
+
+        # Frame-count guard on every segment: returncode 0 does not prove the
+        # window held enough source (-vframes truncates a short window without
+        # complaint), and one short segment drifts every later cut.
+        if not _verify_segment_frames(output_file, output_frame_count):
+            return False
+
         return True
-        
+
     except Exception as e:
         print(f"   ⚠️  Error extracting clip: {e}")
         return False
@@ -816,11 +1355,12 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
 
     raise Exception(f"ProRes segment extraction error: {last_error}")
 
-def concatenate_videos_ffmpeg(video_files: List[str], output_file: str, 
+def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                               audio_file: str = None, start_time: float = 0.0,
                               end_time: float = None, use_nvenc: bool = False,
                               gpu_encoder: str = 'h264_nvenc', fps: float = 30.0,
-                              temp_dir: str = None) -> str:
+                              temp_dir: str = None,
+                              total_frames: int = None) -> str:
     """
     Concatenate video files using FFmpeg concat demuxer.
     
@@ -851,6 +1391,21 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
             cmd.extend(['-ss', str(start_time), '-i', audio_file])
         else:
             cmd.extend(['-i', audio_file])
+
+    def add_audio_end_bound(cmd: List[str]) -> None:
+        """Trim the audio at the video's end WITHOUT -shortest.
+
+        The frame-locked timeline rounds round(audio_duration*fps), so the
+        video can legitimately run up to half a frame past the audio; with
+        -shortest the muxer then drops the final video packet (observed:
+        4561/4562 frames). Bounding the output half a frame past the video
+        end keeps every video packet and still cuts the audio at the video
+        boundary.
+        """
+        if total_frames and fps > 0:
+            cmd.extend(['-t', f'{(int(total_frames) + 0.5) / float(fps):.6f}'])
+        else:
+            cmd.extend(['-shortest'])
 
     try:
         if is_prores:
@@ -906,10 +1461,12 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     '-c:v', 'copy',
                     '-c:a', 'pcm_s24le',
                     '-ar', '48000',
-                    '-shortest',  # Use shortest stream (audio)
+                ]
+                add_audio_end_bound(cmd)
+                cmd.extend([
                     '-y',
                     output_file
-                ]
+                ])
                 
                 result = _run_media_command(cmd, timeout=300)
                 
@@ -946,7 +1503,8 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     cmd.extend(['-map', '0:v:0'])
                 cmd.extend(['-c:v', 'copy'])
                 if audio_file:
-                    cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000', '-shortest'])
+                    cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000'])
+                    add_audio_end_bound(cmd)
                 cmd.extend(['-fflags', '+genpts'])
                 if output_file.lower().endswith(('.mp4', '.mov', '.m4v')):
                     cmd.extend(['-movflags', '+faststart'])
@@ -986,8 +1544,8 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 cmd.extend([
                     '-c:a', 'pcm_s24le',
                     '-ar', '48000',
-                    '-shortest',
                 ])
+                add_audio_end_bound(cmd)
             
             cmd.extend([
                 '-fps_mode', 'cfr',

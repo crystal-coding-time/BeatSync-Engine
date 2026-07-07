@@ -3,3 +3,4 @@ bin/
 input/
 output/
 __pycache__/
+looks/*.cube

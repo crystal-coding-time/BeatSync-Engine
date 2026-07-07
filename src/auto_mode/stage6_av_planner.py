@@ -32,11 +32,20 @@ def build_planned_clip_sequence(
     segment_durations: Sequence[float],
     beat_info: Dict | None,
     video_files: Sequence[str],
+    variety: float = 0.0,
+    speed_ramps: bool = False,
+    lossless: bool = False,
+    fps: float = 30.0,
 ) -> List[Dict]:
     """Build exact source clip choices for every output segment.
 
     Returns an empty list when no visual library is present, which tells the
     renderer to keep its old fallback sampling.
+
+    variety=0 is the exact legacy quality auction (no coverage guarantee —
+    weak sources can lose every pick). Any variety>0 reserves one segment per
+    source so everything the user uploaded appears at least once, and scales
+    the per-source reuse penalty toward an even spread at 1.0.
     """
     beat_info = beat_info or {}
     video_analysis = beat_info.get("video_analysis") or {}
@@ -51,20 +60,41 @@ def build_planned_clip_sequence(
         return []
 
     profiles = _build_segment_profiles(cut_times_arr, durations_arr, beat_info)
+    variety = _clamp(variety)
+
+    # Legacy reuse penalty: 0.012/use capped at 0.18 — too weak for coverage
+    # (the cap means a source ~0.5 below the leaders can never win). With
+    # variety on, the rate scales so a leader at its fair share of segments
+    # yields to unused sources, and the cap goes away.
+    file_rate, file_cap = 0.012, 0.18
+    reservations: Dict[int, Dict] = {}
+    if variety > 0.0:
+        source_count = len({c.get("video_file") for c in candidates})
+        fair_share = len(profiles) / max(1, source_count)
+        file_rate = 0.012 + 1.3 * variety / max(1.0, fair_share)
+        file_cap = float("inf")
+        reservations = _plan_coverage_reservations(candidates, profiles)
+
     recent_ids = deque(maxlen=10)
     recent_videos = deque(maxlen=5)
     usage = Counter()
     planned: List[Dict] = []
 
     for i, profile in enumerate(profiles):
-        candidate = _choose_candidate(
-            candidates=candidates,
-            profile=profile,
-            recent_ids=recent_ids,
-            recent_videos=recent_videos,
-            usage=usage,
-            index=i,
-        )
+        # Reservations are consumed inside the sequential loop so adjacency
+        # deques and usage stay coherent for the auction picks around them.
+        candidate = reservations.get(i)
+        if candidate is None:
+            candidate = _choose_candidate(
+                candidates=candidates,
+                profile=profile,
+                recent_ids=recent_ids,
+                recent_videos=recent_videos,
+                usage=usage,
+                index=i,
+                file_rate=file_rate,
+                file_cap=file_cap,
+            )
         if not candidate:
             continue
         planned_clip = _materialize_clip(
@@ -80,25 +110,262 @@ def build_planned_clip_sequence(
 
     if len(planned) != len(durations_arr):
         return []
+    _assign_boundary_transitions(planned)
+    if speed_ramps and not lossless:
+        # Retime specs never reach precise mode: the ProRes branch extracts
+        # plain windows and must stay pristine for external editing.
+        _assign_retime_specs(planned, candidates, fps)
     return planned
 
 
-def summarize_clip_plan(plan: Sequence[Dict]) -> Dict:
+def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
+                         fps: float) -> None:
+    """Attach per-segment retime specs where the music and footage allow.
+
+    Every gate here is deterministic and conservative: a ramp multiplies how
+    much source a segment consumes, and a window that comes up short would
+    break the frame-locked timeline (extraction guards against it, but a
+    stripped ramp is a wasted plan — better to never attach one that can't
+    run). Renderer probes (not the analysis metadata) decide runway.
+    """
+    from ffmpeg_processing import (
+        get_cached_video_duration,
+        get_cached_video_fps,
+        is_image_source,
+        retime_source_window,
+        seconds_to_frame_count,
+    )
+
+    by_id = {c.get("id"): c for c in candidates}
+    for clip in planned:
+        video_file = clip.get("video_file")
+        final_duration = float(clip.get("final_duration", 0.0))
+        if not video_file or is_image_source(video_file):
+            continue
+        if final_duration < 0.6:
+            # Sub-0.6s cuts don't hold a readable speed change.
+            continue
+
+        source_fps = get_cached_video_fps(video_file)
+        if source_fps < 24.0:
+            # Low-fps sources (GIFs run 10-15fps) are already frame-duplicated
+            # by the fps= normalization; retiming them is pure judder.
+            continue
+
+        target = str(clip.get("target", "flow"))
+        impact = _clamp(clip.get("impact", 0.5), default=0.5)
+        rng = _stable_rng("retime", clip.get("index"), video_file, target)
+        roll = rng.random()
+
+        retime = None
+        if target == "soft" and roll < 0.45:
+            # Slow-mo drift. Depths below 0.6x are duplicated-frame judder on
+            # ordinary 24-30fps sources, so they need high-fps footage.
+            lo = 0.5 if source_fps >= 50.0 else 0.6
+            retime = {"kind": "constant", "speed": round(rng.uniform(lo, 0.7), 3)}
+        elif target == "build" and roll < 0.40:
+            retime = {"kind": "constant", "speed": round(rng.uniform(1.4, 2.0), 3)}
+        elif target == "drop":
+            if impact >= 0.75 and roll < 0.10 and final_duration >= 0.8:
+                out_frames = max(1, seconds_to_frame_count(final_duration, fps))
+                freeze = min(max(2, int(round(fps * 0.3))), out_frames // 2)
+                retime = {"kind": "freeze", "freeze_frames": freeze}
+            elif roll < 0.25:
+                retime = {
+                    "kind": "ramp",
+                    "speed_start": round(rng.uniform(1.5, 2.0), 3),
+                    "speed_end": round(rng.uniform(0.6, 0.8), 3),
+                }
+        if retime is None:
+            continue
+
+        window = retime_source_window(final_duration, retime, fps)
+
+        # Per-window runway: the retimed window must fit inside the scene
+        # window the candidate was chosen for (a ramp that spills across the
+        # scene cut hides a hard cut mid-slow-mo), and inside the real file.
+        candidate = by_id.get(clip.get("candidate_id")) or {}
+        cand_start = float(candidate.get("start", 0.0))
+        cand_end = float(candidate.get("end", cand_start))
+        video_duration = get_cached_video_duration(video_file)
+        scene_len = cand_end - cand_start
+        if scene_len > 0.0 and window > scene_len:
+            continue
+        if window > video_duration - 0.05:
+            continue
+
+        # Re-anchor the start for the bigger window, inside both the scene
+        # window and the file. (Mirrors _materialize_clip's anchor semantics.)
+        start = float(clip.get("start_time", 0.0))
+        hi = min(cand_end - window if scene_len > 0.0 else video_duration - window,
+                 video_duration - window)
+        lo = max(0.0, cand_start if scene_len > 0.0 else 0.0)
+        if hi < lo:
+            continue
+        clip["start_time"] = max(lo, min(start, hi))
+        clip["retime"] = retime
+
+
+def _plan_coverage_reservations(candidates: Sequence[Dict],
+                                profiles: Sequence[Dict]) -> Dict[int, Dict]:
+    """Reserve one segment per source: its best (candidate, segment) pairing.
+
+    Deterministic: sources are seated in descending best-seat-score order,
+    each taking its highest-scoring free segment. Drop segments are exempt
+    when the seated pick would fall clearly below what the auction would put
+    there — coverage should cost the flow/soft filler slots, not the money
+    shots. The short-candidate duration penalty stays in force, which
+    naturally steers short sources (GIFs, stills) onto short segments.
+    """
+    by_source: Dict[str, List[Dict]] = {}
+    for c in candidates:
+        by_source.setdefault(str(c.get("video_file")), []).append(c)
+
+    # Auction-best approximation per segment (raw scores, no deque state),
+    # used only for the drop exemption threshold.
+    best_raw = [max(_score_candidate(c, p) for c in candidates) for p in profiles]
+
+    options_by_source: Dict[str, List] = {}
+    fallback_by_source: Dict[str, List] = {}
+    for src in sorted(by_source):
+        opts = []
+        exempted = []
+        for c in by_source[src]:
+            for j, p in enumerate(profiles):
+                score = _score_candidate(c, p)
+                required = max(0.05, p["duration"])
+                cand_duration = max(0.05, float(c.get("duration", required)))
+                if cand_duration < required * 0.55:
+                    score -= 0.18
+                if p.get("target") == "drop" and score < best_raw[j] - 0.35:
+                    exempted.append((score, j, c))
+                    continue
+                opts.append((score, j, c))
+        key = lambda t: (-t[0], t[1], str(t[2].get("id")))
+        opts.sort(key=key)
+        exempted.sort(key=key)
+        if opts or exempted:
+            options_by_source[src] = opts
+            fallback_by_source[src] = exempted
+
+    order = sorted(options_by_source.items(),
+                   key=lambda kv: (-(kv[1][0][0] if kv[1]
+                                     else fallback_by_source[kv[0]][0][0]), kv[0]))
+    reserved: Dict[int, Dict] = {}
+    taken: set = set()
+    for src, opts in order:
+        seat = next(((j, c) for score, j, c in opts if j not in taken), None)
+        if seat is None:
+            # Every non-drop-worthy seat is taken (or this source only fits
+            # drops): coverage still wins — fall back onto an exempted drop
+            # segment rather than dropping the source from the video.
+            seat = next(((j, c) for score, j, c in fallback_by_source[src]
+                         if j not in taken), None)
+        if seat is not None:
+            j, cand = seat
+            reserved[j] = cand
+            taken.add(j)
+    return reserved
+
+
+# Segments shorter than this get no transition window on either side: the
+# out/in chains occupy ~0.2s and need normal footage around them to read.
+_TRANSITION_MIN_SEG = 0.3
+
+
+def _assign_boundary_transitions(planned: List[Dict]) -> None:
+    """Label consecutive clip pairs with split-transition specs.
+
+    Each transition is rendered as two per-segment effect chains (an out-chain
+    on clip i's tail and an in-chain on clip i+1's head), so assembly stays
+    concat stream-copy. Kept occasional on purpose; deterministic per boundary.
+    """
+    for i in range(len(planned) - 1):
+        a, b = planned[i], planned[i + 1]
+        if (float(a.get("final_duration", 0.0)) < _TRANSITION_MIN_SEG
+                or float(b.get("final_duration", 0.0)) < _TRANSITION_MIN_SEG):
+            continue
+        t_out = str(a.get("target", "flow"))
+        t_in = str(b.get("target", "flow"))
+        impact_in = _clamp(b.get("impact", 0.5), default=0.5)
+        rng = _stable_rng("transition", i, t_out, t_in)
+        roll = rng.random()
+
+        kind = None
+        if t_in == "drop":
+            if t_out == "drop":
+                if roll < 0.40:
+                    kind = "whip_pan"
+                elif roll < 0.55:
+                    kind = "glitch_cut"
+            else:
+                if roll < 0.30:
+                    kind = "whip_pan"
+                elif roll < 0.40:
+                    kind = "dip_flash"
+                elif impact_in >= 0.6 and roll < 0.55:
+                    kind = "glitch_cut"
+        elif t_out == "soft" and t_in == "soft":
+            if roll < 0.30:
+                kind = "dip_black"
+        elif impact_in >= 0.65:
+            if roll < 0.25:
+                kind = "glitch_cut"
+        if kind is None:
+            continue
+
+        spec: Dict = {"type": kind}
+        if kind == "whip_pan":
+            # Same direction on both sides = continuous camera motion across
+            # the cut.
+            spec["direction"] = "right" if rng.random() < 0.5 else "left"
+        a["transition_out"] = dict(spec)
+        b["transition_in"] = dict(spec)
+
+
+def summarize_clip_plan(plan: Sequence[Dict],
+                        video_files: Sequence[str] | None = None,
+                        candidates: Sequence[Dict] | None = None) -> Dict:
     if not plan:
         return {"clip_count": 0, "targets": {}, "ai_tagged": 0}
     targets = Counter(str(item.get("target", "flow")) for item in plan)
     ai_tagged = sum(1 for item in plan if item.get("ai_analyzed"))
     source_count = len(set(item.get("video_file") for item in plan))
-    return {
+    transitions = Counter(
+        str((item.get("transition_out") or {}).get("type"))
+        for item in plan if item.get("transition_out")
+    )
+    retimes = Counter(
+        str((item.get("retime") or {}).get("kind"))
+        for item in plan if item.get("retime")
+    )
+    summary = {
         "clip_count": len(plan),
         "targets": dict(targets),
         "ai_tagged": ai_tagged,
         "source_count": source_count,
+        "transitions": dict(transitions),
+        "retimes": dict(retimes),
     }
+    if video_files is not None:
+        import os
+        usage = Counter(os.path.basename(str(item.get("video_file")))
+                        for item in plan)
+        candidate_files = {os.path.basename(str(c.get("video_file")))
+                           for c in (candidates or [])}
+        all_files = [os.path.basename(str(p)) for p in video_files]
+        summary["source_usage"] = dict(sorted(usage.items(),
+                                              key=lambda kv: (-kv[1], kv[0])))
+        summary["sources_never_selected"] = sorted(
+            f for f in all_files if f not in usage and f in candidate_files)
+        summary["sources_without_candidates"] = sorted(
+            f for f in all_files if f not in candidate_files)
+    return summary
 
 
 def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray, beat_info: Dict) -> List[Dict]:
     beat_times = np.asarray(beat_info.get("times", []), dtype=float)
+    downbeat_times = np.asarray(beat_info.get("downbeat_times", []), dtype=float)
     energy_profile = beat_info.get("energy_profile") or {}
     rhythm_data = beat_info.get("rhythm_data") or {}
     sections = beat_info.get("sections") or []
@@ -135,6 +402,9 @@ def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray
             "section": section,
             "section_type": section.get("type", "body") if section else "body",
             "target": target,
+            "is_downbeat": bool(
+                downbeat_times.size and float(np.min(np.abs(downbeat_times - start))) <= 0.05
+            ),
         })
     return profiles
 
@@ -176,6 +446,8 @@ def _choose_candidate(
     recent_videos: deque,
     usage: Counter,
     index: int,
+    file_rate: float = 0.012,
+    file_cap: float = 0.18,
 ) -> Dict | None:
     best_candidate = None
     best_score = -999.0
@@ -191,7 +463,7 @@ def _choose_candidate(
         if video_file in recent_videos:
             score -= 0.10
         score -= min(0.28, usage[cid] * 0.10)
-        score -= min(0.18, usage[video_file] * 0.012)
+        score -= min(file_cap, usage[video_file] * file_rate)
 
         required_source = max(0.05, profile["duration"])
         candidate_duration = max(0.05, float(candidate.get("duration", required_source)))
@@ -285,6 +557,7 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
         "score": _score_candidate(candidate, profile),
         "candidate_id": candidate.get("id"),
         "tags": list(candidate.get("tags", [])),
+        "subject_anchor": candidate.get("subject_anchor"),
         "ai_analyzed": bool(candidate.get("ai_analyzed")),
         "audio_start": profile.get("start"),
         "audio_end": profile.get("end"),

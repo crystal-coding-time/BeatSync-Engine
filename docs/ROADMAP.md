@@ -14,14 +14,19 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
 - ✅ Source formats: `.mov`, `.webm`, `.m4v`, `.avi`, `.gif` (was mp4/mkv only)
 - ✅ Short sources (GIFs) loop via `-stream_loop` instead of drifting the timeline
 - ✅ Apple VideoToolbox H.264/HEVC encoding (`get_gpu_quality_args` dispatch in `ffmpeg_processing.py`; GUI auto-offers it when NVENC is absent)
-- ⬜ Still images (JPG/PNG) as sources via `zoompan` (Ken Burns) — deferred, needs duration synthesis in the analysis stages
+- ✅ Still images (2026-07-07): `.jpg/.jpeg/.png/.webp/.bmp` as sources. Images get a
+  synthetic duration in the probe layer, one analysis candidate from the single frame, and
+  deterministic Ken Burns motion (seeded `zoompan` pan+zoom) per segment at render time
+  (`is_image_source`/`build_ken_burns_filter` in `ffmpeg_processing.py`). In ProRes precise
+  mode stills become fixed-length static proxies (no Ken Burns — proxies stay pristine).
+  HEIC is **not** supported: Homebrew ffmpeg ships without a HEIF demuxer/decoder
 
 ## Phase 1.5 — aspect-ratio frame fit ✅ (2026-07-06)
 - Mixed resolutions/aspect ratios no longer stretch-distort. GUI "Frame fit" option:
   smart crop-to-fill (default) · blurred-background fill · letterbox · stretch (legacy)
 - `get_fit_filters` / `build_blur_fit_graph` in `ffmpeg_processing.py`; `setsar=1` normalizes
   sample aspect across heterogeneous sources
-- Target resolution/aspect = highest-resolution source by pixel area (`get_max_resolution`); a dominant vertical source makes a vertical video
+- ~~Target resolution/aspect = highest-resolution source by pixel area (`get_max_resolution`); a dominant vertical source makes a vertical video~~ superseded 2026-07-07 — fixed 16:9 canvas by default, see Phase 4.5 (legacy behavior lives on as the "Match best source" canvas option)
 - Smart crop is a **limited-crop hybrid** (2026-07-06, owner feedback: pure fill-crop
   over-cropped): mild mismatches keep the classic fill-and-center-crop, but at most
   `MAX_CROP_PER_AXIS` (15%) of the source may be cropped away — beyond that the source is
@@ -44,7 +49,18 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
   trails on calm segments; hue sweeps through build-ups; rare subtle fisheye (Hype).
   Core filters only, every recipe verified frame-count-safe, capped at 2 (AMV) / 3 (Hype)
   pack effects per segment (`shuffleframes`/`elbg` deliberately excluded — see effects.py)
-- Not included by design: speed ramps (`setpts` would break the zero-drift frame-locked timeline); effects don't apply in ProRes precise mode (kept pristine for external editing)
+- Effects registry + picker (2026-07-07): `effects.py` is now a registry of named primitives
+  (`EFFECT_REGISTRY`). GUI "Effect mode": **Curated** (the classic Clean/AMV/Hype presets,
+  chains proven character-identical to the pre-registry code) · **Custom** (checkbox palette —
+  pick any primitive subset; empty palette means *no* effects) · **Shuffle** (seeded random
+  palette; seed 0 derives from the song filename, same seed → identical video). The applied
+  recipe is printed into the render log. New primitives: half/quad mirrors, beat-flip,
+  sustained push-in/pull-out zooms
+- Effects don't apply in ProRes precise mode (kept pristine for external editing); the GUI
+  now says so next to the mode picker
+- ~~Not included by design: speed ramps~~ superseded — see Phase 4 speed ramps below: the
+  original exclusion assumed whole-timeline `setpts`; per-segment retiming inside the
+  `-vframes` anchor is safe
 
 ## Phase 3 — text overlay system ✅ (2026-07-06)
 - General-purpose text over the video at planned moments (quotes, captions, titles — any text), entered one-per-line in the GUI
@@ -66,9 +82,83 @@ Code-review fixes across the render pipeline; verified with repeat-run `framemd5
 - Output FPS follows the highest-resolution source (matching how target resolution is picked) instead of the arbitrary first upload; ffprobe failures are no longer cached for the whole run
 - Simplification: `ClipJob` dataclass replaces the 10-element args tuple; shared pre-filter/audio-mux helpers in `ffmpeg_processing.py`
 
-## Phase 4 — transitions & polish ⬜
-- Opt-in `xfade` crossfades/wipes on low-energy boundaries (requires re-encode assembly path; hard cuts stay the fast default)
-- LUT-based color grading for a consistent look across mismatched sources
+## Phase 3.5 — beat-sync tightening + audio backends ✅ (2026-07-07)
+- Interior-beat effect gating: each segment's real beat offsets (from the stage-1 grid) are
+  threaded into `build_effect_filters` (`segment_beats` in `video_processor.py`), so pulses,
+  strobes and beat-flips fire on actual beats via `enable=` windows instead of a
+  sine-at-tempo approximation
+- Cut-lead bias: interior cut boundaries land `BEATSYNC_CUT_LEAD_FRAMES` (default **1**)
+  frames *before* the beat — the editor's trick of having the new shot onscreen when the
+  transient hits. First/last boundaries stay locked; total frame count unchanged
+- Optional `beat-this` backend (MIT, CPJKU): `BEATSYNC_BEAT_BACKEND=beat_this` swaps the
+  librosa tracker for the SOTA transformer (beats **and downbeats**; downbeats drive the
+  bar/phrase anchor bonuses in stage 4). CPU by default (faster than MPS for short tracks;
+  `BEATSYNC_BEAT_THIS_DEVICE=mps` overrides), librosa fallback on any failure, off by
+  default — install with `.venv/bin/pip install beat-this torch torchaudio`
+- Frame guards (from the speed-ramps audit): every extracted segment is verified against its
+  planned frame count (demux-only ffprobe), and final assembly is asserted equal to
+  `render_info['timeline_frames']` — the zero-drift constraint is now machine-checked on
+  every render, both standard and ProRes paths
+
+## Phase 4 — transitions & polish 🚧
+- ✅ Split transitions (2026-07-07): whip pans, glitch cuts and dip-to-black/white on
+  planner-labeled boundaries (drop boundaries → whip/glitch, soft → dips; occasional and
+  seeded). Implemented as *per-segment* out/in effect chains — the tail of segment A and the
+  head of segment B each carry half the transition — so concat stream-copy assembly is
+  untouched. Active for AMV/Hype styles
+- ✅ LUT color looks (2026-07-07): six self-baked looks (Vintage, Cross Process, Cool, Warm,
+  High Contrast, Day For Night) generated by `scripts/bake_looks.py` (`haldclutsrc` +
+  curves/colorbalance chains → HaldCLUT PNG → `.cube`), applied per segment via the core
+  `lut3d` filter (~4 ms/frame). GUI "Look" dropdown; AGPL-clean since the LUTs are baked
+  from ffmpeg expressions, not third-party packs. PNGs are committed; `.cube` files are
+  regenerated locally (`looks/*.cube` gitignored, rebuilt on demand by `src/looks.py`)
+- ✅ Source coverage + variety (2026-07-07, owner-reported: many uploads never appeared —
+  23/29 sources in one render): stage-6 planning now seats every source with ≥1 usable
+  candidate into its best-matching segment (reservations consumed inside the sequential
+  auction; weak sources kept off drop segments when possible) and scales the reuse penalty.
+  GUI "Source variety" slider: 0 = pure quality auction (**exact legacy behavior**),
+  1 = even spread; **default 0.4** — note this changes default plans vs. renders made
+  before 2026-07-07. The render log prints a per-source usage histogram plus unused /
+  zero-candidate sources
+- ✅ Speed ramps (2026-07-07, **experimental, opt-in GUI checkbox**): per-segment retiming —
+  slow-mo drift on soft segments, rushes through builds, decelerate-into-the-cut on drops,
+  rare freeze-hits. Safe within the frame-locked timeline because the retime `setpts` sits
+  between `setpts=PTS-STARTPTS` and the `fps` filter with `-vframes` still the frame-count
+  authority; source windows are over-provisioned by 2 frames and every retimed segment is
+  frame-count-verified after extraction (an independent audit showed naive retiming silently
+  produced 59/60- and 23/60-frame segments). Ramps skip images, sub-24fps sources
+  (0.5x floor needs ≥50fps), segments that would loop or spill their scene window, and
+  ProRes precise mode
+- ⬜ Opt-in `xfade` crossfades/wipes on low-energy boundaries (requires boundary-chunk
+  re-encode assembly; hard cuts stay the fast default)
+
+## Phase 4.5 — 16:9 canvas + subject-aware reframe ✅ (2026-07-07)
+Redesign of aspect-ratio handling (owner feedback: one high-res portrait upload flipped the
+whole video to portrait). The output canvas is now fixed and the fit engine follows the subject:
+- **Fixed output canvas, default 16:9 1080p**: GUI "Output canvas" dropdown — 16:9 1080p
+  (default) · 16:9 4K · 9:16 portrait · Match best source (exact legacy `get_max_resolution`
+  behavior). `resolve_target_resolution(output_format, ...)` in `video_processor.py`; unknown
+  keys warn and fall back to the default. Output FPS still follows the highest-resolution source
+- **Subject anchor** (`video_analysis.py`): every analysis candidate carries
+  `subject_anchor {cx, cy, confidence, source, path}` — YuNet face detection when available
+  (model at `models/face_detection_yunet_2023mar.onnx`, re-fetch with `scripts/fetch_yunet.py`,
+  `BEATSYNC_YUNET_MODEL` env overrides/kill-switches), else motion-diff centroid, else
+  Laplacian-detail centroid; deterministic, no extra frame decodes, CPU-only (schema identical
+  on Windows/GPU). `ANALYSIS_VERSION` bump invalidates stale caches
+- **Anchor-aware smart crop** (`ffmpeg_processing.py`): the crop window centers on the subject
+  (clamped) instead of the frame center — anchors change *where* we crop, never *how much*;
+  `MAX_CROP_PER_AXIS` (15%) still governs. Anchors below `ANCHOR_MIN_CONFIDENCE` (0.2) are
+  ignored (centered, byte-identical to legacy). Threaded stage6 → `ClipJob.planned_clip`
+  → `extract_clip_segment_ffmpeg(anchor=...)`
+- **"Echo" blur fill**: the blurred background behind hybrid/blur fits is now graded
+  (110% overscan, darker, desaturated, vignette) with a slow ~3% drift over the segment
+  (direction seeded from the source path — deterministic)
+- **Scan-fit for extreme mismatches** (`SCAN_CROP_LOSS = 0.40`): instead of a blur-fit
+  postage stamp, the frame fills the short axis and the crop window sweeps the long axis with
+  smoothstep easing, ending on the subject anchor; sweep speed is capped
+  (`SCAN_MAX_SPEED_FRAC`) so short segments shrink the travel rather than whip. Requires a
+  known segment duration — ProRes proxies (whole-file, duration-less) keep static centered
+  framing per the precise-mode-stays-pristine rule
 
 ## Phase 5 — full automation ⬜
 - Watch-folder mode built on the existing `video_processor.py` CLI: drop audio + clips, video appears in `output/`
