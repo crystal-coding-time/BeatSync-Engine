@@ -3,13 +3,22 @@
 macOS port of a Windows-only beat-synced music video generator. Owner is learning self-hosting; explain non-obvious decisions briefly.
 
 ## Ground rules
-- **Keep docs in sync with code — every feature change updates `docs/ROADMAP.md` (status) and `README.mac.md` (usage) in the same commit.**
-- Work on the `mac-port` branch; upstream is `main` (`Merserk/BeatSync-Engine`). Keep Windows behavior intact: platform-specific code branches on `os.name == 'nt'` or falls back from bundled `bin/` paths to `PATH` lookups.
+- **The only docs are this file and `README.mac.md` (user-facing usage). Every feature change keeps both accurate in the same commit — need-to-know only, no roadmaps or TODO files.**
+- Work on the `mac-port` branch. `origin` is upstream (`Merserk/BeatSync-Engine`, read-only); push to the `fork` remote (`crystal-coding-time/BeatSync-Engine`). Keep Windows behavior intact: platform-specific code branches on `os.name == 'nt'` or falls back from bundled `bin/` paths to `PATH` lookups.
 - Python env: `.venv` (Homebrew python@3.13), no CuPy on Mac. Launch with `./run.sh` (Gradio UI on 7860).
+- Working rhythm: land a change uncommitted → restart the service → owner tests → commit only on his OK.
 
 ## Architecture in one paragraph
-`src/gui.py` (Gradio) → 6-stage auto pipeline in `src/auto_mode/` (stage1 librosa beats → stage2 features → stage3 sections → stage4 cut selection → stage5 optional Qwen3-VL tagging via llama.cpp → stage6 planner assigns each segment a source clip + profile) → `src/video_processor.py` extracts segments in parallel → `src/ffmpeg_processing.py` builds per-segment ffmpeg commands (per-segment `-vf` chain = the hook point for effects/text) → concat stream-copy assembly.
+`src/gui.py` (Gradio) → for multiple songs `src/multisong.py` (per-song analysis, sample-exact 44.1kHz concat = the timing authority, offset-merged beat_info) → 6-stage auto pipeline in `src/auto_mode/` (stage1 librosa beats [optional beat-this backend] → stage2 per-beat features incl. SuperFlux onsets/harmonic-change/EBU loudness → stage3 sections [optional all-in-one-mlx structure labels via `src/structure_stems.py`, which also supplies demucs-mlx stem signals] → stage4 cut selection on the beat grid → stage5 optional Qwen3-VL tagging via llama.cpp → stage6 planner: one global auction per segment with coverage reservations (LAP-seated), proportional-fair source variety, and DINOv2 semantic diversity via `src/visual_embeddings.py`) → `src/video_processor.py` extracts segments in parallel → `src/ffmpeg_processing.py` builds per-segment ffmpeg commands (per-segment `-vf` chain = the hook point for effects/retimes/text; `src/effects.py` is the effect-primitive registry) → concat stream-copy assembly, with opt-in xfade boundary chunks re-encoded in place.
+
+## Hard invariants (never break these)
+- **Determinism**: all randomness through seeded `_stable_rng` streams; two identical runs must produce byte-identical video (test = double-run framemd5 equality). New effects/features get dedicated rng streams so existing plans stay byte-identical; MLX/ONNX backends achieve determinism by memoization (4dp-rounded sidecar caches).
+- **Frame-exactness**: `-vframes` is the frame-count authority; per-segment and assembly frame guards must pass; the frame-locked timeline (`segment_frames`) is the duration authority. `tpad=stop_mode=clone` before `fps=` guards demuxer underrun (GIF trailing display durations). Gotcha: `tmix` toggled with `enable=` silently drops frames — use split/trim/concat instead.
+- **Byte-identical off-paths**: every optional feature's disabled state (checkbox off, slider 0, model absent) must reproduce the previous behavior exactly.
+- **ProRes precise mode stays pristine**: no effects, retimes, duos, crossfades, or text; static centered framing on proxies.
+- **Graceful degradation**: optional backends (YuNet faces, beat-this, Qwen, DINOv2 embeddings, all-in-one-mlx/demucs-mlx) fall back with one log line when missing; kill switches: `BEATSYNC_DISABLE_QWEN/EMBED/STRUCTURE/STEMS`, `BEATSYNC_YUNET_MODEL`, `BEATSYNC_BEAT_BACKEND`.
+- **15%-crop rule**: `MAX_CROP_PER_AXIS` caps content loss; subject anchors change WHERE we crop, never HOW MUCH.
 
 ## Testing
 No test suite. Smoke test = run the pipeline headless on synthetic media:
-`ffmpeg -f lavfi -i "sine=frequency=440:beep_factor=8:duration=20" beat.wav`, testsrc clips, then call `gui._process_video_impl(...)` with `PYTHONPATH=src`. `BEATSYNC_DISABLE_QWEN=1` skips the slow vision stage.
+`ffmpeg -f lavfi -i "sine=frequency=440:beep_factor=8:duration=20" beat.wav`, testsrc clips, then call `gui._process_video_impl(audio_files=..., video_files=..., ...)` with `PYTHONPATH=src` (`audio_files` accepts one path or a list). `BEATSYNC_DISABLE_QWEN=1` skips the slow vision stage. Isolate runs by monkeypatching `paths.get_processing_dir` to a scratch dir. Verify: double-run framemd5 identical + "✓ Frame guard" lines. Renders log to `output/render_<timestamp>.log`.
