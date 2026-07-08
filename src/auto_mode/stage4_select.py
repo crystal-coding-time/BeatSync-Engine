@@ -182,9 +182,25 @@ def compute_cut_scores(beat_indices: np.ndarray, features: Dict, section: Dict,
 
     # Wave-13: SuperFlux onset strength joins the base score (novelty 0.10->0.06,
     # arc 0.07->0.06 rebalanced down to make room; superflux weighted 0.10).
+    # Wave-14: when the demucs drum stem is available, its per-beat drum onset is
+    # the same transient signal uncontaminated by melody/vocals, so it takes over
+    # the 0.10 onset weight IN PLACE of SuperFlux. Absent (Windows/no-stem) =>
+    # SuperFlux stays, byte-identical to wave 13.
+    if "drum_onset" in features:
+        onset_term = 0.10 * np.asarray(features["drum_onset"][idx], dtype=float)
+    else:
+        onset_term = 0.10 * features["onset_superflux"][idx]
     score = (0.36 * impact + 0.27 * rhythm + 0.20 * wave
              + 0.06 * novelty + 0.06 * features["arc"][idx]
-             + 0.10 * features["onset_superflux"][idx])
+             + onset_term)
+
+    # Wave-14: when the vocal stem is available, discourage cutting mid-vocal-
+    # phrase unless the bar structure justifies it. Deliberately conservative
+    # (-0.06) and applied only to beats that are NEITHER phrase nor bar anchors.
+    # Absent => no penalty, byte-identical to wave 13.
+    if "vocal_presence" in features:
+        off_anchor = ~(features["is_bar_anchor"][idx] | features["is_phrase_anchor"][idx])
+        score = score - 0.06 * np.asarray(features["vocal_presence"][idx], dtype=float) * off_anchor
 
     score = score.copy()
     score[features["is_bar_anchor"][idx]] += cfg.anchor_bonus

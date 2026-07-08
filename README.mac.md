@@ -65,6 +65,15 @@ Cut placement listens to more than the beat grid: sharp transients (SuperFlux on
 cuts toward real percussive hits, and in quiet low-percussion passages the engine cuts on
 chord changes instead of an empty grid. Same inputs still always render the same video.
 
+With the optional structure backend installed (`.venv/bin/pip install "all-in-one-mlx"
+"demucs-mlx[convert]"`, Apple Silicon only), the engine goes further: a local model labels
+the song's real sections (verse/chorus/bridge/intro/outro, with choruses upgraded to drops
+when the energy or the bass stem confirms it), drum-stem onsets drive cut snapping without
+vocal/pad contamination, and cuts avoid landing mid-vocal-phrase off the bar grid. The first
+analysis of a new track takes ~2 minutes (stem separation); after that it's cached and free.
+Without the packages everything falls back to the built-in heuristics.
+`BEATSYNC_DISABLE_STRUCTURE=1` / `BEATSYNC_DISABLE_STEMS=1` switch it off.
+
 - **Style** — Minimal (clean cuts, no effects), Music video (AMV), or Hype. See "Effect
   style" details below.
 - **Output canvas** — the frame every render targets: 16:9 1080p (default), 16:9 4K, 9:16 Portrait, or Match best source (the old behavior, where the highest-resolution upload decides the resolution *and* aspect — one portrait phone clip could flip the whole video vertical). A fixed canvas makes the output predictable for YouTube/TV; pick Portrait deliberately for Shorts/Reels. Output FPS still follows the highest-resolution source — set Custom FPS (Advanced) to override (so a low-fps GIF in the list can't drag the whole render down).

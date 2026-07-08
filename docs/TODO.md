@@ -56,9 +56,20 @@ retime specs gain optional `interp` factor (deep slow-mo on 24–50fps sources o
 | 13.3 | Loudness-scaled punch/flash amplitudes (byte-identical when key absent) | `src/effects.py` | 💾 |
 | 13.4 | Integration: cross-check (runway-window symmetry fix in create_clip_parallel), docs sync, smoke, restart | (lead) | 💾 |
 
+## Wave 14 — music-structure understanding 💾 (committed 2026-07-08)
+
+`all-in-one-mlx` functional section labels (chorus/verse/drop) + `demucs-mlx` stem signals,
+auto-enabled when installed, sidecar-cached (determinism by memoization), full heuristic
+fallback when unavailable (Windows/Intel/missing package → byte-identical to wave 13).
+
+| # | Task | File(s) | Status |
+|---|------|---------|--------|
+| 14.1 | Backend module: analyze_structure() + get_stem_signals() wrappers over all-in-one-mlx / demucs-mlx, sidecar caches, kill switch, dep install | `src/structure_stems.py` (new) | 💾 |
+| 14.2 | Pipeline integration: structure labels refine stage-3 sections; drum-stem onsets replace SuperFlux weight when available; vocal-presence cut penalty; bass-step drop confirmation; all gated on availability | `src/auto_mode/*` | 💾 |
+| 14.3 | Integration: cross-check, docs sync, smoke (with + without backend), restart | (lead) | 💾 |
+
 ## Backlog / opt-in follow-ups
 
-- `all-in-one-mlx` structure labels + `demucs-mlx` stems behind env flag (verified installable on py3.13)
 - RIFE 4.6 via rife-ncnn-vulkan pre-pass (cached, framemd5-verified intermediates; models >4.6 broken on Apple Silicon)
 - Flow motion-blur effect primitive (minterpolate/tmix); FFglitch datamosh profile (later)
 - xfade crossfades on low-energy boundaries (pre-existing roadmap item)

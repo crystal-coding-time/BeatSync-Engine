@@ -215,6 +215,29 @@ the process inputs list order untouched by construction:
 - Frame fit is now Auto (the smart ladder) / Blurred background / Letterbox; `'stretch'`
   survives for headless/settings callers only
 
+## Wave 14 — music-structure understanding ✅ (2026-07-08)
+Real section labels + stem-derived signals via the MLX ports of All-In-One and Demucs
+(`src/structure_stems.py`; auto-enabled when installed, Apple Silicon only — everywhere else
+the import fails cleanly and the pipeline is byte-identical to wave 13):
+- **Structure labels** (`all-in-one-mlx` 1.0.5, Harmonix 8-fold ensemble — weights ~10 MB
+  fetched once to `~/.cache/beatsync/allin1-mlx-weights/`): stage 3 adopts the backend's
+  section boundaries and functional labels (intro/verse/chorus/bridge/break/outro…) instead of
+  heuristic clustering; a labeled chorus upgrades to **drop** when energy supports it (existing
+  thresholds) or the bass-stem energy steps ≥0.25 over the previous section, and to **finale**
+  near the end. Verified on a real track: 19 sections reading as genuine song structure
+- **Stem signals** (`demucs-mlx` 1.4.4 htdemucs, ~160 MB auto-converted to
+  `~/.cache/demucs-mlx/`): per-beat `drum_onset` (replaces the SuperFlux weight in cut scoring
+  when present — same signal, uncontaminated by vocals/pads), `vocal_presence` (−0.06 cut
+  penalty on non-anchor beats: don't cut mid-phrase unless the bar justifies it),
+  `bass_energy` (drop confirmation, above)
+- **Determinism by memoization**: both backends are sidecar-cached (4dp-rounded values stored
+  AND returned identically on cold/warm paths) keyed by audio signature + backend versions
+  (+ beat-grid hash for stems); MLX has no bit-exactness contract, the cache is the firewall.
+  First analysis of a track costs ~1.5–2.5 min (demix-dominated); cached ≈ 0.1 s
+- Kill switches: `BEATSYNC_DISABLE_STRUCTURE=1`, `BEATSYNC_DISABLE_STEMS=1`. Fallback path
+  (missing package / Intel / Windows / failure) verified byte-identical to HEAD.
+  Cut plans change when the backend is active (deliberate — that's the feature)
+
 ## Wave 13 — musical pacing + interpolated slow-mo ✅ (2026-07-08)
 Tier-0 audio intelligence (zero new dependencies) + minterpolate deep slow-mo (tracker `docs/TODO.md`):
 - **Three new per-beat features** (stage 2; always present, zero-filled with a ⚠️ on failure;

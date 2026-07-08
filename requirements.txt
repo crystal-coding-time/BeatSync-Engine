@@ -12,3 +12,6 @@ cupy-cuda13x[ctk]==14.1.1
 # Optional macOS downbeat backend (BEATSYNC_BEAT_BACKEND=beat_this) — not
 # installed by the Windows flow; install manually:
 #   .venv/bin/pip install beat-this torch torchaudio
+# Optional macOS music-structure backend (section labels + stems; Apple Silicon
+# only, auto-enabled when installed) — not part of the Windows flow:
+#   .venv/bin/pip install all-in-one-mlx "demucs-mlx[convert]"

@@ -328,9 +328,64 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     if rhythm.size:
         _notify_console(console_callback, 2, f"Rhythm strength: avg {float(np.mean(rhythm)):.2f}, peak {float(np.max(rhythm)):.2f}")
 
+    # Wave-14: optional music-structure + stem-signal backend (all-in-one-mlx /
+    # demucs-mlx via src/structure_stems.py). Lazily imported and fully
+    # self-guarded: a missing module (Windows/Intel/uninstalled), kill switch, or
+    # backend failure leaves every downstream stage BYTE-IDENTICAL to the wave-13
+    # heuristic path. The contract functions never raise and log their own
+    # fallback lines; the try/except around the import (and a belt-and-suspenders
+    # guard around the calls) protect the hard fallback invariant regardless.
+    structure = None
+    try:
+        from structure_stems import analyze_structure, get_stem_signals
+    except ImportError:
+        analyze_structure = None
+        get_stem_signals = None
+
+    if analyze_structure is not None:
+        try:
+            _structure = analyze_structure(audio_file)
+        except Exception as e:
+            print(f"   ⚠️  Structure backend failed; heuristic sections used: {e}")
+            _structure = None
+        if isinstance(_structure, dict) and _structure.get("available"):
+            structure = _structure
+
+    if get_stem_signals is not None:
+        try:
+            _stems = get_stem_signals(audio_file, beat_times)
+        except Exception as e:
+            print(f"   ⚠️  Stem backend failed; heuristic signals used: {e}")
+            _stems = None
+        if isinstance(_stems, dict) and _stems.get("available"):
+            # Stem signals ride ON the features dict exactly like wave-13's
+            # per-beat features, so stages 3/4 read them uniformly. Each is set
+            # only when present and length-matched to the beat grid; otherwise the
+            # key is simply absent and the fallback weighting takes over.
+            for _feat_key, _stem_key in (
+                ("drum_onset", "drum_onset"),
+                ("vocal_presence", "vocal_presence"),
+                ("bass_energy", "bass_energy"),
+            ):
+                _sig = _stems.get(_stem_key)
+                if _sig is not None and len(_sig) == len(beat_times):
+                    features[_feat_key] = np.asarray(_sig, dtype=float)
+
+    if structure is not None:
+        _labels = [str(s.get("label", "")) for s in structure.get("sections", [])]
+        print(
+            f"      ℹ️ 🎼 Structure backend: {len(_labels)} sections, "
+            f"labels: {', '.join(_labels[:8])}"
+        )
+        _notify_console(
+            console_callback, 3,
+            f"Structure backend: {len(_labels)} sections ({', '.join(_labels[:6])})",
+        )
+
     _notify_progress(progress_callback, 3)
     print("   🎼 Step 3: Detecting broad musical sections...")
-    sections = analyze_sections(y, y_harmonic, y_percussive, sr, beat_times, features, cfg)
+    sections = analyze_sections(y, y_harmonic, y_percussive, sr, beat_times, features, cfg,
+                                structure=structure)
     print(f"      ✓ {len(sections)} sections")
     section_types = [str(s.get("type", "section")) for s in sections[:5]]
     _notify_console(console_callback, 3, f"Sections: {len(sections)}")
@@ -442,6 +497,17 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         "harmonic_change": features["harmonic_change"],
     }
 
+    # Wave-14: stem signals ride the carrying dicts alongside wave-13 features
+    # (drum_onset/vocal_presence with rhythm data; bass_energy with energy).
+    # Present only when the backend delivered them; old cached beat_info that
+    # never had these keys flows through downstream unchanged.
+    if "drum_onset" in features:
+        rhythm_data["drum_onset"] = features["drum_onset"]
+    if "vocal_presence" in features:
+        rhythm_data["vocal_presence"] = features["vocal_presence"]
+    if "bass_energy" in features:
+        energy_profile["bass_energy"] = features["bass_energy"]
+
     beat_info = {
         "times": beat_times,
         "downbeat_times": downbeat_times,
@@ -458,6 +524,9 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         "mode": "auto_v4_audio_visual_rhythmic_planner",
         "auto_style": "audio_visual_rhythmic_gmv_amv",
     }
+
+    if structure is not None:
+        beat_info["structure"] = structure
 
     try:
         if use_gpu and GPU_AVAILABLE:
