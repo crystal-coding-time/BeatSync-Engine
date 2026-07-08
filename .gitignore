@@ -4,3 +4,4 @@ input/
 output/
 __pycache__/
 looks/*.cube
+.DS_Store
