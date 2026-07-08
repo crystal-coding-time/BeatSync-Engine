@@ -289,6 +289,24 @@ PAN_MIN_KNOT_DT = 0.05
 ECHO_BG_OVERSCAN = 1.10
 ECHO_DRIFT_TRAVEL = 0.03
 
+# Slow foreground push-in for echo-fill composites (limited-crop hybrid and
+# pure blur-mode foregrounds): total zoom travel over the segment as a
+# fraction of 1.0 (0.035 = 3.5%). Uses zoompan (crop/scale can't animate
+# w/h), d=1 so the frame count is untouched. 0 disables and reproduces the
+# pre-zoom chains byte-for-byte.
+HYBRID_FG_ZOOM = 0.035
+
+# Beat-reactive echo margins: on each beat the background grade briefly
+# lifts saturation/brightness (the _fx_sat_pulse idiom — windowed
+# between(t,b,b+WINDOW) terms inside the eq expressions, eval=frame).
+# Margin seasoning, not a strobe: the lift rides ON TOP of the echo grade
+# (saturation 0.6 → 0.85, brightness -0.08 → -0.05) and only on the
+# background branch, before the foreground overlay.
+ECHO_PULSE_SAT = 0.25
+ECHO_PULSE_BRIGHT = 0.03
+ECHO_PULSE_WINDOW = 0.18
+ECHO_PULSE_MAX_BEATS = 8
+
 
 def _resolve_anchor(anchor) -> object:
     """(cx, cy) in 0..1 from an analysis anchor dict, or None when unusable.
@@ -756,8 +774,47 @@ def _echo_drift_direction(source_key: str) -> Tuple[int, int]:
     return _ECHO_DRIFT_DIRECTIONS[int(digest[:8], 16) % len(_ECHO_DRIFT_DIRECTIONS)]
 
 
+def _pulse_beats(local_beats) -> List[float]:
+    """Sanitized beat offsets for the margin pulse: finite, >= 0, sorted,
+    capped at ECHO_PULSE_MAX_BEATS. Empty/None/garbage → [] (no pulse)."""
+    if not local_beats:
+        return []
+    out = []
+    for b in local_beats:
+        try:
+            t = float(b)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(t) and t >= 0.0:
+            out.append(t)
+    return sorted(out)[:ECHO_PULSE_MAX_BEATS]
+
+
+def _echo_grade(local_beats=None) -> str:
+    """The echo background grade, beat-pulsed when local beat offsets are
+    known. local_beats=None (or unusable) emits the exact legacy static
+    grade string, so pulse-free chains stay byte-identical.
+
+    The pulse is the _fx_sat_pulse idiom: a sum of between(t,b,b+WINDOW)
+    window terms modulating the eq values per frame — outside every window
+    the expression collapses to the static graded values exactly. t here is
+    the segment-local output clock (pre_filters end in setpts=PTS-STARTPTS
+    + fps before the split), the same clock segment_beats are rebased to.
+    """
+    beats = _pulse_beats(local_beats)
+    if not beats:
+        return "eq=brightness=-0.08:saturation=0.6"
+    pulses = '+'.join(
+        f"between(t,{b:.4f},{b + ECHO_PULSE_WINDOW:.4f})" for b in beats)
+    return (
+        f"eq=brightness='-0.08+{ECHO_PULSE_BRIGHT:.3f}*({pulses})'"
+        f":saturation='0.6+{ECHO_PULSE_SAT:.3f}*({pulses})':eval=frame"
+    )
+
+
 def _echo_bg_filters(target_size: Tuple[int, int], duration: float = None,
-                     source_key: str = None) -> List[str]:
+                     source_key: str = None,
+                     local_beats: List[float] = None) -> List[str]:
     """The 'echo' background: blurred overscanned fill with a deliberate
     grade (darkened, desaturated, subtle vignette) and — when the segment
     duration is known — a slow linear drift of the crop window (~3% of the
@@ -765,10 +822,12 @@ def _echo_bg_filters(target_size: Tuple[int, int], duration: float = None,
 
     duration=None keeps today's static cover framing (grade still applies).
     The vignette runs after the drifting crop so it stays centered on the
-    visible frame instead of wandering with the window.
+    visible frame instead of wandering with the window. local_beats (segment
+    -local beat offsets) makes the grade pulse on each beat; None keeps the
+    static grade byte-identical.
     """
     w, h = target_size
-    grade = "eq=brightness=-0.08:saturation=0.6"
+    grade = _echo_grade(local_beats)
     vignette = "vignette=angle=PI/8"
     if not duration or duration <= 0:
         return [
@@ -804,7 +863,8 @@ def _echo_bg_filters(target_size: Tuple[int, int], duration: float = None,
 
 def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None,
                     *, duration: float = None, source_key: str = None,
-                    label_suffix: str = '') -> str:
+                    label_suffix: str = '',
+                    local_beats: List[float] = None) -> str:
     """Single-input chain: echo blur fill in back, foreground centered on top.
 
     Works in both -vf and -filter_complex (a linear chain with an internal
@@ -815,11 +875,14 @@ def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None,
     static-background behavior. label_suffix keeps the internal labels
     unique when the chain appears more than once in one filter_complex
     (split-screen panes); the default '' keeps solo graphs byte-identical.
+    local_beats feeds the background's beat pulse (margins only — the fg
+    branch is untouched); the default None keeps the static grade.
     """
     w, h = target_size
     if fg_filters is None:
         fg_filters = [f"scale={w}:{h}:force_original_aspect_ratio=decrease"]
-    bg = ",".join(_echo_bg_filters(target_size, duration, source_key))
+    bg = ",".join(_echo_bg_filters(target_size, duration, source_key,
+                                   local_beats))
     ls = label_suffix
     return (
         f"split=2[bg{ls}][fg{ls}];"
@@ -832,23 +895,64 @@ def _blur_fit_chain(target_size: Tuple[int, int], fg_filters: List[str] = None,
 def build_blur_fit_graph(pre_filters: List[str], target_size: Tuple[int, int],
                          post_filters: List[str], out_label: str = 'outv',
                          fg_filters: List[str] = None, *,
-                         duration: float = None, source_key: str = None) -> str:
+                         duration: float = None, source_key: str = None,
+                         local_beats: List[float] = None) -> str:
     """Filter graph for blur fit: echo blur fill in back, foreground in front."""
     pre = ",".join(pre_filters)
     post = ("," + ",".join(post_filters)) if post_filters else ""
     chain = _blur_fit_chain(target_size, fg_filters, duration=duration,
-                            source_key=source_key)
+                            source_key=source_key, local_beats=local_beats)
     return f"[0:v]{pre},{chain}{post}[{out_label}]"
 
 
+def _fg_zoom_filter(fg_w: int, fg_h: int, duration: float, fps: float):
+    """Slow push-in for an echo-fill foreground, or None when gated off.
+
+    zoompan (crop/scale can't animate w/h) with d=1 emits exactly one output
+    frame per input frame — the fg branch's frame count is untouched and
+    -vframes stays the authority. s= is locked to the fg pane dims, so the
+    composited rectangle never moves; the CONTENT inside it scales up
+    linearly to 1+HYBRID_FG_ZOOM by the last frame (z is a pure expression
+    of the output frame counter `on` — deterministic, no rng). fps= keeps
+    the output timestamps on the segment clock so downstream t-based effect
+    expressions stay beat-aligned. Runs AFTER the anchored/tracked crop, so
+    a tracked pan composes with the zoom instead of fighting it.
+
+    Gates (any → None, chain byte-identical to the pre-zoom engine):
+    HYBRID_FG_ZOOM <= 0 (kill switch), unknown/invalid duration or fps,
+    degenerate pane dims.
+    """
+    if not HYBRID_FG_ZOOM or HYBRID_FG_ZOOM <= 0:
+        return None
+    try:
+        duration = float(duration)
+        fps = float(fps)
+    except (TypeError, ValueError):
+        return None
+    if duration <= 0 or fps <= 0 or fg_w < 2 or fg_h < 2:
+        return None
+    n = max(2, int(round(duration * fps)))
+    return (
+        f"zoompan=z='1+{HYBRID_FG_ZOOM:.4f}*on/{n}':d=1"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":s={fg_w}x{fg_h}:fps={fps}"
+    )
+
+
 def _hybrid_fg_filters(hybrid_fg, anchor: dict = None, *,
-                       duration: float = None) -> List[str]:
+                       duration: float = None,
+                       fps: float = None) -> List[str]:
     """Foreground scale+crop for the limited-crop hybrid; the crop window
     honors the anchor (offset, never enlarged) when one is usable, and — when
     the anchor carries a rebased subject path (PAN_PATH_KEY) and the segment
     duration is known — follows it as a tracked pan. Fallbacks emit the exact
     static _anchored_crop, and the foreground dims are known here, so the
-    pan headroom is exact."""
+    pan headroom is exact.
+
+    With duration AND fps known (and HYBRID_FG_ZOOM > 0) the branch gains
+    the slow zoompan push-in after the crop (pan first, then zoom). The
+    default fps=None keeps existing callers (ProRes proxy conversion via
+    build_source_fit_chain) byte-identical."""
     fg_w, fg_h, crop_w, crop_h = hybrid_fg
     crop = None
     if duration and isinstance(anchor, dict) and anchor.get(PAN_PATH_KEY):
@@ -857,7 +961,43 @@ def _hybrid_fg_filters(hybrid_fg, anchor: dict = None, *,
         crop = _tracked_crop(crop_w, crop_h, anchor, duration, hx, hy)
     if crop is None:
         crop = _anchored_crop(crop_w, crop_h, anchor)
-    return [f"scale={fg_w}:{fg_h}", crop]
+    filters = [f"scale={fg_w}:{fg_h}", crop]
+    zoom = _fg_zoom_filter(crop_w, crop_h, duration, fps)
+    if zoom:
+        filters.append(zoom)
+    return filters
+
+
+def _blur_mode_fg_filters(video_file: str, target_size: Tuple[int, int], *,
+                          duration: float = None, fps: float = None):
+    """Foreground filters for pure blur mode WITH the slow push-in, or None
+    to keep the legacy default fg (scale=...decrease, no zoom).
+
+    zoompan needs a fixed s=, so the undistorted fit is computed here in
+    Python (even-rounded, never above target — the same rounding idiom as
+    plan_smart_crop) and emitted as an explicit scale instead of
+    force_original_aspect_ratio=decrease. Only taken when the zoom actually
+    fires; every gate (kill switch, unknown duration/fps, failed probe)
+    returns None so the chain stays byte-identical to the current engine.
+    """
+    if not HYBRID_FG_ZOOM or HYBRID_FG_ZOOM <= 0:
+        return None
+    if not duration or not fps:
+        return None
+    info = get_cached_display_info(video_file)
+    if not info:
+        return None
+    sw, sh = info[0], info[1]
+    tw, th = target_size
+    if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
+        return None
+    f = min(tw / sw, th / sh)
+    fw = min(tw, max(2, int(round(sw * f / 2)) * 2))
+    fh = min(th, max(2, int(round(sh * f / 2)) * 2))
+    zoom = _fg_zoom_filter(fw, fh, duration, fps)
+    if not zoom:
+        return None
+    return [f"scale={fw}:{fh}", zoom]
 
 
 def build_source_fit_chain(video_file: str, target_size: Tuple[int, int],
@@ -1439,7 +1579,8 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                                 look_cube: str = None,
                                 retime: dict = None,
                                 *, anchor: dict = None,
-                                partner: dict = None) -> bool:
+                                partner: dict = None,
+                                local_beats: List[float] = None) -> bool:
     """
     Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
 
@@ -1469,6 +1610,16 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
     any partner planning or render failure drops the partner and renders
     the primary solo — a partner can never fail a segment. partner=None is
     byte-identical to the pre-duo engine.
+
+    local_beats (optional, from the effects planner's segment_beats): beat
+    offsets on this segment's local output clock (seconds from the first
+    frame, <= 8 entries). Only consumed when the echo blur fill is on
+    screen (fit_mode='blur' or the limited-crop hybrid): the background
+    grade pulses briefly on each beat (ECHO_PULSE_*), background branch
+    only, before the fg overlay. local_beats=None (the default, and what
+    Minimal/clean renders pass) keeps every chain byte-identical to the
+    pulse-free engine. Duo panes never pulse (their echo fill is a rare
+    fallback and the composed frame already carries the beat effects).
     """
     try:
         # ✅ FRAME-ACCURATE: Calculate exact output frame count first; the
@@ -1616,14 +1767,24 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         # already drops the path from retimed clips; this belt-and-braces
         # covers retimes attached by external callers.
         pan_duration = None if retime else exact_output_duration
+        # Foreground push-in clock guard: same retime reasoning as the pan
+        # (zoompan's counter runs on the retimed clock), plus still images
+        # already get Ken Burns motion downstream — don't compound two zooms.
+        fg_zoom_duration = None if (retime or image_source) else exact_output_duration
         if use_blur_graph:
-            fg_filters = (_hybrid_fg_filters(hybrid_fg, anchor,
-                                             duration=pan_duration)
-                          if hybrid_fg else None)
+            if hybrid_fg:
+                fg_filters = _hybrid_fg_filters(hybrid_fg, anchor,
+                                                duration=pan_duration,
+                                                fps=fps if fg_zoom_duration else None)
+            else:
+                fg_filters = _blur_mode_fg_filters(video_file, target_size,
+                                                   duration=fg_zoom_duration,
+                                                   fps=fps)
             filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters,
                                                 out_label=base_label, fg_filters=fg_filters,
                                                 duration=exact_output_duration,
-                                                source_key=video_file)
+                                                source_key=video_file,
+                                                local_beats=local_beats)
         else:
             filters = list(pre_filters)
             if scan_plan:

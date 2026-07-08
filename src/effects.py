@@ -51,11 +51,90 @@ def _clamp01(value, default=0.5) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _fx_punch_fill(ctx) -> None:
+    # Punch to full-bleed: when the source sits in the fit ladder's hybrid
+    # tier (crop_loss in (MAX_CROP_PER_AXIS, SCAN_CROP_LOSS] — e.g. 4:3 in a
+    # 16:9 target), the fitted frame shows the clip over blurred echo margins.
+    # The composed frame reaches this chain AFTER fitting, so a zoompan that
+    # STARTS at the fill ratio on the cut and decays back to 1 makes the real
+    # image swallow the margins exactly on the beat, then breathe back out to
+    # the framed view — the letterbox gap becomes a rhythmic device. Same
+    # decay curve as _fx_punch_zoom, just inverted intent: punch_zoom adds a
+    # small hit on top of a full frame; punch_fill spends its amplitude
+    # closing the margins.
+    #
+    # IMPORTANT: like dutch_tilt, this builder never touches ctx['rng'] — it
+    # draws only from its own 'fx_punchfill' stable stream, so inserting it
+    # into the curated sequence cannot shift the historical styles' draws.
+    if not ctx['target_size'] or ctx['target'] != 'drop':
+        return
+    if ctx['clip'].get('partner'):
+        return  # duo panes have no margins to punch through
+    if any('zoompan' in f for f in ctx['filters']):
+        return  # one zoompan per segment (the Ken Burns gate idiom)
+    video_file = ctx['clip'].get('video_file', '')
+    if not video_file:
+        return
+    # Import inside the builder (the stage6 convention for cross-module use):
+    # effects.py stays import-light and the fit-ladder constants/probes can
+    # never drift out of lockstep with the geometry this primitive mirrors.
+    from ffmpeg_processing import (MAX_CROP_PER_AXIS, SCAN_CROP_LOSS,
+                                   get_cached_display_info, plan_smart_crop)
+    info = get_cached_display_info(video_file)
+    if not info:
+        return
+    disp_w, disp_h, _sar = info
+    tw, th = ctx['target_size']
+    if disp_w <= 0 or disp_h <= 0 or tw <= 0 or th <= 0:
+        return
+    f_fit = min(tw / disp_w, th / disp_h)
+    f_fill = max(tw / disp_w, th / disp_h)
+    crop_loss = 1.0 - f_fit / f_fill
+    if not (MAX_CROP_PER_AXIS < crop_loss <= SCAN_CROP_LOSS):
+        return  # outside the hybrid band: no margins (or scan-fit) — no-op
+    seed_parts = ['fx_punchfill', ctx['segment_index'], video_file, ctx['style']]
+    if not ctx['curated']:
+        seed_parts.extend([ctx['mode'], ctx['palette_seed']])
+    fill_rng = _stable_rng(*seed_parts)
+    # Rare in curated mode (~1 in 4 eligible hybrid-tier drops; only AMV/Hype
+    # ever reach the builders); boosted in custom/shuffle, keeping the drop
+    # affinity, so a ticked palette entry actually shows up.
+    chance = 0.25 if ctx['curated'] else 0.6 * ctx['k']
+    if fill_rng.random() >= chance:
+        return
+    # f_fill/f_fit is the zoom that takes the letterboxed fit to full-bleed.
+    # The hybrid foreground is already over-scaled (it traded MAX_CROP_PER_AXIS
+    # of crop for smaller margins), so cap at 10% past ITS true full-bleed
+    # zoom — max(tw/crop_w, th/crop_h) from the ladder's own geometry — and at
+    # 1.6 absolute for sanity.
+    ratio = min(f_fill / f_fit, 1.6)
+    hybrid = plan_smart_crop((disp_w, disp_h), (tw, th))
+    if hybrid:
+        _fg_w, _fg_h, crop_w, crop_h = hybrid
+        bleed = max(tw / max(2, crop_w), th / max(2, crop_h))
+        ratio = min(ratio, 1.1 * bleed)
+    amp = (ratio - 1.0) * ctx['k']  # intensity blends the punch toward 1
+    if amp < 0.005:
+        return
+    fps = ctx['fps']
+    zoom_expr = f"1+{amp:.4f}*exp(-(on/{fps:.4f})*9)"
+    ctx['filters'].append(
+        f"zoompan=z='{zoom_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":s={tw}x{th}:fps={fps}"
+    )
+
+
 def _fx_punch_zoom(ctx) -> None:
     # Punch-in zoom decaying from the cut: the visual "hit" on beat-aligned
     # cuts. crop can't animate w/h, so zoompan (1 output frame per input
     # frame, time reconstructed from the output frame counter) does the zoom.
     if not ((ctx['target'] in ('drop', 'rhythm') or ctx['energy'] > 0.75) and ctx['target_size']):
+        return
+    if any('zoompan' in f for f in ctx['filters']):
+        # One zoompan per segment: punch_fill (which runs first and is the
+        # bigger hit) replaces the plain punch on the drops where it fired.
+        # Nothing before this builder emitted zoompan historically, so this
+        # guard leaves every pre-punch_fill render byte-identical.
         return
     hype, k, fps = ctx['hype'], ctx['k'], ctx['fps']
     amp = (0.16 if hype else 0.10) * k * (0.6 + 0.4 * ctx['energy'])
@@ -450,6 +529,7 @@ def _transition_filters(spec: Dict, side: str, duration: float, k: float,
 # order (rng draw order must not change); custom/shuffle iterate the full
 # list. push/pull share one builder so only one zoompan direction fires.
 _PRIMITIVES = [
+    ('punch_fill', 'Punch to full-bleed (hybrid-fit drops)', _fx_punch_fill),
     ('punch_zoom', 'Punch-in zoom (drop hits)', _fx_punch_zoom),
     ('push_in', 'Slow push-in (builds)', _fx_push_pull_zoom),
     ('pull_out', 'Slow pull-out (calm releases)', _fx_push_pull_zoom),
@@ -473,10 +553,13 @@ _PRIMITIVES = [
 
 EFFECT_REGISTRY = {pid: {'label': label, 'builder': builder} for pid, label, builder in _PRIMITIVES}
 
-# The classic style pipeline, in its exact historical order. dutch_tilt is a
-# later insertion, but it draws only from its own stable rng (never
-# ctx['rng']), so the historical draw order below is unchanged.
+# The classic style pipeline, in its exact historical order. dutch_tilt and
+# punch_fill are later insertions, but each draws only from its own stable
+# rng (never ctx['rng']), so the historical draw order below is unchanged.
+# punch_fill must precede punch_zoom: it emits the segment's one zoompan and
+# punch_zoom's guard then yields to it.
 _CURATED_SEQUENCE = (
+    'punch_fill',
     'punch_zoom', 'dutch_tilt', 'shake', 'white_flash', 'sat_pulse', 'chroma_shift',
     'pixelize_burst', 'zoom_blur', 'strobe', 'trails', 'hue_sweep',
     'fisheye', 'posterize_flash', 'vignette_grain',

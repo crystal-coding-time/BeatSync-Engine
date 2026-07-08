@@ -496,6 +496,12 @@ def create_clip_parallel(job: ClipJob):
             'anchor': (planned_clip or {}).get('subject_anchor'),
             'partner': partner,
         }
+        if opts.get('effect_style', 'clean') != 'clean':
+            # Beat-reactive echo margins: the blur/hybrid background pulses
+            # on these segment-local beat offsets. Key added ONLY for styled
+            # renders — Minimal ('clean') never passes it, so its chains stay
+            # byte-identical to the pulse-free engine.
+            extract_kwargs['local_beats'] = (opts.get('segment_beats') or {}).get(i)
 
         success = extract_clip_segment_ffmpeg(**extract_kwargs)
         

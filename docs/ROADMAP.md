@@ -56,6 +56,12 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
   palette; seed 0 derives from the song filename, same seed → identical video). The applied
   recipe is printed into the render log. New primitives: half/quad mirrors, beat-flip,
   sustained push-in/pull-out zooms
+- Punch-to-full-bleed (2026-07-07): `punch_fill` primitive — drop cuts on hybrid-tier fits
+  punch in to exactly full-bleed and decay back to the framed view; amplitude computed from
+  the clip's real fill geometry (capped at true full-bleed +10%), ~1 in 4 eligible drops in
+  AMV/Hype via a dedicated rng stream (existing curated plans stay byte-identical); no-op
+  on duo segments and whenever another zoompan is present (`punch_zoom` gained the same
+  one-zoompan guard)
 - Dutch tilt (2026-07-07): `dutch_tilt` primitive — a few degrees of rotation scaled to
   cover (no black corners on any canvas), sign alternating per inter-beat interval when the
   beat grid is present. Curated: AMV/Hype, drop/rhythm segments only, ~1 in 6, seeded from a
@@ -164,6 +170,12 @@ whole video to portrait). The output canvas is now fixed and the fit engine foll
 - **"Echo" blur fill**: the blurred background behind hybrid/blur fits is now graded
   (110% overscan, darker, desaturated, vignette) with a slow ~3% drift over the segment
   (direction seeded from the source path — deterministic)
+- **Kinetic fill upgrades** (2026-07-07, wave 8): the hybrid/blur foreground gets a slow
+  continuous push-in (`HYBRID_FG_ZOOM = 0.035`; 0 = kill switch; zoompan after the tracked
+  pan with `s=` locked so the frame rectangle never moves; skips retimes/stills/duo panes),
+  and the echo margins pulse with the music — a windowed saturation/brightness lift on each
+  beat (`ECHO_PULSE_*` constants; `local_beats` threaded into
+  `extract_clip_segment_ffmpeg`, only for non-Minimal styles, ≤8 beats/segment)
 - **Scan-fit for extreme mismatches** (`SCAN_CROP_LOSS = 0.40`): instead of a blur-fit
   postage stamp, the frame fills the short axis and the crop window sweeps the long axis with
   smoothstep easing, ending on the subject anchor; sweep speed is capped
