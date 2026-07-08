@@ -11,15 +11,18 @@ when the server path is unavailable.
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import concurrent.futures
 import io
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -100,6 +103,157 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     except (TypeError, ValueError):
         value = default
     return max(lo, min(hi, value))
+
+
+def _request_timeout() -> float:
+    """Per-request watchdog cap once a server has completed one request."""
+    if "BEATSYNC_QWEN_REQUEST_TIMEOUT" in os.environ:
+        return float(_env_int("BEATSYNC_QWEN_REQUEST_TIMEOUT", 60, lo=10, hi=1800))
+    # Back-compat: honor the pre-watchdog knob if someone tuned it.
+    if "BEATSYNC_QWEN_LLAMA_HTTP_TIMEOUT" in os.environ:
+        return float(_env_int("BEATSYNC_QWEN_LLAMA_HTTP_TIMEOUT", 240, lo=30, hi=1800))
+    return 60.0
+
+
+def _warmup_timeout() -> float:
+    """First request per server start: model/mmproj warmup can be legitimately slow."""
+    return float(_env_int("BEATSYNC_QWEN_WARMUP_TIMEOUT", 180, lo=30, hi=1800))
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return True
+        return "timed out" in str(reason).lower()
+    return "timed out" in str(exc).lower()
+
+
+class QwenRequestTimeout(RuntimeError):
+    """A single /v1/chat/completions call exceeded its watchdog timeout."""
+
+
+class ServerWedgedError(RuntimeError):
+    """Circuit breaker verdict: llama-server accepts requests but never completes them."""
+
+
+class RequestTimeoutBreaker:
+    """Trips after N consecutive llama-server request timeouts.
+
+    Motivation (2026-07-07 incident): llama-server stayed 'healthy' on /health
+    while its first chat completion hung forever, freezing a render for ~a day.
+    With this breaker a wedged server costs minutes: one restart is allowed
+    after the threshold is first reached; if timeouts continue, the breaker
+    opens for good and the worker exits with whatever succeeded instead of
+    grinding through every remaining candidate at the per-request timeout.
+    Any successful request resets the consecutive count, so healthy-but-slow
+    traffic never trips it.
+    """
+
+    def __init__(self) -> None:
+        self.threshold = _env_int("BEATSYNC_QWEN_TIMEOUT_BREAKER", 6, lo=1, hi=100)
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._restart_used = False
+        self._tripped = False
+
+    def record_timeout(self) -> bool:
+        with self._lock:
+            self._consecutive += 1
+            return self._tripped or self._consecutive >= self.threshold
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive = 0
+
+    def at_threshold(self) -> bool:
+        with self._lock:
+            return self._tripped or self._consecutive >= self.threshold
+
+    def consume_restart(self) -> bool:
+        with self._lock:
+            if self._restart_used or self._tripped:
+                return False
+            self._restart_used = True
+            return True
+
+    def reset_after_restart(self) -> None:
+        with self._lock:
+            self._consecutive = 0
+
+    def trip(self) -> None:
+        with self._lock:
+            self._tripped = True
+
+    @property
+    def tripped(self) -> bool:
+        with self._lock:
+            return self._tripped
+
+
+# Every live llama-server Popen is registered here so termination signals and
+# atexit can always reach it: the server must never outlive this worker.
+_SERVER_PROCESSES: set = set()
+_SERVER_PROCESSES_LOCK = threading.Lock()
+
+
+def _register_server_process(process: subprocess.Popen) -> None:
+    with _SERVER_PROCESSES_LOCK:
+        _SERVER_PROCESSES.add(process)
+
+
+def _unregister_server_process(process: subprocess.Popen) -> None:
+    with _SERVER_PROCESSES_LOCK:
+        _SERVER_PROCESSES.discard(process)
+
+
+def _shutdown_server_processes() -> None:
+    with _SERVER_PROCESSES_LOCK:
+        processes = list(_SERVER_PROCESSES)
+    for process in processes:
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception:
+            pass
+    deadline = time.monotonic() + 10.0
+    for process in processes:
+        try:
+            process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+
+def _handle_termination_signal(signum, _frame) -> None:
+    # Inference threads may be blocked inside urlopen(), so an ordinary
+    # SystemExit could hang on executor shutdown. Stop llama-server first,
+    # then exit hard so the server can never be orphaned by a worker kill.
+    print(
+        f"Qwen worker received signal {signum}; stopping llama-server and exiting",
+        file=sys.stderr,
+        flush=True,
+    )
+    _shutdown_server_processes()
+    os._exit(128 + int(signum))
+
+
+def _install_signal_handlers() -> None:
+    # SIGBREAK is Windows-only; SIGHUP is POSIX-only. Register whatever exists.
+    for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handle_termination_signal)
+        except (ValueError, OSError, RuntimeError):
+            pass
 
 
 def _parse_json_object(text: str) -> Dict:
@@ -552,6 +706,7 @@ class LlamaServerClient:
         ctx_size: int,
         response_path: str,
         slots: int,
+        breaker: RequestTimeoutBreaker | None = None,
     ) -> None:
         self.paths = paths
         self.device = device
@@ -559,9 +714,13 @@ class LlamaServerClient:
         self.port = _free_tcp_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.slots = max(1, min(32, int(slots)))
+        self.breaker = breaker
+        self._success_count = 0
+        self._count_lock = threading.Lock()
         prefix = _response_prefix(response_path)
         self.stdout_path = prefix.with_name(prefix.name + f"_llama_server_ctx{ctx_size}_stdout.log")
         self.stderr_path = prefix.with_name(prefix.name + f"_llama_server_ctx{ctx_size}_stderr.log")
+        self.server_log_path = prefix.with_name(prefix.name + f"_llama_server_ctx{ctx_size}.log")
         self._stdout_handle = self.stdout_path.open("w", encoding="utf-8", errors="replace")
         self._stderr_handle = self.stderr_path.open("w", encoding="utf-8", errors="replace")
         self.process: subprocess.Popen | None = None
@@ -585,6 +744,20 @@ class LlamaServerClient:
             "--timeout", "3600",
             "--mmproj-offload",
             "--reasoning", "off",
+            # Defensive flags (2026-07-07 wedge incident): recent llama.cpp
+            # builds (Homebrew b9870) enable prompt-cache RAM, context
+            # checkpoints and flash-attn by default; upstream issues
+            # ggml-org/llama.cpp #24265, #17297 and #20921 tie those
+            # subsystems to intermittent mid-prompt stalls while /health
+            # stays ok. Disabling them costs ~15% gen speed; wave throughput
+            # is unchanged.
+            "--cache-ram", "0",
+            "--ctx-checkpoints", "0",
+            "--flash-attn", "off",
+            # llama-server stdout is block-buffered when piped, so a killed
+            # server leaves 0-byte stdout logs. --log-file writes diagnostics
+            # directly so a wedge is diagnosable after the fact.
+            "--log-file", str(self.server_log_path),
             "--alias", "qwen3vl",
             "--log-verbosity", "1",
             "--no-log-prefix",
@@ -602,6 +775,7 @@ class LlamaServerClient:
             text=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        _register_server_process(self.process)
 
         ready_timeout = _env_int("BEATSYNC_QWEN_LLAMA_SERVER_READY_TIMEOUT", 180, lo=15, hi=900)
         deadline = time.perf_counter() + ready_timeout
@@ -632,13 +806,58 @@ class LlamaServerClient:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=10)
+        if process is not None:
+            _unregister_server_process(process)
         self._stdout_handle.close()
         self._stderr_handle.close()
+
+    def _next_request_timeout(self) -> float:
+        # First request per server start gets the generous warmup allowance;
+        # after one success the tight per-request cap applies.
+        with self._count_lock:
+            warmed = self._success_count > 0
+        return _request_timeout() if warmed else _warmup_timeout()
+
+    def _post_chat_completion(self, payload: Dict) -> Dict:
+        # Per-request watchdog: one bounded retry on timeout, then the item
+        # fails into the wave's failed-item path (deterministic tags remain).
+        last_timeout = 0.0
+        for attempt in (1, 2):
+            if self.breaker and self.breaker.at_threshold():
+                raise ServerWedgedError("llama-server circuit breaker is open")
+            timeout = self._next_request_timeout()
+            last_timeout = timeout
+            try:
+                data = _http_json(
+                    "POST", self.base_url + "/v1/chat/completions", payload, timeout=timeout
+                )
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"llama-server HTTP {exc.code}: {body}") from exc
+            except Exception as exc:
+                if not _is_timeout_error(exc):
+                    raise
+                at_threshold = self.breaker.record_timeout() if self.breaker else False
+                print(
+                    f"Qwen watchdog: chat completion timed out after {timeout:.0f}s "
+                    f"(attempt {attempt}/2)",
+                    flush=True,
+                )
+                if attempt == 1 and not at_threshold:
+                    continue
+                raise QwenRequestTimeout(
+                    f"chat completion timed out after {timeout:.0f}s"
+                ) from exc
+            if self.breaker:
+                self.breaker.record_success()
+            with self._count_lock:
+                self._success_count += 1
+            return data
+        raise QwenRequestTimeout(f"chat completion timed out after {last_timeout:.0f}s")
 
     def generate(self, image: Image.Image, prompt: str) -> str:
         if not self.process or self.process.poll() is not None:
             raise RuntimeError("llama-server is not running")
-        timeout = float(_env_int("BEATSYNC_QWEN_LLAMA_HTTP_TIMEOUT", 240, lo=30, hi=1800))
         payload = {
             "model": "qwen3vl",
             "messages": [{
@@ -663,11 +882,7 @@ class LlamaServerClient:
                 },
             },
         }
-        try:
-            data = _http_json("POST", self.base_url + "/v1/chat/completions", payload, timeout=timeout)
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"llama-server HTTP {exc.code}: {body}") from exc
+        data = self._post_chat_completion(payload)
 
         choices = data.get("choices") or []
         if not choices:
@@ -781,6 +996,7 @@ class QwenLlamaClient:
         self.load_seconds = 0.0
         self.batch_size = self.target_slots
         self.response_path = response_path
+        self.breaker = RequestTimeoutBreaker()
         print(f"Qwen llama.cpp model: {self.paths.model.name}", flush=True)
         print(f"Qwen llama.cpp mmproj: {self.paths.mmproj.name}", flush=True)
         print(f"Qwen llama.cpp Vulkan device: {self.device_label}", flush=True)
@@ -806,6 +1022,7 @@ class QwenLlamaClient:
                     ctx_size,
                     self.response_path,
                     self.target_slots,
+                    breaker=self.breaker,
                 )
                 self.ctx_size = ctx_size
                 self.load_seconds = self.server.load_seconds
@@ -846,6 +1063,7 @@ class QwenLlamaClient:
                 self.ctx_size,
                 self.response_path,
                 self.target_slots,
+                breaker=self.breaker,
             )
             self.load_seconds += self.server.load_seconds
             self.batch_size = self.server.slots
@@ -867,6 +1085,11 @@ class QwenLlamaClient:
         if self.server:
             try:
                 return self.server.generate(image, prompt)
+            except (ServerWedgedError, QwenRequestTimeout):
+                # Watchdog timeouts are the circuit breaker's business
+                # (handled at the wave level). Falling back to llama-mtmd-cli
+                # here would grind every candidate at the CLI timeout instead.
+                raise
             except Exception as exc:
                 fallback_ctx = _ctx_sizes()[-1]
                 if self.ctx_size != fallback_ctx and _is_context_or_memory_error(str(exc)):
@@ -883,6 +1106,7 @@ class QwenLlamaClient:
                             fallback_ctx,
                             self.response_path,
                             self.target_slots,
+                            breaker=self.breaker,
                         )
                         self.ctx_size = fallback_ctx
                         self.load_seconds += self.server.load_seconds
@@ -977,7 +1201,7 @@ def _run_inference_wave(
             else:
                 failed.append((offset, item, error))
 
-    if failed and client.server:
+    if failed and client.server and not client.breaker.at_threshold():
         retry_failed: List[Tuple[int, Dict, str]] = []
         for offset, item, _error in failed:
             item_id, semantic, error = _generate_with_server(client, item, prompt, base_index + offset)
@@ -986,6 +1210,36 @@ def _run_inference_wave(
             else:
                 retry_failed.append((offset, item, error))
         failed = retry_failed
+
+    # Circuit breaker: consecutive request timeouts mean the server accepts
+    # work but never finishes it (2026-07-07 incident). Allow exactly one
+    # restart, then abort the whole tagging run with partial results. This
+    # runs BEFORE the reduced-slot retry below so a wedged server cannot
+    # ping-pong through slot-halving restarts.
+    if failed and client.breaker.at_threshold():
+        if client.server and client.breaker.consume_restart():
+            # Restart at reduced slots: a SIGTERM-ignoring wedged server gets
+            # SIGKILLed by close(), and the fresh instance retries the failed
+            # items with less concurrency before the breaker gives up.
+            reduced_slots = max(1, int(client.batch_size or 1) // 2)
+            print(
+                f"Qwen watchdog: {client.breaker.threshold} consecutive request timeouts; "
+                f"restarting llama-server once with {reduced_slots} slot(s) before giving up",
+                flush=True,
+            )
+            if client.restart_server_with_slots(reduced_slots):
+                client.breaker.reset_after_restart()
+                retry_items = [item for _offset, item, _error in failed]
+                semantics.update(_run_inference_wave(client, retry_items, prompt, base_index))
+                return semantics
+        client.breaker.trip()
+        client.close()
+        print(
+            "Qwen watchdog: llama-server is wedged (accepts requests but never completes them); "
+            "aborting semantic tagging with partial results",
+            flush=True,
+        )
+        raise ServerWedgedError("llama-server wedged: consecutive request timeouts")
 
     valid_ratio = len(semantics) / max(1, len(wave_items))
     if failed and client.server and client.batch_size > 1 and valid_ratio < 0.70:
@@ -1033,16 +1287,24 @@ def _run_semantics_for_video(
         timings["frame_count"] = len(frame_items)
         inference_started = time.perf_counter()
         idx = 0
-        while idx < len(frame_items):
-            wave_size = max(1, int(client.batch_size or 1))
-            wave_items = frame_items[idx:idx + wave_size]
-            semantics.update(_run_inference_wave(client, wave_items, prompt, idx))
-            idx += len(wave_items)
-            elapsed = max(0.001, time.perf_counter() - inference_started)
-            rate = idx / elapsed
+        try:
+            while idx < len(frame_items):
+                wave_size = max(1, int(client.batch_size or 1))
+                wave_items = frame_items[idx:idx + wave_size]
+                semantics.update(_run_inference_wave(client, wave_items, prompt, idx))
+                idx += len(wave_items)
+                elapsed = max(0.001, time.perf_counter() - inference_started)
+                rate = idx / elapsed
+                print(
+                    f"Qwen llama.cpp tagged {idx}/{len(frame_items)} "
+                    f"({rate:.2f}/s, batch {client.batch_size})",
+                    flush=True,
+                )
+        except ServerWedgedError:
+            timings["wedged"] = True
             print(
-                f"Qwen llama.cpp tagged {idx}/{len(frame_items)} "
-                f"({rate:.2f}/s, batch {client.batch_size})",
+                f"Qwen watchdog: skipping {len(frame_items) - idx} remaining candidates "
+                "for this video (server wedged)",
                 flush=True,
             )
         elapsed = max(0.001, time.perf_counter() - inference_started)
@@ -1059,6 +1321,8 @@ def _run_semantics_for_video(
 
 
 def main() -> None:
+    _install_signal_handlers()
+    atexit.register(_shutdown_server_processes)
     args = _parse_args()
     whole_started = time.perf_counter()
     with open(args.request, "r", encoding="utf-8") as f:
@@ -1103,6 +1367,14 @@ def main() -> None:
             )
             semantics_by_job[job_id] = semantics
             timings_by_job[job_id] = timings
+            if client.breaker.tripped:
+                remaining_jobs = len(jobs) - job_index
+                print(
+                    "Qwen circuit breaker tripped: llama-server wedged; writing partial "
+                    f"results and skipping {remaining_jobs} remaining job(s)",
+                    flush=True,
+                )
+                break
     finally:
         client.close()
 
@@ -1114,6 +1386,7 @@ def main() -> None:
         "peak_vram_gb": 0.0,
         "total_seconds": total_seconds,
         "timings_by_job": timings_by_job,
+        "wedged": client.breaker.tripped,
     }
     if legacy_single:
         response["semantics"] = semantics_by_job.get("single", {})

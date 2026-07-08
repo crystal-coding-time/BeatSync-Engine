@@ -38,6 +38,8 @@ Opens the web UI at http://127.0.0.1:7860.
 
 Binary resolution order: the bundled `bin/` locations are tried first (so a portable layout still works), then the system `PATH`. Overridable with `BEATSYNC_QWEN_LLAMA_DIR`, `BEATSYNC_QWEN_LLAMA_MODEL`, `BEATSYNC_QWEN_LLAMA_MMPROJ`.
 
+The vision stage is watchdogged: a hung llama-server request times out (60s steady-state, 180s during model warmup; `BEATSYNC_QWEN_REQUEST_TIMEOUT`/`BEATSYNC_QWEN_WARMUP_TIMEOUT`), and repeated timeouts trip a circuit breaker that restarts the server once, then abandons AI tagging for the run and continues with deterministic visual tags — a wedged server costs minutes, never a frozen render (`BEATSYNC_QWEN_TIMEOUT_BREAKER`, `BEATSYNC_QWEN_BATCH_TIMEOUT`). Known-buggy llama.cpp subsystems (prompt cache, context checkpoints, flash-attn — default-on in recent Homebrew builds) are explicitly disabled, and the server writes a real log file next to the batch files in `input/video_analysis_cache/`. `BEATSYNC_DISABLE_QWEN=1` still skips the stage entirely.
+
 Useful env vars:
 - `BEATSYNC_DISABLE_QWEN=1` — skip AI scene tagging (works without the model downloads)
 - `GRADIO_SERVER_PORT=<port>` — pin the UI port

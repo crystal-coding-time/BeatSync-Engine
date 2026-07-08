@@ -13,6 +13,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -819,6 +820,101 @@ def _complete_deferred_qwen_batch(
     print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
 
 
+def _qwen_worker_timeout(total_candidates: int) -> int:
+    """Parent-level backstop timeout for the stage-5 Qwen worker.
+
+    The worker now fail-fasts on its own (per-request watchdog + circuit
+    breaker: a fully wedged llama-server ends the worker in minutes), so this
+    is a last-resort backstop, not the primary defense. The old formula
+    (max(1800, n*75)) allowed ~23h for 1099 candidates and froze a render for
+    a day when llama-server wedged on its first request.
+
+    Cap is 7200s, not lower: measured healthy throughput is ~3.3s/candidate
+    (13s median request wall at 4 slots), so a healthy 1099-candidate batch
+    plus frame prefetch legitimately needs over an hour; a tighter backstop
+    would kill it and discard every tag. Override with
+    BEATSYNC_QWEN_BATCH_TIMEOUT (seconds) in either direction.
+    """
+    override = os.environ.get("BEATSYNC_QWEN_BATCH_TIMEOUT")
+    if override:
+        try:
+            return max(60, int(override))
+        except ValueError:
+            pass
+    return min(7200, 300 + int(total_candidates) * 15)
+
+
+def _kill_qwen_worker_group(proc: "subprocess.Popen") -> None:
+    """POSIX-only: kill the worker's whole process group (SIGTERM, then SIGKILL).
+
+    The worker is started with start_new_session=True, so its pgid == its pid
+    and llama-server (its child) is in the same group. SIGTERM first gives the
+    worker's signal handler a chance to stop llama-server cleanly.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    # Always follow with a group SIGKILL: even if the worker itself exited on
+    # SIGTERM, a group member (llama-server) may have ignored it. killpg works
+    # as long as any member of the group is still alive.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        pass
+
+
+def _run_qwen_worker_process(command: List[str], env: Dict[str, str], timeout: int) -> "subprocess.CompletedProcess":
+    """Run the stage-5 worker; a timeout must never orphan llama-server.
+
+    POSIX: the worker runs in its own session/process group so that on
+    TimeoutExpired we can os.killpg the whole tree. Plain subprocess.run only
+    kills the direct child, which left llama-server orphaned (and the GPU
+    busy) in the 2026-07-07 incident. Windows: killpg/setsid do not exist and
+    process groups work differently (Job Objects would be needed), so Windows
+    keeps the previous subprocess.run behavior unchanged.
+    """
+    if os.name == "nt":
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env=env,
+        )
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_qwen_worker_group(proc)
+        raise
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
 def _run_qwen_worker_batch(
     jobs: Sequence[Dict],
     qwen_model_path: str,
@@ -841,17 +937,12 @@ def _run_qwen_worker_batch(
 
     env = _qwen_worker_environment()
     total_candidates = sum(len(job.get("candidates") or []) for job in jobs)
-    timeout = max(1800, int(total_candidates * 75))
+    timeout = _qwen_worker_timeout(total_candidates)
     try:
-        result = subprocess.run(
+        result = _run_qwen_worker_process(
             [sys.executable, worker_path, "--request", request_path, "--response", response_path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-            env=env,
+            env,
+            timeout,
         )
         if result.stdout.strip():
             for line in result.stdout.strip().splitlines():
@@ -1701,17 +1792,12 @@ def _run_qwen_worker(
         json.dump(request, f)
 
     env = _qwen_worker_environment()
-    timeout = max(1800, int(len(candidates) * 75))
+    timeout = _qwen_worker_timeout(len(candidates))
     try:
-        result = subprocess.run(
+        result = _run_qwen_worker_process(
             [sys.executable, worker_path, "--request", request_path, "--response", response_path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-            env=env,
+            env,
+            timeout,
         )
         if result.stdout.strip():
             for line in result.stdout.strip().splitlines():

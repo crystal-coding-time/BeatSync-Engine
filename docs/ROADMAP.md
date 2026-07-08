@@ -215,6 +215,29 @@ the process inputs list order untouched by construction:
 - Frame fit is now Auto (the smart ladder) / Blurred background / Letterbox; `'stretch'`
   survives for headless/settings callers only
 
+## Stage-5 hardening ✅ (2026-07-07)
+Incident: an owner render froze for ~35 min inside llama-server (Homebrew llama.cpp 9870,
+Qwen3VL-2B + mmproj) — a slot wedged mid-prompt while `/health` stayed ok; the worker had
+no effective per-request timeout and the parent backstop scaled to ~23 h. Not reproducible
+deterministically (65 requests / 8 fresh servers, 0 hangs); fingerprint matches open
+upstream bugs (ggml-org/llama.cpp #24265 prompt-cache/ctx-checkpoint stall, #17297
+flash-attn, #20921 wedged slot). Fixes:
+- Server flags now disable the implicated build-9870 default-on subsystems:
+  `--cache-ram 0 --ctx-checkpoints 0 --flash-attn off` (~15% gen cost, throughput
+  unchanged), plus `--log-file` (piped stdout is block-buffered — killed servers used to
+  leave 0-byte logs)
+- Per-request watchdog: 180 s warmup allowance until a server's first success
+  (`BEATSYNC_QWEN_WARMUP_TIMEOUT`), then 60 s steady-state (`BEATSYNC_QWEN_REQUEST_TIMEOUT`),
+  1 retry, failed items keep deterministic tags
+- Circuit breaker: 6 consecutive timeouts (`BEATSYNC_QWEN_TIMEOUT_BREAKER`) → one server
+  restart at halved slots → trips: partial results written (`"wedged": true`), remaining
+  jobs skipped. Worst case ≈ 16 min, was ~23 h
+- Orphan prevention: worker signal handlers + atexit stop llama-server
+  (SIGTERM→SIGKILL escalation); the parent runs the worker in its own process group and
+  kills the whole group on timeout (POSIX; Windows keeps prior behavior)
+- Parent backstop: `min(7200, 300 + 15·candidates)` s (`BEATSYNC_QWEN_BATCH_TIMEOUT`) —
+  7200 cap because a healthy 1000+-candidate batch legitimately needs >1 h at ~3.3 s/frame
+
 ## Phase 5 — full automation ⬜
 - Watch-folder mode built on the existing `video_processor.py` CLI: drop audio + clips, video appears in `output/`
 - launchd job on macOS; candidate for running on the-all-thing server later
