@@ -1471,6 +1471,15 @@ RETIME_MAX_SPEED = 2.5
 # comes up even one source frame short yields a short segment (audit repro:
 # 59/60 and 23/60) that would silently drift the whole timeline.
 RETIME_SLACK_FRAMES = 2
+# Deep-slow-mo interpolation (retime['interp']) uses minterpolate, which cannot
+# synthesize past the last input frame: measured 90 source frames -> 177 (not
+# 180) at interp=2, a 3-densified-frame tail shortfall. Over-provision the SOURCE
+# window by this many SOURCE frames so the shortfall stays inside the slack and
+# wave-11's tpad clone stays a no-op in practice (measured sufficient: see the
+# tpad no-op check — 4 source frames clears the worst 30fps/24fps cases with
+# margin). Source frames, not output frames, because minterpolate consumes the
+# tail at the SOURCE rate.
+INTERP_SLACK_FRAMES = 4
 
 
 def _retime_speeds(retime: dict) -> Tuple[float, float]:
@@ -1486,12 +1495,20 @@ def _retime_speeds(retime: dict) -> Tuple[float, float]:
 
 
 def retime_source_window(output_duration: float, retime: dict | None,
-                         fps: float) -> float:
+                         fps: float, source_fps: float | None = None) -> float:
     """Source seconds a segment must decode, slack included.
 
     Shared by the planner (runway gating), the clip worker (start clamping)
     and extraction (trim/-t) so the three can never disagree about how much
     source a retimed segment consumes.
+
+    source_fps is only consulted for interpolated deep slow-mo
+    (retime['interp']): it adds INTERP_SLACK_FRAMES source frames to cover
+    minterpolate's tail shortfall. It defaults to None so non-interp callers
+    (and the clip worker's start-clamp guard) stay bit-for-bit unchanged — an
+    interp window without source_fps simply loses the extra provision, which
+    only ever loosens the guard (the planner, which DOES pass source_fps, has
+    already placed the start inside the larger window).
     """
     if not retime:
         return output_duration
@@ -1503,6 +1520,8 @@ def retime_source_window(output_duration: float, retime: dict | None,
     s0, s1 = _retime_speeds(retime)
     avg = (s0 + s1) / 2.0
     slack = (RETIME_SLACK_FRAMES / fps) * max(1.0, s0, s1)
+    if retime.get('interp') and source_fps and source_fps > 0:
+        slack += INTERP_SLACK_FRAMES / source_fps
     return output_duration * avg + slack
 
 
@@ -1557,7 +1576,8 @@ def _retime_filters(retime: dict, output_duration: float, fps: float) -> List[st
 def build_segment_pre_filters(exact_duration: float, fps: float,
                               trim_start: float = 0.0,
                               retime: dict | None = None,
-                              output_duration: float = None) -> List[str]:
+                              output_duration: float = None,
+                              source_fps: float | None = None) -> List[str]:
     """Shared trim/setpts/fps head of every segment's filter chain.
 
     Trim first so each extracted segment has exact timing; effects come after
@@ -1571,6 +1591,14 @@ def build_segment_pre_filters(exact_duration: float, fps: float,
     and silently break beat alignment. exact_duration is the SOURCE window
     (equal to the output duration when retime is None); output_duration is
     what -vframes will enforce.
+
+    source_fps is only consulted for interpolated deep slow-mo
+    (retime['interp']): minterpolate densifies the SOURCE stream to
+    interp*source_fps BEFORE the retime setpts (so deep slow-mo synthesizes
+    motion instead of duplicating frames), inserted between setpts=PTS-STARTPTS
+    and the retime setpts — the retime setpts and everything after fps= then
+    see the densified stream. Without an interp spec (or source_fps) the chain
+    is byte-identical to the pre-interp engine.
     """
     if trim_start > 0:
         trim_filter = f"trim=start={trim_start:.6f}:duration={exact_duration}"
@@ -1578,6 +1606,14 @@ def build_segment_pre_filters(exact_duration: float, fps: float,
         trim_filter = f"trim=duration={exact_duration}"
     filters = [trim_filter, "setpts=PTS-STARTPTS"]
     if retime:
+        interp = retime.get('interp')
+        if interp and source_fps and source_fps > 0:
+            # scd default (fdiff) stays ON — stage6 only ever feeds within-shot
+            # windows, so scene-change guarding against garbage tweens is free.
+            filters.append(
+                f"minterpolate=fps={interp * source_fps}"
+                f":mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+            )
         filters.extend(_retime_filters(retime, output_duration or exact_duration, fps))
     # Hold the last frame if the demuxer under-delivers. GIFs (and some VFR
     # sources) carry a long display duration on their FINAL frame — container
@@ -1689,7 +1725,14 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         # source window derives from it (and the retime spec, if any).
         output_frame_count = max(1, seconds_to_frame_count(duration, fps))
         exact_output_duration = frame_count_to_seconds(output_frame_count, fps)
-        exact_source_duration = retime_source_window(exact_output_duration, retime, fps)
+        # source_fps drives both the interp over-provision (retime_source_window)
+        # and the minterpolate target rate (build_segment_pre_filters); cached, so
+        # cheap. Only probed when a retime is present so the non-retime path stays
+        # pristine (no new probe/warning). Images have no real timebase, but retime
+        # is stripped for them below, so the fallback value is never consumed there.
+        segment_source_fps = get_cached_video_fps(video_file) if retime else None
+        exact_source_duration = retime_source_window(
+            exact_output_duration, retime, fps, source_fps=segment_source_fps)
 
         # Still images have no timeline: -loop 1 serves the single frame for
         # exactly the segment window, so seeking, -stream_loop and retiming
@@ -1802,7 +1845,8 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
 
         pre_filters = build_segment_pre_filters(
             exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0,
-            retime=retime, output_duration=exact_output_duration)
+            retime=retime, output_duration=exact_output_duration,
+            source_fps=segment_source_fps)
 
         # Per-source fit decisions: SAR normalization for anamorphic inputs,
         # the limited-crop hybrid when plain Smart crop would discard more

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Stage 2: beat-synchronous energy wave and rhythm feature extraction."""
 
-from typing import Dict, Tuple
+import re
+import subprocess
+from typing import Dict, Optional, Tuple
 import librosa
 import numpy as np
 
@@ -12,7 +14,11 @@ from . import _interp_to_beats, _normalize, _safe_percentile, _smooth
 def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
                           beat_times: np.ndarray, beat_frames: np.ndarray,
                           onset_env: np.ndarray, cfg: AutoWaveConfig,
-                          use_gpu: bool = False) -> Dict:
+                          use_gpu: bool = False,
+                          y_harmonic: Optional[np.ndarray] = None,
+                          audio_file: Optional[str] = None,
+                          start_time: float = 0.0,
+                          duration: Optional[float] = None) -> Dict:
     """Extract beat-synchronous energy/rhythm data with smooth wave behavior."""
     duration = len(y) / sr
 
@@ -69,6 +75,31 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
     is_phrase_anchor[::max(1, cfg.phrase_beats)] = True
     is_bar_anchor[::max(1, cfg.bar_beats)] = True
 
+    # Wave-13: three extra per-beat features consumed by stage4 scoring and
+    # stage6 planning. Each is ALWAYS present (zero-filled + ⚠️ on any failure),
+    # deterministic (pure librosa/numpy or a deterministic ffmpeg parse), and
+    # normalized 0..1 to len(beat_times) exactly like the curves above.
+
+    # SuperFlux onset strength (librosa SuperFlux recipe: lag=2, max_size=3 on
+    # the percussive component, package hop kept for frame-time alignment).
+    try:
+        superflux_curve = librosa.onset.onset_strength(
+            y=y_percussive, sr=sr, hop_length=cfg.hop_length, lag=2, max_size=3
+        )
+        superflux_curve = _normalize(_smooth(np.asarray(superflux_curve, dtype=float), 3))
+        onset_superflux = _normalize(_interp_to_beats(superflux_curve, beat_times, sr, cfg.hop_length))
+    except Exception as e:
+        print(f"      ⚠️ SuperFlux onset extraction failed; using zeros: {e}")
+        onset_superflux = np.zeros(len(beat_times), dtype=float)
+
+    # Harmonic change (HCDF): tonnetz-distance between adjacent frames.
+    harmonic_change = compute_harmonic_change(
+        y_harmonic if y_harmonic is not None else y, sr, beat_times, cfg
+    )
+
+    # EBU R128 momentary loudness at each beat (deterministic ffmpeg parse).
+    loudness = compute_loudness(audio_file, start_time, duration, beat_times)
+
     return {
         "kick": kick,
         "bass": bass,
@@ -95,7 +126,94 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
         "rms_curve": rms_curve_n,
         "centroid_curve": centroid_curve_n,
         "flux_curve": flux_curve_n,
+        "onset_superflux": onset_superflux,
+        "harmonic_change": harmonic_change,
+        "loudness": loudness,
     }
+
+
+def compute_harmonic_change(y_harmonic: np.ndarray, sr: int, beat_times: np.ndarray,
+                            cfg: AutoWaveConfig) -> np.ndarray:
+    """HCDF: per-frame tonnetz-distance (chord/key-change strength), interp to beats.
+
+    CQT chroma is the expensive step; if it fails we fall back to zeros with a
+    ⚠️ log so the key is ALWAYS present at len(beat_times), normalized 0..1.
+    """
+    try:
+        chroma = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr, hop_length=cfg.hop_length)
+        ton = librosa.feature.tonnetz(chroma=chroma)
+        diff = np.linalg.norm(np.diff(ton, axis=1), axis=0)
+        if diff.size == 0:
+            return np.zeros(len(beat_times), dtype=float)
+        # np.diff drops one frame; pad at the front so the curve realigns to the
+        # original frame grid (frame i -> time i) used by _interp_to_beats.
+        hcdf = np.concatenate([diff[:1], diff])
+        hcdf = _smooth(hcdf, 5)
+        return _normalize(_interp_to_beats(hcdf, beat_times, sr, cfg.hop_length))
+    except Exception as e:
+        print(f"      ⚠️ Harmonic-change (HCDF) extraction failed; using zeros: {e}")
+        return np.zeros(len(beat_times), dtype=float)
+
+
+def compute_loudness(audio_file: Optional[str], start_time: float,
+                     duration: Optional[float], beat_times: np.ndarray) -> np.ndarray:
+    """EBU R128 momentary loudness sampled at each beat.
+
+    Runs ffmpeg's ebur128 filter once and parses the deterministic ``t:``/``M:``
+    stderr trace (one sample per 100 ms). Momentary values are clamped at -60
+    LUFS (silence reports ~-120) and mapped to 0..1 with a robust 5th->95th
+    percentile scale so a single loud spike does not flatten everything else.
+    Any failure -> zeros + ⚠️, so the key is ALWAYS present.
+    """
+    n = len(beat_times)
+    if not audio_file:
+        print("      ⚠️ Loudness: no audio path threaded to stage2; using zeros")
+        return np.zeros(n, dtype=float)
+    try:
+        from ffmpeg_processing import FFMPEG_PATH
+
+        cmd = [FFMPEG_PATH, '-nostdin', '-hide_banner']
+        # Input seeking (-ss before -i) resets output PTS to 0, so the parsed
+        # t: values share the same 0-based timeline as beat_times.
+        if start_time and start_time > 0:
+            cmd += ['-ss', f'{float(start_time):.6f}']
+        cmd += ['-i', audio_file, '-map', 'a:0']
+        if duration and duration > 0:
+            cmd += ['-t', f'{float(duration):.6f}']
+        cmd += ['-af', 'ebur128', '-f', 'null', '-']
+
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, text=True)
+        stderr = proc.stderr or ""
+
+        times: list = []
+        mom: list = []
+        for m in re.finditer(r't:\s*([-\d.]+).*?M:\s*([-\d.]+)', stderr):
+            try:
+                t = float(m.group(1))
+                mval = float(m.group(2))
+            except ValueError:
+                continue
+            times.append(t)
+            mom.append(max(mval, -60.0))
+
+        if len(times) < 2:
+            print("      ⚠️ Loudness (ebur128) produced no parseable frames; using zeros")
+            return np.zeros(n, dtype=float)
+
+        times_arr = np.asarray(times, dtype=float)
+        mom_arr = np.asarray(mom, dtype=float)
+        sampled = np.interp(beat_times, times_arr, mom_arr,
+                            left=float(mom_arr[0]), right=float(mom_arr[-1]))
+
+        lo = float(np.percentile(mom_arr, 5))
+        hi = float(np.percentile(mom_arr, 95))
+        if hi - lo < 1e-8:
+            return np.zeros(n, dtype=float)
+        return np.clip((sampled - lo) / (hi - lo), 0.0, 1.0)
+    except Exception as e:
+        print(f"      ⚠️ Loudness (ebur128) extraction failed; using zeros: {e}")
+        return np.zeros(n, dtype=float)
 
 
 def analyze_rhythm_bands(y: np.ndarray, sr: int, beat_times: np.ndarray,

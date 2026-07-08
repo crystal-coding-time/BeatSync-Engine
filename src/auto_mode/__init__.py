@@ -298,7 +298,11 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
 
     _notify_progress(progress_callback, 2)
     print("   🌊 Step 2: Reading energy waves and rhythm impacts...")
-    features = analyze_wave_features(y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu)
+    features = analyze_wave_features(
+        y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu,
+        y_harmonic=y_harmonic, audio_file=audio_file,
+        start_time=start_time, duration=duration,
+    )
     if downbeat_times.size:
         # Real downbeats replace the naive every-4th-beat grid: bar anchors are
         # the model's downbeats, phrase anchors every second downbeat. This
@@ -417,6 +421,7 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         "zcr": features["flux_curve"],
         "wave": features["wave"],
         "arc": features["arc"],
+        "loudness": features["loudness"],
     }
 
     rhythm_data = {
@@ -433,6 +438,8 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         "is_strong_bass": features["is_strong_bass"],
         "is_bar_anchor": features["is_bar_anchor"],
         "is_phrase_anchor": features["is_phrase_anchor"],
+        "onset_superflux": features["onset_superflux"],
+        "harmonic_change": features["harmonic_change"],
     }
 
     beat_info = {

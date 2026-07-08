@@ -43,6 +43,25 @@ def _clamp01(value, default=0.5) -> float:
     return max(0.0, min(1.0, v))
 
 
+def _loudness_gain(ctx) -> float:
+    """Amplitude multiplier for impact effects from the segment's loudness.
+
+    'loudness' is an optional stage-6 planner key (EBU momentary loudness of
+    the segment's music, 0..1, 0.5 = average). Missing/None (every plan
+    before wave-13, and fallback segments) returns 1.0 — an exact no-op
+    multiplier (x*1.0 == x bit-for-bit in IEEE754) — so every filter chain
+    that doesn't carry the key stays byte-identical to today's output. This
+    is a pure amplitude modulator: callers must only multiply it into a
+    HOW-HARD parameter (zoom/brightness/pixel amplitudes), never use it to
+    decide WHETHER an effect fires — that decision is owned entirely by each
+    builder's own rng stream, and loudness must never perturb rng draws.
+    """
+    loudness = ctx['clip'].get('loudness')
+    if loudness is None:
+        return 1.0
+    return 0.75 + 0.5 * _clamp01(loudness)
+
+
 # ---------------------------------------------------------------------------
 # Primitive builders. Each decides for itself whether it fires and appends to
 # ctx['filters']. In curated mode the conditions (and therefore the exact
@@ -113,7 +132,12 @@ def _fx_punch_fill(ctx) -> None:
         _fg_w, _fg_h, crop_w, crop_h = hybrid
         bleed = max(tw / max(2, crop_w), th / max(2, crop_h))
         ratio = min(ratio, 1.1 * bleed)
-    amp = (ratio - 1.0) * ctx['k']  # intensity blends the punch toward 1
+    base_amp = (ratio - 1.0) * ctx['k']  # intensity blends the punch toward 1
+    # loudness gain scales the hit but never past the full-bleed+10% cap
+    # established above (ratio - 1.0): min() is a no-op that always resolves
+    # to base_amp when gain==1.0 (base_amp <= ratio - 1.0 since ratio >= 1
+    # and k <= 1.0), so the absent-'loudness' chain is bit-for-bit unchanged.
+    amp = min(ratio - 1.0, base_amp * _loudness_gain(ctx))
     if amp < 0.005:
         return
     fps = ctx['fps']
@@ -137,7 +161,7 @@ def _fx_punch_zoom(ctx) -> None:
         # guard leaves every pre-punch_fill render byte-identical.
         return
     hype, k, fps = ctx['hype'], ctx['k'], ctx['fps']
-    amp = (0.16 if hype else 0.10) * k * (0.6 + 0.4 * ctx['energy'])
+    amp = (0.16 if hype else 0.10) * k * (0.6 + 0.4 * ctx['energy']) * _loudness_gain(ctx)
     zoom_expr = f"1+{amp:.4f}*exp(-(on/{fps:.4f})*9)"
     ctx['filters'].append(
         f"zoompan=z='{zoom_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
@@ -247,7 +271,7 @@ def _fx_shake(ctx) -> None:
         fire = ctx['target'] == 'drop'
     if not fire:
         return
-    a = max(2, int(round(8 * ctx['k'])))
+    a = max(2, int(round(8 * ctx['k'] * _loudness_gain(ctx))))
     ctx['filters'].append(
         f"crop=w=in_w-{2 * a}:h=in_h-{2 * a}"
         f":x='{a}+{a}*sin(t*41)*exp(-t*3)':y='{a}+{a}*cos(t*57)*exp(-t*3)'"
@@ -259,7 +283,7 @@ def _fx_white_flash(ctx) -> None:
     # White flash right at drop cuts.
     if ctx['target'] != 'drop':
         return
-    amp = (0.55 if ctx['hype'] else 0.35) * ctx['k']
+    amp = (0.55 if ctx['hype'] else 0.35) * ctx['k'] * _loudness_gain(ctx)
     ctx['filters'].append(f"eq=brightness='{amp:.3f}*exp(-t*14)':eval=frame")
 
 
@@ -316,7 +340,7 @@ def _fx_zoom_blur(ctx) -> None:
                 and ctx['rng'].random() < 0.5 * ctx['k'])
     if not fire:
         return
-    radius = max(4, int(round(10 * ctx['k'] * (0.5 + 0.5 * ctx['energy']))))
+    radius = max(4, int(round(10 * ctx['k'] * (0.5 + 0.5 * ctx['energy']) * _loudness_gain(ctx))))
     ctx['filters'].append(f"dblur=angle=90:radius={radius}:enable='lt(t,0.3)'")
     ctx['pack'] += 1
 

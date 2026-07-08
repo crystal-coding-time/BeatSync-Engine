@@ -215,6 +215,30 @@ the process inputs list order untouched by construction:
 - Frame fit is now Auto (the smart ladder) / Blurred background / Letterbox; `'stretch'`
   survives for headless/settings callers only
 
+## Wave 13 — musical pacing + interpolated slow-mo ✅ (2026-07-08)
+Tier-0 audio intelligence (zero new dependencies) + minterpolate deep slow-mo (tracker `docs/TODO.md`):
+- **Three new per-beat features** (stage 2; always present, zero-filled with a ⚠️ on failure;
+  ~1s total for a 4-min track): `onset_superflux` (SuperFlux onset strength — vibrato-robust
+  transients), `harmonic_change` (tonnetz-distance HCDF — chord-change moments),
+  `loudness` (EBU R128 momentary via one ffmpeg `ebur128` pass, robust 5–95th percentile map)
+- **Smarter cut selection** (stage 4): base cut score now includes SuperFlux (weights:
+  impact .36 / rhythm .27 / wave .20 / superflux .10 / novelty .06 / arc .06), and
+  low-percussion sections (`mixed` pattern in intro/outro/breakdown/verse/bridge) get a
+  +0.12·HCDF bonus — quiet passages cut on the chord change instead of a bare grid.
+  **Default cut plans change vs wave 12** (deliberate; still beat-grid-locked, ~4% count shift)
+- **Loudness-scaled impact effects**: planned clips carry `loudness`; punch zoom/fill,
+  white flash, shake and zoom blur scale 0.75×–1.25× with the music's momentary loudness.
+  Never changes *whether* an effect fires (rng streams untouched); clips without the key
+  (old plans) render byte-identically
+- **Interpolated deep slow-mo** (speed ramps opt-in, as before): 24–50fps sources may now draw
+  0.5–0.6× soft slow-mo — previously gated to ≥50fps sources — rendered via inline
+  `minterpolate=mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1` at 2× source fps between
+  `setpts=PTS-STARTPTS` and the retime (`retime['interp']`). Measured bit-deterministic;
+  ~5–8s of CPU per segment, so it stays rare (soft targets only, ~45% × sub-0.6 draws).
+  `INTERP_SLACK_FRAMES = 4` extra source frames absorb minterpolate's tail shortfall
+  (verified: exact frame counts even with the wave-11 tpad guard stripped); planner, clip
+  worker and extraction all size the window with the same `source_fps`
+
 ## Wave 12 — semantic diversity + fair-share variety ✅ (2026-07-08)
 Two upgrades to stage-6 planning (tracker `docs/TODO.md`; designs from the 2026-07-07 research):
 - **Visual variety** (new GUI slider, Advanced, default 0.4): avoids runs of visually similar

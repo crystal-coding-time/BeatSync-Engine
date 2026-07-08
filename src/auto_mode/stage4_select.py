@@ -180,13 +180,25 @@ def compute_cut_scores(beat_indices: np.ndarray, features: Dict, section: Dict,
     rhythm = features["rhythm_score"][idx]
     novelty = features["novelty"][idx]
 
-    score = 0.36 * impact + 0.27 * rhythm + 0.20 * wave + 0.10 * novelty + 0.07 * features["arc"][idx]
+    # Wave-13: SuperFlux onset strength joins the base score (novelty 0.10->0.06,
+    # arc 0.07->0.06 rebalanced down to make room; superflux weighted 0.10).
+    score = (0.36 * impact + 0.27 * rhythm + 0.20 * wave
+             + 0.06 * novelty + 0.06 * features["arc"][idx]
+             + 0.10 * features["onset_superflux"][idx])
 
     score = score.copy()
     score[features["is_bar_anchor"][idx]] += cfg.anchor_bonus
     score[features["is_phrase_anchor"][idx]] += cfg.phrase_bonus
 
+    section_type = section.get("type", "verse")
     pattern = section.get("dominant_pattern", "mixed")
+
+    # Wave-13: harmonic-change (HCDF) bonus only where percussion is weak, i.e.
+    # 'mixed' pattern in the quieter/melodic section types. Chord-change cuts
+    # matter there; drops/choruses stay percussion-driven.
+    if pattern == "mixed" and section_type in {"intro", "outro", "breakdown", "verse", "bridge"}:
+        score = score + 0.12 * features["harmonic_change"][idx]
+
     if pattern == "kick_clap":
         score += 0.12 * features["is_strong_kick"][idx] + 0.10 * features["is_strong_clap"][idx]
     elif pattern == "kick":

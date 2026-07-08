@@ -43,7 +43,7 @@ analysis/Qwen caches valid (no ANALYSIS_VERSION bump).
 | 12.3 | Plumbing: Visual variety slider (Advanced), settings threading, embed annotation call before planning (graceful skip) | `src/gui.py`, `src/video_processor.py` | 💾 |
 | 12.4 | Integration: fetch model, cross-check, docs sync (ROADMAP + README), smoke (with + without model), restart | (lead) | 💾 |
 
-## Wave 13 — pacing + kinetic (in flight, owner approved)
+## Wave 13 — pacing + kinetic 💾 (committed 2026-07-08)
 
 Contract: features dict gains `onset_superflux` / `harmonic_change` / `loudness` (per-beat,
 normalized, zero-filled + ⚠️ on failure); planned clips gain optional `loudness` float;
@@ -51,10 +51,10 @@ retime specs gain optional `interp` factor (deep slow-mo on 24–50fps sources o
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 13.1 | SuperFlux onset + tonnetz harmonic-change + ebur128 momentary-loudness per-beat features; conservative cut-score integration (onset bonus everywhere, HCDF bonus in low-percussive sections) | `src/auto_mode/stage2_features.py`, `stage4_select.py`, `__init__.py` | 🤖 Agent I |
-| 13.2 | Loudness → segment profiles → planned clips; `interp` retime spec (lifts ≥50fps gate for sub-0.6x) + inline `minterpolate` in the retime chain (+4-frame over-provision, tpad synergy) | `src/auto_mode/stage6_av_planner.py`, `src/ffmpeg_processing.py` | 🤖 Agent J |
-| 13.3 | Loudness-scaled punch/flash amplitudes (byte-identical when key absent) | `src/effects.py` | 🤖 Agent K |
-| 13.4 | Integration: cross-check, docs sync, smoke (determinism + frame guards + interp render cost), restart | (lead) | ⬜ |
+| 13.1 | SuperFlux onset + tonnetz harmonic-change + ebur128 momentary-loudness per-beat features; conservative cut-score integration (onset bonus everywhere, HCDF bonus in low-percussive sections) | `src/auto_mode/stage2_features.py`, `stage4_select.py`, `__init__.py` | 💾 |
+| 13.2 | Loudness → segment profiles → planned clips; `interp` retime spec (lifts ≥50fps gate for sub-0.6x) + inline `minterpolate` in the retime chain (+4-frame over-provision, tpad synergy) | `src/auto_mode/stage6_av_planner.py`, `src/ffmpeg_processing.py` | 💾 |
+| 13.3 | Loudness-scaled punch/flash amplitudes (byte-identical when key absent) | `src/effects.py` | 💾 |
+| 13.4 | Integration: cross-check (runway-window symmetry fix in create_clip_parallel), docs sync, smoke, restart | (lead) | 💾 |
 
 ## Backlog / opt-in follow-ups
 

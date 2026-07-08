@@ -40,6 +40,7 @@ from paths import (
 from ffmpeg_processing import (
     get_video_duration,
     get_cached_video_duration,
+    get_cached_video_fps,
     get_video_fps,
     get_video_resolution,
     convert_to_prores_proxy,
@@ -389,7 +390,11 @@ def create_clip_parallel(job: ClipJob):
                 # A retimed segment consumes source_window seconds of source;
                 # if the clamped window can't fit, strip the ramp instead of
                 # looping it (deterministic: depends only on probed duration).
-                window = retime_source_window(source_duration, retime, job.fps)
+                # source_fps matters for interp retimes (extra decode slack) —
+                # pass it so this check, the planner and extraction all size
+                # the same window.
+                window = retime_source_window(source_duration, retime, job.fps,
+                                              source_fps=get_cached_video_fps(video_file))
                 if video_duration >= window:
                     max_start = max(0.0, video_duration - window)
                     clip_start = max(0.0, min(float(planned_clip.get('start_time', 0.0)), max_start))

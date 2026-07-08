@@ -381,10 +381,22 @@ def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
 
         retime = None
         if target == "soft" and roll < 0.45:
-            # Slow-mo drift. Depths below 0.6x are duplicated-frame judder on
-            # ordinary 24-30fps sources, so they need high-fps footage.
-            lo = 0.5 if source_fps >= 50.0 else 0.6
-            retime = {"kind": "constant", "speed": round(rng.uniform(lo, 0.7), 3)}
+            # Slow-mo drift. On >=50fps footage the deep band (<0.6x) is real
+            # source frames. On ordinary 24-50fps sources sub-0.6x used to be
+            # pure duplicated-frame judder — now minterpolate synthesizes the
+            # in-between frames (interp=2), so the deep band opens up there too.
+            #
+            # RNG DISCIPLINE: both branches draw exactly ONE uniform from the
+            # shared 'retime' stream — the >=50 branch always did uniform(0.5,
+            # 0.7); the <50 branch WAS uniform(0.6, 0.7) and is now uniform(0.5,
+            # 0.7). Same draw count, so every other segment's plan is untouched;
+            # only 24-50fps soft-slow-mo speeds shift (lower bound 0.6 -> 0.5),
+            # and a drawn speed < 0.6 there gains the interp flag.
+            speed = round(rng.uniform(0.5, 0.7), 3)
+            retime = {"kind": "constant", "speed": speed}
+            if source_fps < 50.0 and speed < 0.6:
+                # 24 <= source_fps < 50 is guaranteed by the sub-24 skip above.
+                retime["interp"] = 2
         elif target == "build" and roll < 0.40:
             retime = {"kind": "constant", "speed": round(rng.uniform(1.4, 2.0), 3)}
         elif target == "drop":
@@ -401,7 +413,10 @@ def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
         if retime is None:
             continue
 
-        window = retime_source_window(final_duration, retime, fps)
+        # source_fps lets retime_source_window add the interp over-provision
+        # (a no-op for non-interp specs); it must match extraction's window.
+        window = retime_source_window(final_duration, retime, fps,
+                                      source_fps=source_fps)
 
         # Per-window runway: the retimed window must fit inside the scene
         # window the candidate was chosen for (a ramp that spills across the
@@ -614,6 +629,11 @@ def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray
 
     wave = np.asarray(energy_profile.get("wave", []), dtype=float)
     arc = np.asarray(energy_profile.get("arc", []), dtype=float)
+    # EBU momentary loudness per beat (0..1); a stage-2 feature threaded through
+    # energy_profile alongside wave/arc. Always present going forward, but ABSENT
+    # in beat_info cached before it landed — _interp_feature's default (0.5) keeps
+    # those runs neutral, and effects (_loudness_gain) reads the resulting clip key.
+    loudness = np.asarray(energy_profile.get("loudness", []), dtype=float)
     impact = np.asarray(rhythm_data.get("impact_strength", []), dtype=float)
     rhythm = np.asarray(rhythm_data.get("combined_strength", []), dtype=float)
     novelty = np.asarray(rhythm_data.get("novelty_strength", []), dtype=float)
@@ -625,6 +645,7 @@ def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray
         mid = (start + end) * 0.5
         local_wave = _interp_feature(mid, beat_times, wave, 0.5)
         local_arc = _interp_feature(mid, beat_times, arc, 0.5)
+        local_loudness = _interp_feature(mid, beat_times, loudness, 0.5)
         local_impact = _interp_feature(start, beat_times, impact, 0.5)
         local_rhythm = _interp_feature(start, beat_times, rhythm, 0.5)
         local_novelty = _interp_feature(start, beat_times, novelty, 0.4)
@@ -641,6 +662,7 @@ def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray
             "rhythm": local_rhythm,
             "novelty": local_novelty,
             "arc": local_arc,
+            "loudness": local_loudness,
             "section": section,
             "section_type": section.get("type", "body") if section else "body",
             "target": target,
@@ -933,6 +955,7 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int,
         "audio_end": profile.get("end"),
         "wave": profile.get("wave"),
         "impact": profile.get("impact"),
+        "loudness": profile.get("loudness"),
     }
 
 
@@ -1092,6 +1115,7 @@ def _materialize_partner(candidate: Dict, profile: Dict) -> Dict:
         "source_duration": source_duration,
         "candidate_id": candidate.get("id"),
         "source_name": candidate.get("source_name"),
+        "loudness": profile.get("loudness"),
         "subject_anchor": _rebase_subject_anchor(candidate, start_time,
                                                  source_duration),
     }
