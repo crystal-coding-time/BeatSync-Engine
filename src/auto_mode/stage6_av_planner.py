@@ -108,7 +108,7 @@ class _FairShareEWMA:
         self._state[key] = (self.value(key, index) + amount, index)
 
 
-# --- Split-screen duo segments (see docs/DESIGN_split_screen.md) -------------
+# --- Split-screen duo segments ----------------------------------------------
 # A duo pairs the auction's primary clip with a partner clip from a different
 # cross-orientation source (portrait sources on a landscape canvas, or the
 # converse). The planner only ever ADDS a "partner" key: primary selection,

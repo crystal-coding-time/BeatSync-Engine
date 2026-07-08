@@ -1026,7 +1026,7 @@ def build_source_fit_chain(video_file: str, target_size: Tuple[int, int],
     return ",".join(sar_fix + [chain]) if sar_fix else chain
 
 
-# --- Split-screen duo panes (design doc: docs/DESIGN_split_screen.md) --------
+# --- Split-screen duo panes -----------------------------------------------
 
 def _pane_sizes(target_size: Tuple[int, int]):
     """((w0, h0), (w1, h1), 'hstack'|'vstack') pane geometry for a duo.
