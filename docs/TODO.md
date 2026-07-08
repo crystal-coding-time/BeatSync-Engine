@@ -1,93 +1,15 @@
-# Work tracker — waves 11+
+# Work tracker
 
-Working to-do document for the 2026-07-07 review/design cycle. Status key:
-⬜ pending · 🤖 agent dispatched · 🔧 integrating · ✅ landed (uncommitted) · 💾 committed · ⏸ awaiting owner decision
+All tracked work is complete. Waves 11-16 (2026-07-08) are committed and documented in
+`docs/ROADMAP.md`:
 
-Workflow reminder: agents work disjoint files → integration + docs sync (ROADMAP/README) →
-headless smoke test → restart `./run.sh` → **owner tests → commit only on his OK** → next wave.
+- Wave 11 - review-driven hardening + perf + GIF trailing-frame fix (f2fc6b3)
+- Wave 12 - semantic diversity (DINOv2 + windowed MMR) + proportional-fair variety (ed4177e)
+- Wave 13 - musical pacing features, loudness-scaled effects, interpolated slow-mo (5f6268a)
+- Wave 14 - music-structure understanding: all-in-one-mlx labels + demucs stems (1761969)
+- Wave 15 - crossfades, optimal LAP seating, motion smear, 1-frame-segment fix (f13b780)
+- Wave 16 - multi-song extended videos, any number of tracks (f13b780)
 
-## Wave 11 — verified review fixes 💾 (committed 2026-07-08)
-
-From the 2026-07-07 adversarially-verified pipeline review (13 confirmed/plausible findings + 1 latent hardening).
-
-| # | Task | File(s) | Sev | Status |
-|---|------|---------|-----|--------|
-| 11.1 | Qwen failure cached as `ai_enabled=True` — set from real success flag; also guard batch per-video merge (lines ~776–807) | `src/video_analysis.py` | High | 💾 |
-| 11.2 | Serial-retry in analysis loop has no try/except — one corrupt file discards the whole batch pre-cache | `src/video_analysis.py` | Med | 💾 |
-| 11.3 | 3 ffprobe spawns per source → single combined probe (duration+fps+resolution) local to video_analysis | `src/video_analysis.py` | Low | 💾 |
-| 11.4 | `get_cached_video_fps` caches probe failures (pins 30.0 for the run) — mirror duration-cache no-cache-on-failure | `src/ffmpeg_processing.py` | Med | 💾 |
-| 11.5 | Unknown duration → fictitious 10.0s (seek past EOF → frame-guard abort; early-content bias) — safe unknown-duration path | `src/ffmpeg_processing.py` | Low | 💾 |
-| 11.6 | Latent decel-ramp `sqrt(negative)` → NaN PTS: `sqrt(max(0,…))` hardening in `_retime_filters` (verified unreachable today; cheap landmine removal) | `src/ffmpeg_processing.py` | Hardening | 💾 |
-| 11.7 | ProRes mode transcodes ALL sources — convert only plan-referenced files (+ fallback pool from that subset) | `src/video_processor.py` | Med | 💾 |
-| 11.8 | `_fx_push_pull_zoom` missing one-zoompan guard (stacks with punch_zoom on rhythm segments in Custom/Shuffle) | `src/effects.py` | Med | 💾 |
-| 11.9 | Unconditional trailing `scale` on effect segments — only restore after dimension-shrinking filters (shake/whip_pan) | `src/effects.py` | Low | 💾 |
-| 11.10 | `_score_candidate` recomputed ~900k× in stage6 — memoize by (candidate id, target), byte-identical values | `src/auto_mode/stage6_av_planner.py` | Med | 💾 |
-| 11.11 | Loop-invariant `_safe_percentile(wave,45,…)` recomputed in section scan — hoist | `src/auto_mode/stage3_sections.py` | Med | 💾 |
-| 11.12 | Rhythm-band exception zero-fills silently — add ⚠️ log line | `src/auto_mode/stage2_features.py` | Med | 💾 |
-| 11.13 | Per-cut `np.argmin` beat re-mapping in ratio cap — `np.searchsorted` (identical picks) | `src/auto_mode/stage4_select.py` | Low | 💾 |
-| 11.14 | HPSS failure swallowed with no log line — add ⚠️ log line | `src/auto_mode/__init__.py` | Low | 💾 |
-| 11.15 | Integration: cross-file check, ROADMAP.md sync, headless smoke (determinism + frame guards), restart run.sh | (lead) | — | 💾 |
-| 11.16 | Owner-reported render failure (clip 133, 75/105 frames): GIF trailing display-duration gap — `tpad=stop_mode=clone` before `fps=` in the shared segment chain; pre-existing bug, reproduced + fixed against the real render | `src/ffmpeg_processing.py` | High | 💾 |
-
-## Wave 12 — semantic diversity + fair-share variety 💾 (committed 2026-07-08)
-
-Approach A (DINOv2 embeddings + windowed-MMR/cluster penalties) + Approach B (proportional-fair
-usage). Approach C (min-cost-flow seating) stays backlog. Contract: candidates gain optional
-`embedding` (384-d unit list, 4dp) + `visual_cluster` (int) keys; sidecar cache keeps existing
-analysis/Qwen caches valid (no ANALYSIS_VERSION bump).
-
-| # | Task | File(s) | Status |
-|---|------|---------|--------|
-| 12.1 | Embedding infra: DINOv2 ViT-S/14 ONNX (CPU, deterministic), sidecar per-video cache, online cosine clustering, fetch script, kill switches | `src/visual_embeddings.py`, `scripts/fetch_dinov2.py` (new) | 💾 |
-| 12.2 | Auction: windowed-MMR + cluster-run penalties (`semantic_variety`, 0 = byte-identical) + proportional-fair EWMA usage term for variety>0 (variety=0 stays exact legacy) | `src/auto_mode/stage6_av_planner.py` | 💾 |
-| 12.3 | Plumbing: Visual variety slider (Advanced), settings threading, embed annotation call before planning (graceful skip) | `src/gui.py`, `src/video_processor.py` | 💾 |
-| 12.4 | Integration: fetch model, cross-check, docs sync (ROADMAP + README), smoke (with + without model), restart | (lead) | 💾 |
-
-## Wave 13 — pacing + kinetic 💾 (committed 2026-07-08)
-
-Contract: features dict gains `onset_superflux` / `harmonic_change` / `loudness` (per-beat,
-normalized, zero-filled + ⚠️ on failure); planned clips gain optional `loudness` float;
-retime specs gain optional `interp` factor (deep slow-mo on 24–50fps sources only).
-
-| # | Task | File(s) | Status |
-|---|------|---------|--------|
-| 13.1 | SuperFlux onset + tonnetz harmonic-change + ebur128 momentary-loudness per-beat features; conservative cut-score integration (onset bonus everywhere, HCDF bonus in low-percussive sections) | `src/auto_mode/stage2_features.py`, `stage4_select.py`, `__init__.py` | 💾 |
-| 13.2 | Loudness → segment profiles → planned clips; `interp` retime spec (lifts ≥50fps gate for sub-0.6x) + inline `minterpolate` in the retime chain (+4-frame over-provision, tpad synergy) | `src/auto_mode/stage6_av_planner.py`, `src/ffmpeg_processing.py` | 💾 |
-| 13.3 | Loudness-scaled punch/flash amplitudes (byte-identical when key absent) | `src/effects.py` | 💾 |
-| 13.4 | Integration: cross-check (runway-window symmetry fix in create_clip_parallel), docs sync, smoke, restart | (lead) | 💾 |
-
-## Wave 14 — music-structure understanding 💾 (committed 2026-07-08)
-
-`all-in-one-mlx` functional section labels (chorus/verse/drop) + `demucs-mlx` stem signals,
-auto-enabled when installed, sidecar-cached (determinism by memoization), full heuristic
-fallback when unavailable (Windows/Intel/missing package → byte-identical to wave 13).
-
-| # | Task | File(s) | Status |
-|---|------|---------|--------|
-| 14.1 | Backend module: analyze_structure() + get_stem_signals() wrappers over all-in-one-mlx / demucs-mlx, sidecar caches, kill switch, dep install | `src/structure_stems.py` (new) | 💾 |
-| 14.2 | Pipeline integration: structure labels refine stage-3 sections; drum-stem onsets replace SuperFlux weight when available; vocal-presence cut penalty; bass-step drop confirmation; all gated on availability | `src/auto_mode/*` | 💾 |
-| 14.3 | Integration: cross-check, docs sync, smoke (with + without backend), restart | (lead) | 💾 |
-
-## Wave 15 — crossfades, optimal seating, motion smear 💾 (committed 2026-07-08)
-
-| # | Task | File(s) | Status |
-|---|------|---------|--------|
-| 15.1 | Opt-in xfade crossfades on calm boundaries: extend segment A by D frames, xfade(A_ext, B) replaces both in the concat list — total timeline frames invariant, frame guards pass | `src/gui.py`, `src/video_processor.py`, `src/ffmpeg_processing.py` | 💾 |
-| 15.2 | Coverage reservations seated via linear-sum assignment (scipy, no new dep) instead of greedy best-first; drop-exemption semantics preserved | `src/auto_mode/stage6_av_planner.py` | 💾 |
-| 15.3 | `motion_smear` effect primitive (tmix burst on drop cuts; split/trim/concat form — tmix+enable drops frames, gotcha documented) | `src/effects.py` | 💾 |
-| 15.4 | Integration: cross-check, docs sync, smokes (off-path, on-path, forced-fire eligibility), restart | (lead) | 💾 |
-| 15.5 | Pre-existing 1-frame-segment drift (planner 0.05s floor vs frame-locked timeline) — clip worker now takes the timeline as duration authority for non-retimed segments | `src/video_processor.py` | 💾 |
-
-## Wave 16 — multi-song extended videos 💾 (committed 2026-07-08)
-
-Multiple audio files → one extended video. Per-song stages 1–4 (own beat grid/sections/
-structure/stems/loudness; caches stay per-file), timelines merged with cumulative offsets
-(song joins = locked cut boundaries), ONE global stage-6 plan (coverage/variety/semantic
-diversity span the whole video), audio pre-concatenated sample-exactly, render side unchanged.
-V1 = clean hard joins; audio crossfade + loudness matching are follow-ups.
-
-| # | Task | File(s) | Status |
-|---|------|---------|--------|
-| 16.1 | `analyze_and_concat()`: per-song analysis, sample-exact audio concat (the timing authority), key-by-key beat_info merge, single-song passthrough | `src/multisong.py` (new) | 💾 |
-| 16.2 | Multi-file audio picker + session plumbing; single-song path byte-identical; create_music_video audio audit | `src/gui.py`, `src/video_processor.py` | 💾 |
-| 16.3 | Integration: cross-check, single-song + 3-song end-to-end smokes (frame guard 1110/1110, 48 kHz stereo mux, double-run identical), docs sync, restart | (lead) | 💾 |
+No open or planned work is tracked here. Workflow for future waves: tracker tasks -> parallel
+agents on disjoint files -> integration + docs sync -> headless smoke (double-run framemd5 +
+frame guards) -> restart ./run.sh -> owner tests -> commit on his OK.

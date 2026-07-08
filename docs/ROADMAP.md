@@ -109,7 +109,7 @@ Code-review fixes across the render pipeline; verified with repeat-run `framemd5
   `render_info['timeline_frames']` — the zero-drift constraint is now machine-checked on
   every render, both standard and ProRes paths
 
-## Phase 4 — transitions & polish 🚧
+## Phase 4 — transitions & polish ✅ (completed 2026-07-08)
 - ✅ Split transitions (2026-07-07): whip pans, glitch cuts and dip-to-black/white on
   planner-labeled boundaries (drop boundaries → whip/glitch, soft → dips; occasional and
   seeded). Implemented as *per-segment* out/in effect chains — the tail of segment A and the
