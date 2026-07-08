@@ -53,6 +53,8 @@ from ffmpeg_processing import (
     build_ken_burns_filter,
     count_video_frames,
     retime_source_window,
+    build_crossfade_chunk,
+    truncate_segment_to_frames,
 )
 from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_clip_plan
 from effects import build_effect_filters, _stable_rng
@@ -359,6 +361,10 @@ class ClipJob:
     fps: float
     planned_clip: Dict | None = None
     render_opts: Dict = field(default_factory=dict)
+    # Crossfade A side: render this many EXTRA tail frames so the boundary-chunk
+    # re-encode can dissolve into the next segment. 0 for every other segment
+    # (byte-identical to the pre-crossfade engine).
+    xfade_extend_frames: int = 0
 
 
 def create_clip_parallel(job: ClipJob):
@@ -375,6 +381,11 @@ def create_clip_parallel(job: ClipJob):
     target_size = job.target_size
     planned_clip = job.planned_clip
     render_opts = job.render_opts
+    # Crossfade A side: D extra tail frames to blend into the next segment.
+    # Effects/text/Ken Burns stay planned on the original source_duration; only
+    # the decoded window and -vframes grow (in extract_clip_segment_ffmpeg).
+    extend_frames = max(0, int(job.xfade_extend_frames or 0))
+    extend_secs = frame_count_to_seconds(extend_frames, job.fps) if extend_frames else 0.0
 
     try:
         # Sources shorter than the segment keep the full requested duration:
@@ -384,8 +395,21 @@ def create_clip_parallel(job: ClipJob):
         if planned_clip:
             video_file = planned_clip.get('video_file') or video_file
             video_duration = get_cached_video_duration(video_file)
-            source_duration = max(0.05, float(planned_clip.get('source_duration', final_duration)))
             retime = planned_clip.get('retime')
+            if retime:
+                # Retime windows keep the plan's value (gated >= 0.6s upstream,
+                # so the planner's 0.05s floor never actually engages here).
+                source_duration = max(0.05, float(planned_clip.get('source_duration', final_duration)))
+            else:
+                # The frame-locked timeline (job.final_duration) is the duration
+                # authority: the plan's source_duration carries the planner's
+                # 0.05s floor, which inflates a sub-floor segment (a 1-frame
+                # lead-in at 30fps, or 2 frames at 60fps) past its planned frame
+                # count — the extracted clip then holds one frame too many and
+                # the assembly guard aborts the render. For every segment the
+                # floor never touched, plan source_duration == final_duration by
+                # construction, so this is byte-identical.
+                source_duration = max(1.0 / max(job.fps, 1.0), float(final_duration))
             if retime:
                 # A retimed segment consumes source_window seconds of source;
                 # if the clamped window can't fit, strip the ramp instead of
@@ -402,8 +426,14 @@ def create_clip_parallel(job: ClipJob):
                     print(f"   ⚠️  Retime dropped for clip {i + 1}: source too short for the ramp window")
                     retime = None
             if not retime:
-                if video_duration >= source_duration:
-                    max_start = max(0.0, video_duration - source_duration)
+                # A crossfade A side decodes source_duration + D frames, so
+                # clamp the start against the larger window (keeps the tail
+                # inside the source when possible; loop/tpad guards cover the
+                # rest). extend_secs is 0 for every non-crossfade segment, so
+                # this is byte-identical off the crossfade path.
+                clamp_duration = source_duration + extend_secs
+                if video_duration >= clamp_duration:
+                    max_start = max(0.0, video_duration - clamp_duration)
                     clip_start = max(0.0, min(float(planned_clip.get('start_time', 0.0)), max_start))
                 else:
                     clip_start = 0.0
@@ -500,6 +530,7 @@ def create_clip_parallel(job: ClipJob):
             'retime': retime,
             'anchor': (planned_clip or {}).get('subject_anchor'),
             'partner': partner,
+            'extend_frames': extend_frames,
         }
         if opts.get('effect_style', 'clean') != 'clean':
             # Beat-reactive echo margins: the blur/hybrid background pulses
@@ -521,6 +552,131 @@ def create_clip_parallel(job: ClipJob):
         return (i, None, target_size, None, str(e), elapsed)
 
 
+# --- Opt-in crossfades on calm boundaries -----------------------------------
+# Targets whose boundaries are calm enough to dissolve rather than hard-cut.
+_XFADE_TARGETS = frozenset({'soft', 'flow'})
+# Roughly one in three eligible calm boundaries actually crossfades.
+_XFADE_PROBABILITY = 1.0 / 3.0
+# The dissolve length before clamping: 0.4s worth of frames.
+_XFADE_SECONDS = 0.4
+# A segment must be at least this long to lend a boundary to a crossfade.
+_XFADE_MIN_SEG_SECONDS = 1.0
+
+
+def _select_crossfade_boundaries(plan: List[Dict], segment_frames, fps: float) -> Dict[int, Dict]:
+    """Deterministically pick calm boundaries to crossfade.
+
+    Returns {i: {'frames': D, 'transition': name}} for each chosen boundary
+    between planned clips i and i+1. Rules:
+      * BOTH targets in {'soft','flow'};
+      * NEITHER clip carries a retime or partner, clip i has no
+        transition_out and clip i+1 no transition_in (never double up with a
+        split transition or a duo/retime);
+      * neither segment shorter than _XFADE_MIN_SEG_SECONDS;
+      * ~1 in 3 of the eligible boundaries fire, via a dedicated per-boundary
+        rng stream (_stable_rng('xfade', i, fileA, fileB)) — existing plans
+        and rng streams are untouched, so plans stay byte-identical;
+      * never two adjacent crossfades: a segment is in at most one, so chosen
+        boundary indices are always at least 2 apart.
+    D = round(_XFADE_SECONDS * fps), clamped to min(lenA, lenB)//3 frames.
+    """
+    if not plan or fps <= 0:
+        return {}
+    chosen: Dict[int, Dict] = {}
+    last_selected = -2
+    for i in range(len(plan) - 1):
+        a, b = plan[i], plan[i + 1]
+        if str(a.get('target', 'flow')) not in _XFADE_TARGETS:
+            continue
+        if str(b.get('target', 'flow')) not in _XFADE_TARGETS:
+            continue
+        if a.get('retime') or b.get('retime'):
+            continue
+        if a.get('partner') or b.get('partner'):
+            continue
+        if a.get('transition_out') or b.get('transition_in'):
+            continue
+        len_a = int(segment_frames[i])
+        len_b = int(segment_frames[i + 1])
+        if len_a / fps < _XFADE_MIN_SEG_SECONDS or len_b / fps < _XFADE_MIN_SEG_SECONDS:
+            continue
+        # Adjacency guard first, so a skipped-by-adjacency boundary leaves its
+        # own rng stream untouched (each boundary's stream is independent).
+        if i <= last_selected + 1:
+            continue
+        rng = _stable_rng('xfade', i, a.get('video_file'), b.get('video_file'))
+        if rng.random() >= _XFADE_PROBABILITY:
+            continue
+        d_frames = round(_XFADE_SECONDS * fps)
+        d_frames = min(d_frames, min(len_a, len_b) // 3)
+        if d_frames < 1:
+            continue
+        # Occasional wipes; fade is the common case. Same rng draw.
+        troll = rng.random()
+        if troll < 0.75:
+            transition = 'fade'
+        elif troll < 0.83:
+            transition = 'wipeleft'
+        elif troll < 0.91:
+            transition = 'wiperight'
+        else:
+            transition = 'smoothup'
+        chosen[i] = {'frames': int(d_frames), 'transition': transition}
+        last_selected = i
+    return chosen
+
+
+def _assemble_crossfade_chunks(clip_files: List[str], xfade_boundaries: Dict[int, Dict],
+                               segment_frames, fps: float, temp_dir: str,
+                               use_nvenc: bool, gpu_encoder: str) -> List[str]:
+    """Fold each chosen boundary's two segment files into one xfade chunk.
+
+    Returns the concat file list with every chosen (i, i+1) pair replaced by a
+    single combined chunk (len_a + len_b frames); untouched segments pass
+    through verbatim and still stream-copy. The chunk re-encode is the only
+    boundary-chunk re-encode the roadmap contract calls for. On a chunk
+    failure the extended A side is truncated back to its planned length so the
+    hard-cut fallback can't drift the timeline."""
+    assembly: List[str] = []
+    n = len(clip_files)
+    i = 0
+    made = 0
+    while i < n:
+        spec = xfade_boundaries.get(i)
+        if spec and i + 1 < n:
+            len_a = int(segment_frames[i])
+            len_b = int(segment_frames[i + 1])
+            d_frames = int(spec['frames'])
+            combined = os.path.join(temp_dir, f"xfade_chunk_{i:05d}_{uuid.uuid4().hex}.mp4")
+            ok = build_crossfade_chunk(
+                clip_files[i], clip_files[i + 1], combined, len_a, len_b,
+                d_frames, fps, spec['transition'], use_nvenc, gpu_encoder)
+            if ok:
+                assembly.append(combined)
+                made += 1
+                i += 2
+                continue
+            # Fallback: the A side holds len_a + D frames; trim it back to
+            # len_a so a plain hard cut keeps the timeline frame-exact.
+            print(f"   ⚠️  Crossfade chunk {i} failed; falling back to a hard cut")
+            trimmed = os.path.join(temp_dir, f"xfade_trim_{i:05d}_{uuid.uuid4().hex}.mp4")
+            if truncate_segment_to_frames(clip_files[i], trimmed, len_a, fps,
+                                          use_nvenc, gpu_encoder):
+                assembly.append(trimmed)
+            else:
+                raise RuntimeError(
+                    f"Crossfade boundary {i} failed and its extended segment could "
+                    f"not be trimmed back — refusing to deliver a drifted timeline."
+                )
+            i += 1
+            continue
+        assembly.append(clip_files[i])
+        i += 1
+    print(f"   🎞 Crossfades: {made} calm boundary/boundaries dissolved "
+          f"({len(clip_files)} segments → {len(assembly)} concat entries)")
+    return assembly
+
+
 def create_music_video(audio_file: str, video_files: VideoList, beat_times: BeatTimes,
                       output_file: str = 'output_music_video.mkv',
                       start_time: float = 0.0, end_time: float = None,
@@ -538,6 +694,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                       text_scale: float = 1.0, variety: float = 0.4,
                       speed_ramps: bool = False,
                       split_screen: bool = True,
+                      crossfades: bool = False,
                       settings: Dict = None) -> str:
     """
     Creates a music video with video clips cut to detected beats.
@@ -585,6 +742,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         variety = settings.get('variety', variety)
         speed_ramps = settings.get('speed_ramps', speed_ramps)
         split_screen = settings.get('split_screen', split_screen)
+        crossfades = settings.get('crossfades', crossfades)
 
     # Visual variety only travels via the settings dict (no positional kwarg
     # on this function) — read it alongside the other settings, defaulting to
@@ -1002,17 +1160,33 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         else:
             print(f"   Frame fit: {fit_mode}")
 
+        # Opt-in crossfades on calm boundaries (never in ProRes precise mode —
+        # this whole branch is the standard path). Selection is deterministic
+        # over the finished plan; the A side of each chosen boundary renders D
+        # extra tail frames, which the boundary-chunk re-encode dissolves into
+        # B during assembly. crossfades off (default) → xfade_boundaries empty
+        # → every ClipJob carries extend 0 and the assembly is untouched.
+        xfade_boundaries: Dict[int, Dict] = {}
+        if crossfades and planned_clip_sequence:
+            xfade_boundaries = _select_crossfade_boundaries(
+                planned_clip_sequence, segment_frames, fps)
+            if xfade_boundaries:
+                print(f"   🎞 Crossfades: {len(xfade_boundaries)} calm boundary/boundaries "
+                      f"selected to dissolve")
+
         clip_args = []
         for i, final_duration in enumerate(segment_durations):
             # Duration comes from the absolute frame-locked cut timeline.
             planned_clip = planned_clip_sequence[i] if planned_clip_sequence else None
             video_file = (planned_clip.get('video_file') if planned_clip
                           else _stable_rng('source_fallback', i).choice(video_files))
+            xfade_extend = int(xfade_boundaries.get(i, {}).get('frames', 0))
             clip_args.append(ClipJob(
                 index=i, video_file=video_file, final_duration=final_duration,
                 target_size=target_size, use_nvenc=use_nvenc, gpu_encoder=gpu_encoder,
                 temp_dir=session_temp_dir, fps=fps,
-                planned_clip=planned_clip, render_opts=render_opts))
+                planned_clip=planned_clip, render_opts=render_opts,
+                xfade_extend_frames=xfade_extend))
         
         clip_files = [None] * len(clip_args)
         clip_timings: List[float] = []
@@ -1068,15 +1242,25 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
 
         if not clip_files:
             raise ValueError('No valid video clips could be created')
- 
+
+        # Fold chosen calm boundaries into crossfade chunks (one boundary-chunk
+        # re-encode each; every other segment still stream-copies). The
+        # combined chunk holds len_a + len_b frames, so the concat list just
+        # has fewer, longer entries — the total-frames bound is unchanged.
+        assembly_files = clip_files
+        if xfade_boundaries:
+            assembly_files = _assemble_crossfade_chunks(
+                clip_files, xfade_boundaries, segment_frames, fps,
+                session_temp_dir, use_nvenc, gpu_encoder)
+
         print(f"\n{'='*60}")
-        print(f"🎬 FINAL ASSEMBLY: Concatenating {len(clip_files)} clips")
+        print(f"🎬 FINAL ASSEMBLY: Concatenating {len(assembly_files)} clips")
         print(f"{'='*60}\n")
-        
+
         # Concatenate all clips and add audio
         assembly_started = time.perf_counter()
         concatenate_videos_ffmpeg(
-            video_files=clip_files,
+            video_files=assembly_files,
             output_file=output_file,
             audio_file=audio_file,
             start_time=start_time,

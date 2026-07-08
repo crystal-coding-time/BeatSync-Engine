@@ -68,20 +68,26 @@ fallback when unavailable (Windows/Intel/missing package → byte-identical to w
 | 14.2 | Pipeline integration: structure labels refine stage-3 sections; drum-stem onsets replace SuperFlux weight when available; vocal-presence cut penalty; bass-step drop confirmation; all gated on availability | `src/auto_mode/*` | 💾 |
 | 14.3 | Integration: cross-check, docs sync, smoke (with + without backend), restart | (lead) | 💾 |
 
-## Wave 15 — crossfades, optimal seating, motion smear (in flight, owner "proceed" 2026-07-08)
+## Wave 15 — crossfades, optimal seating, motion smear 💾 (committed 2026-07-08)
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 15.1 | Opt-in xfade crossfades on calm boundaries: extend segment A by D frames, xfade(A_ext, B) replaces both in the concat list — total timeline frames invariant, frame guards pass | `src/gui.py`, `src/video_processor.py`, `src/ffmpeg_processing.py` | 🤖 Agent P |
-| 15.2 | Coverage reservations seated via linear-sum assignment (scipy, no new dep) instead of greedy best-first; drop-exemption semantics preserved | `src/auto_mode/stage6_av_planner.py` | 🤖 Agent Q |
-| 15.3 | `motion_smear` effect primitive (tmix burst on drop cuts, frame-count-safe) | `src/effects.py` | 🤖 Agent R |
-| 15.4 | Integration: cross-check, docs sync, smoke, restart | (lead) | ⬜ |
+| 15.1 | Opt-in xfade crossfades on calm boundaries: extend segment A by D frames, xfade(A_ext, B) replaces both in the concat list — total timeline frames invariant, frame guards pass | `src/gui.py`, `src/video_processor.py`, `src/ffmpeg_processing.py` | 💾 |
+| 15.2 | Coverage reservations seated via linear-sum assignment (scipy, no new dep) instead of greedy best-first; drop-exemption semantics preserved | `src/auto_mode/stage6_av_planner.py` | 💾 |
+| 15.3 | `motion_smear` effect primitive (tmix burst on drop cuts; split/trim/concat form — tmix+enable drops frames, gotcha documented) | `src/effects.py` | 💾 |
+| 15.4 | Integration: cross-check, docs sync, smokes (off-path, on-path, forced-fire eligibility), restart | (lead) | 💾 |
+| 15.5 | Pre-existing 1-frame-segment drift (planner 0.05s floor vs frame-locked timeline) — clip worker now takes the timeline as duration authority for non-retimed segments | `src/video_processor.py` | 💾 |
 
-## Wave 16 — multi-song extended videos (queued behind wave 15; owner-requested 2026-07-08)
+## Wave 16 — multi-song extended videos 💾 (committed 2026-07-08)
 
 Multiple audio files → one extended video. Per-song stages 1–4 (own beat grid/sections/
 structure/stems/loudness; caches stay per-file), timelines merged with cumulative offsets
 (song joins = locked cut boundaries), ONE global stage-6 plan (coverage/variety/semantic
 diversity span the whole video), audio pre-concatenated sample-exactly, render side unchanged.
-V1 = clean hard joins; audio crossfade + loudness matching are follow-ups. Starts after wave 15
-commits (file overlap with in-flight agents).
+V1 = clean hard joins; audio crossfade + loudness matching are follow-ups.
+
+| # | Task | File(s) | Status |
+|---|------|---------|--------|
+| 16.1 | `analyze_and_concat()`: per-song analysis, sample-exact audio concat (the timing authority), key-by-key beat_info merge, single-song passthrough | `src/multisong.py` (new) | 💾 |
+| 16.2 | Multi-file audio picker + session plumbing; single-song path byte-identical; create_music_video audio audit | `src/gui.py`, `src/video_processor.py` | 💾 |
+| 16.3 | Integration: cross-check, single-song + 3-song end-to-end smokes (frame guard 1110/1110, 48 kHz stereo mux, double-run identical), docs sync, restart | (lead) | 💾 |

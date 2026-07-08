@@ -345,6 +345,114 @@ def _fx_zoom_blur(ctx) -> None:
     ctx['pack'] += 1
 
 
+def _fx_motion_smear(ctx) -> None:
+    # 360-shutter motion smear: a short tmix burst right at the cut on
+    # drop/rhythm segments, reading as flow-style motion blur on fast
+    # footage. tmix mixes N successive frames at the SAME size (no crop, no
+    # resample) into a weighted average, so it never changes dimensions.
+    #
+    # GOTCHA (found by a real render during wave-15 verification, encoded
+    # here like this file's other ffmpeg landmines): tmix's `enable=`
+    # timeline support is NOT frame-count-safe. A plain
+    # `tmix=...:enable='between(t,0,W)'` glitches the output frame's pts
+    # right at the on/off boundary (confirmed via -fps_mode passthrough:
+    # the boundary frame's pts briefly jumps backward), and default
+    # cfr/vsync handling then silently DROPS (frames-2) frames to paper over
+    # it — e.g. frames=4 quietly loses 2 frames from a 60-frame segment.
+    # That's exactly the zero-drift violation the pipeline's frame guards
+    # (ROADMAP Phase 3.5) are designed to catch, so `enable=` is a non-starter
+    # here. Fix: never let one tmix instance toggle on/off — split the
+    # segment into two independent sub-streams at the window boundary
+    # (ffmpeg's `trim` resolves the cut to the nearest real frame, so the
+    # two pieces' frame counts always sum back to the original), tmix only
+    # the head piece (which runs across its whole, un-gated sub-stream — no
+    # toggle, no glitch), setpts-rebase both, then `concat` them back.
+    # Verified via real render (60in/60out @640x360, PSNR ~29dB inside the
+    # window vs ~44-46dB outside, matching the tail's pure-encode-noise
+    # floor) — see wave-15 notes.
+    #
+    # IMPORTANT: like dutch_tilt/punch_fill, this builder never touches
+    # ctx['rng'] — it draws only from its own 'fx_motionsmear' stable
+    # stream, so inserting it into the curated sequence cannot shift the
+    # historical styles' draws.
+    if ctx['pack'] >= ctx['pack_cap']:
+        return
+    if ctx['target'] not in ('drop', 'rhythm'):
+        return
+    if any('dblur=angle=90' in f for f in ctx['filters']):
+        # Mutual exclusion with zoom_blur (runs earlier in both sequences,
+        # see _PRIMITIVES order below): a tmix smear stacked on a
+        # directional dblur smear reads as mud, so whichever of the two
+        # fires first claims the segment's "smear" slot — same idiom as the
+        # one-zoompan guards (punch_fill/punch_zoom/push_pull_zoom) sniffing
+        # ctx['filters'] for an already-emitted filter rather than a flag.
+        return
+    # The trim/concat split needs a real "rest" tail after the burst window
+    # (max 0.4s) or the second branch would be empty/degenerate; skip on
+    # segments too short to know are safe, or too short outright (mirrors
+    # _transition_filters' duration<=0.3 guard). Unplanned fallback segments
+    # (no final_duration/source_duration) simply never fire this primitive.
+    duration = 0.0
+    try:
+        duration = float(ctx['clip'].get('final_duration') or ctx['clip'].get('source_duration') or 0.0)
+    except (TypeError, ValueError):
+        pass
+    if duration < 0.6:
+        return
+    seed_parts = ['fx_motionsmear', ctx['segment_index'], ctx['clip'].get('video_file', ''), ctx['style']]
+    if not ctx['curated']:
+        seed_parts.extend([ctx['mode'], ctx['palette_seed']])
+    smear_rng = _stable_rng(*seed_parts)
+    # Rare in curated mode (~1 in 6 eligible drop/rhythm segments, and only
+    # AMV/Hype ever reach the builders); boosted in custom/shuffle so a
+    # ticked palette entry actually shows up — same shape as dutch_tilt.
+    chance = (1.0 / 6.0) if ctx['curated'] else 0.5 * ctx['k']
+    if smear_rng.random() >= chance:
+        return
+    # frames=3-4, ascending weights. Verified empirically (scratch render:
+    # 4 solid-gray frames at luma 0/85/170/255 through
+    # tmix=frames=4:weights='1 2 3 4' produced luma 170, matching
+    # (1*0+2*85+3*170+4*255)/10 — NOT the reverse) that tmix's weight[i]
+    # lands on the i-th-OLDEST frame in the window, i.e. the last weight
+    # always lands on the live/current frame. So ascending weights ('1 2 3
+    # 4') put the heaviest multiplier on the CURRENT frame — the live image
+    # stays dominant while the trailing frames blend in underneath, which
+    # reads as a punchy directional smear. That's the opposite intent of
+    # this file's _fx_trails, which deliberately uses DESCENDING weights
+    # ('N..1') to weight the OLDEST frame heaviest for a lingering ghost
+    # trail on calm footage — flat weights ('1 1 1 1') would sit between the
+    # two, an evenly-blended mush that reads as neither a hit nor a trail.
+    # Hype gets the heavier 4-frame window (more smear on the harder style);
+    # AMV (and low-k custom/shuffle) gets a lighter 3-frame smear so the
+    # burst doesn't overwhelm calmer cuts.
+    frames = 4 if ctx['hype'] else 3
+    weights = ' '.join(str(w) for w in range(1, frames + 1))
+    # Burst window ~0.25-0.35s starting at the segment head (segments start
+    # at t=0 after setpts=PTS-STARTPTS, so t=0 is exactly the cut/beat), kept
+    # at least 0.1s clear of the segment tail so the "rest" branch is never
+    # empty. Loudness scales the window LENGTH, not the frame count or
+    # weights: changing `frames` would change which source frames are
+    # actually averaged (a structural change to the smear), where
+    # stretching the window is a pure duration knob — the same "how
+    # hard/how long" role _loudness_gain already plays for zoom/brightness
+    # amplitudes elsewhere in this file. _loudness_gain returns exactly 1.0
+    # when the segment carries no 'loudness' key (every plan before wave
+    # 13), so the window length is untouched for those; this is a brand-new
+    # primitive so there is no older motion_smear baseline to preserve
+    # either way.
+    window = max(0.20, min(0.4, (0.25 + 0.10 * ctx['k']) * _loudness_gain(ctx)))
+    window = min(window, duration - 0.1)
+    tag = f"ms{ctx['segment_index']}"
+    ctx['filters'].append(
+        f"split[{tag}a][{tag}b];"
+        f"[{tag}a]trim=start=0:end={window:.4f},setpts=PTS-STARTPTS,"
+        f"tmix=frames={frames}:weights='{weights}'[{tag}smear];"
+        f"[{tag}b]trim=start={window:.4f},setpts=PTS-STARTPTS[{tag}rest];"
+        f"[{tag}smear][{tag}rest]concat=n=2:v=1:a=0"
+    )
+    ctx['pack'] += 1
+
+
 def _fx_strobe(ctx) -> None:
     # Negative-flash strobe: two inverted frames out of every eight, and only
     # in the first 0.6s (hype drops with strong impacts in curated mode).
@@ -572,6 +680,7 @@ _PRIMITIVES = [
     ('chroma_shift', 'Chromatic aberration', _fx_chroma_shift),
     ('pixelize_burst', 'Pixelize burst (drop cuts)', _fx_pixelize_burst),
     ('zoom_blur', 'Zoom-blur smear (drop cuts)', _fx_zoom_blur),
+    ('motion_smear', 'Motion smear (flow-blur hits)', _fx_motion_smear),
     ('strobe', 'Negative strobe (hard drops)', _fx_strobe),
     ('trails', 'Motion trails (calm segments)', _fx_trails),
     ('hue_sweep', 'Hue sweep (builds)', _fx_hue_sweep),
@@ -585,15 +694,17 @@ _PRIMITIVES = [
 
 EFFECT_REGISTRY = {pid: {'label': label, 'builder': builder} for pid, label, builder in _PRIMITIVES}
 
-# The classic style pipeline, in its exact historical order. dutch_tilt and
-# punch_fill are later insertions, but each draws only from its own stable
-# rng (never ctx['rng']), so the historical draw order below is unchanged.
-# punch_fill must precede punch_zoom: it emits the segment's one zoompan and
-# punch_zoom's guard then yields to it.
+# The classic style pipeline, in its exact historical order. dutch_tilt,
+# punch_fill and motion_smear are later insertions, but each draws only from
+# its own stable rng (never ctx['rng']), so the historical draw order below
+# is unchanged. punch_fill must precede punch_zoom: it emits the segment's
+# one zoompan and punch_zoom's guard then yields to it. motion_smear must
+# follow zoom_blur: it sniffs ctx['filters'] for zoom_blur's dblur signature
+# and yields to it (see _fx_motion_smear's mutual-exclusion comment).
 _CURATED_SEQUENCE = (
     'punch_fill',
     'punch_zoom', 'dutch_tilt', 'shake', 'white_flash', 'sat_pulse', 'chroma_shift',
-    'pixelize_burst', 'zoom_blur', 'strobe', 'trails', 'hue_sweep',
+    'pixelize_burst', 'zoom_blur', 'motion_smear', 'strobe', 'trails', 'hue_sweep',
     'fisheye', 'posterize_flash', 'vignette_grain',
 )
 

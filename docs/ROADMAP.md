@@ -138,8 +138,8 @@ Code-review fixes across the render pipeline; verified with repeat-run `framemd5
   produced 59/60- and 23/60-frame segments). Ramps skip images, sub-24fps sources
   (0.5x floor needs ≥50fps), segments that would loop or spill their scene window, and
   ProRes precise mode
-- ⬜ Opt-in `xfade` crossfades/wipes on low-energy boundaries (requires boundary-chunk
-  re-encode assembly; hard cuts stay the fast default)
+- ✅ Opt-in `xfade` crossfades/wipes on calm boundaries (2026-07-08, wave 15 — see below);
+  hard cuts stay the fast default
 
 ## Phase 4.5 — 16:9 canvas + subject-aware reframe ✅ (2026-07-07)
 Redesign of aspect-ratio handling (owner feedback: one high-res portrait upload flipped the
@@ -213,6 +213,55 @@ the process inputs list order untouched by construction:
   filename, text position/size)
 - Frame fit is now Auto (the smart ladder) / Blurred background / Letterbox; `'stretch'`
   survives for headless/settings callers only
+
+## Wave 16 — multi-song extended videos ✅ (2026-07-08)
+Drop in any number of songs → one extended video (owner-requested):
+- **Per-song musical brains, one global visual plan**: stages 1–4 (beat grid, sections,
+  structure/stems, loudness, cut selection) run per song exactly as solo — all per-song
+  caches keep working — then `src/multisong.py` merges everything with cumulative offsets
+  (every beat_info consumer traced key-by-key; optional keys like stems zero-fill songs that
+  lack them). Each song join is a locked cut boundary. Stage 6 plans ONCE over the merged
+  timeline, so coverage / fair-share variety / semantic diversity span the whole video
+- **The concat audio is the timing authority**: songs are decoded once to 44.1 kHz stereo
+  PCM_24 and concatenated sample-exactly; all merged timestamps derive from that decode's sample
+  counts, so the muxed soundtrack and the cut timeline cannot disagree (verified: the audible
+  join sits at exactly the merged offset; concat byte-deterministic — a libsndfile PEAK-chunk
+  wall-clock timestamp was caught and avoided via PCM)
+- **GUI**: the audio input is a multi-file dropzone with an ordered, removable song list
+  ("Songs play in this order") — no count limit. One song = byte-identical legacy behavior
+  (proved by framemd5 vs pre-wave gui). Shuffle's filename-derived seed uses the first song
+- Verified: 3-song full render — joins at 0/15/27 s, frame guard exact (1110 = 37 s × 30),
+  48 kHz stereo output audio, double-run framemd5 identical
+- V1 joins are clean hard cuts on the next song's first boundary; audio crossfading between
+  songs and loudness matching at joins are natural follow-ups on the same architecture
+
+## Wave 15 — crossfades, optimal seating, motion smear ✅ (2026-07-08)
+- **Opt-in crossfades on calm boundaries** ("Crossfade calm cuts" checkbox, Advanced, default
+  OFF → byte-identical behavior): between consecutive soft/flow segments (no retime/duo/split
+  transition on the boundary, both ≥1 s), ~1 in 3 fire via a dedicated rng stream. The A side
+  renders D≈0.4 s extra tail frames (effects/text still planned on the original window); one
+  boundary-chunk re-encode `xfade`s A_ext into B producing exactly lenA+lenB frames and
+  replaces both entries in the concat list — total timeline frames invariant, everything else
+  still stream-copies. Mostly fades, occasional seeded wipes. Never adjacent, never in ProRes.
+  Chunk encode reuses the segment encoder args so concat stays valid; a chunk failure degrades
+  to the hard cut (truncate fallback)
+- **Coverage seating is now globally optimal** (`scipy.optimize.linear_sum_assignment`, no new
+  dependency): replaces greedy best-seat-first in `_plan_coverage_reservations`, constrained to
+  never seat fewer sources than greedy would — provably ≥ greedy on BOTH coverage and total
+  seat score (200-scenario verification: never worse, strictly better score in ~half).
+  Drop-exemption tiering, per-seat candidate tie-breaks, and determinism (input-order-
+  independent via sorted rows + quantized epsilon tie-breaking) preserved. variety>0 plans
+  change (deliberate); variety=0 exact legacy
+- **`motion_smear` effect primitive**: a punchy `tmix` smear burst (~0.25–0.4 s, loudness-
+  scaled) at the head of drop/rhythm cuts, AMV/Hype ~1 in 6 via a dedicated rng stream;
+  mutually exclusive with zoom_blur. Encodes a real ffmpeg gotcha: `tmix` toggled with
+  `enable=` silently drops frames-2 frames at the boundary — implemented as
+  split/trim/tmix/concat (the mirror-chain idiom) instead, verified frame-exact
+- **1-frame-segment fix** (pre-existing, surfaced by wave-15 testing): the planner's 0.05 s
+  duration floor inflated sub-floor segments (a 1-frame lead-in at 30 fps, 2 frames at 60 fps)
+  past their planned frame count, aborting the render on the assembly guard. The clip worker
+  now takes the frame-locked timeline as the duration authority for non-retimed segments
+  (byte-identical wherever the floor never engaged; verified 1-frame extraction)
 
 ## Wave 14 — music-structure understanding ✅ (2026-07-08)
 Real section labels + stem-derived signals via the MLX ports of All-In-One and Demucs

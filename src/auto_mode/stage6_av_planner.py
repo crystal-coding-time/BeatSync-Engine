@@ -457,15 +457,85 @@ def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
 def _plan_coverage_reservations(candidates: Sequence[Dict],
                                 profiles: Sequence[Dict],
                                 score_cache: "_ScoreCache | None" = None) -> Dict[int, Dict]:
-    """Reserve one segment per source: its best (candidate, segment) pairing.
+    """Reserve one segment per source: a globally optimal (source, segment) seating.
 
-    Deterministic: sources are seated in descending best-seat-score order,
-    each taking its highest-scoring free segment. Drop segments are exempt
-    when the seated pick would fall clearly below what the auction would put
-    there — coverage should cost the flow/soft filler slots, not the money
-    shots. The short-candidate duration penalty stays in force, which
-    naturally steers short sources (GIFs, stills) onto short segments.
+    Solves a single rectangular linear assignment problem
+    (``scipy.optimize.linear_sum_assignment``) that maximizes the total
+    seat score over all sources at once, instead of the pre-wave-15 greedy
+    that seated sources one at a time in best-seat order. Greedy could hand a
+    high-priority source a seat that a later source needed as its *only* good
+    seat, forcing that later source onto a terrible seat (or off the video);
+    the global solve avoids those dead ends, so it seats at least as many
+    sources as greedy and at no worse total score, in every case.
+
+    PLAN STABILITY (wave-15 change, deliberate — same precedent as the wave-12
+    proportional-fair redesign): variety>0 plans CHANGE, because reservation
+    seating is now globally optimal rather than greedy. variety=0 never calls
+    this function (no reservations), so the legacy quality auction stays
+    byte-for-byte identical.
+
+    Preserved semantics vs. greedy:
+      * The per-(source, segment) seat score is identical, including the
+        short-candidate duration penalty (-0.18 when the candidate is shorter
+        than 0.55x the segment) that steers short sources (GIFs, stills) onto
+        short segments.
+      * The drop-exemption tier is preserved: on a 'drop' segment a candidate
+        scoring below ``best_raw[j] - 0.35`` is "exempt" — coverage should
+        spend the flow/soft filler slots, not the money-shot drops. Exempt
+        seats are shifted strictly below every primary (non-exempt) seat, so
+        the solver only ever seats a source on an exempt drop when it has no
+        primary seat available.
+      * Per (source, segment) the reserved candidate is that source's
+        best-scoring candidate for the segment under the exact greedy
+        tie-break ``key = (-score, j, str(id))``. The LAP decides *which*
+        segment each source gets; the candidate for a given seat is unchanged.
+
+    WHY A COVERAGE FLOOR (and how both guarantees hold at once). Pure
+    score-maximization would leave a marginal source unseated whenever seating
+    it lowers the total — but greedy always seats a source that has a free
+    seat, so pure score-max can DROP coverage below greedy. Pure
+    coverage-maximization (seat as many as possible) can instead force a
+    lower-scoring layout than greedy. Neither dominates greedy on both axes.
+    The fix: run greedy's exact seating once to learn its coverage ``cov_g``,
+    then solve ``maximize total seat score subject to seating at least cov_g
+    sources``. Greedy's own matching is feasible for that program, so the LAP
+    optimum is >= greedy on score AND >= cov_g on coverage — both required
+    parities hold by construction, in every scenario.
+
+    The cardinality floor is encoded structurally, not as a penalty: the cost
+    matrix gets exactly ``n_src - cov_g`` shared "unseated" columns (cost 0,
+    any source may take one). With only that many escape hatches, at most
+    ``n_src - cov_g`` sources can sit out, so at least ``cov_g`` land on real
+    segments. Sources whose real seats beat 0 still fill in freely, so
+    coverage floats up to the score-max level when that exceeds ``cov_g``. A
+    source with NO option at all (neither tier) has only forbidden real cells,
+    so it takes one of the unseated columns — no reservation, exactly like
+    greedy. With more sources than segments, ``cov_g`` == segment count and
+    the LAP fills every segment with the globally best-fitting sources while
+    the rest sit out — the same coverage target greedy reached seat-by-seat.
+
+    TIER SHIFT. Primary seats keep their real score. Exempt seats are shifted
+    down by ``SHIFT = (Pmax - Pmin) + (Emax - Emin) + 1`` — one unit past the
+    combined span of both tiers' scores, so ``Emax - SHIFT < Pmin`` and every
+    exempt seat is strictly below every primary seat no matter the data (no
+    hardcoded magic number: the shift is derived from the actual ranges and
+    can't be crossed). The shift is a single constant, so it preserves the
+    real spacing *within* the exempt tier; seating a source on an exempt drop
+    only happens when it has no primary seat, and the coverage floor still
+    forces it in when greedy seated it there.
+
+    DETERMINISM. The cost matrix is built in ``sorted(by_source)`` row order,
+    and each (source, segment) seat aggregates its candidates with the exact
+    ``(-score, j, str(id))`` tie-break — so the matrix is a pure function of
+    the candidate *content*, independent of the input list's order. Seat
+    values are quantized to a 1e-9 grid, and a per-cell epsilon derived from
+    (row rank, segment index) and scaled strictly below that grid is added, so
+    genuine >1e-9 score gaps can never be flipped by the tie-break while exact
+    ties resolve deterministically toward the lower segment index (matching
+    greedy's ``j`` tie-break) — identical across platforms and input orders.
     """
+    from scipy.optimize import linear_sum_assignment
+
     by_source: Dict[str, List[Dict]] = {}
     for c in candidates:
         by_source.setdefault(str(c.get("video_file")), []).append(c)
@@ -473,14 +543,26 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
     _score = score_cache.score if score_cache is not None else _score_candidate
 
     # Auction-best approximation per segment (raw scores, no deque state),
-    # used only for the drop exemption threshold.
+    # used only for the drop exemption threshold. Order-independent (max).
     best_raw = [max(_score(c, p) for c in candidates) for p in profiles]
 
-    options_by_source: Dict[str, List] = {}
-    fallback_by_source: Dict[str, List] = {}
-    for src in sorted(by_source):
-        opts = []
-        exempted = []
+    sources = sorted(by_source)              # deterministic row order
+    n_src = len(sources)
+    n_seg = len(profiles)
+
+    # Per (row r, segment j) keep the single best candidate in each tier under
+    # the exact greedy tie-break key (-score, j, str(id)); j is constant within
+    # a cell, so this reduces to "highest score, then lowest str(id)".
+    prim_cell: Dict[tuple, tuple] = {}       # (r, j) -> (score, candidate)
+    exempt_cell: Dict[tuple, tuple] = {}     # (r, j) -> (score, candidate)
+
+    def _better(new_score: float, new_c: Dict, cur: "tuple | None") -> bool:
+        if cur is None:
+            return True
+        # (-score, str(id)) ascending == greedy's opts.sort winner.
+        return (-new_score, str(new_c.get("id"))) < (-cur[0], str(cur[1].get("id")))
+
+    for r, src in enumerate(sources):
         for c in by_source[src]:
             for j, p in enumerate(profiles):
                 score = _score(c, p)
@@ -488,34 +570,96 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
                 cand_duration = max(0.05, float(c.get("duration", required)))
                 if cand_duration < required * 0.55:
                     score -= 0.18
+                key = (r, j)
                 if p.get("target") == "drop" and score < best_raw[j] - 0.35:
-                    exempted.append((score, j, c))
+                    if _better(score, c, exempt_cell.get(key)):
+                        exempt_cell[key] = (score, c)
                     continue
-                opts.append((score, j, c))
-        key = lambda t: (-t[0], t[1], str(t[2].get("id")))
-        opts.sort(key=key)
-        exempted.sort(key=key)
-        if opts or exempted:
-            options_by_source[src] = opts
-            fallback_by_source[src] = exempted
+                if _better(score, c, prim_cell.get(key)):
+                    prim_cell[key] = (score, c)
 
-    order = sorted(options_by_source.items(),
-                   key=lambda kv: (-(kv[1][0][0] if kv[1]
-                                     else fallback_by_source[kv[0]][0][0]), kv[0]))
-    reserved: Dict[int, Dict] = {}
-    taken: set = set()
-    for src, opts in order:
-        seat = next(((j, c) for score, j, c in opts if j not in taken), None)
+    if not prim_cell and not exempt_cell:
+        return {}
+
+    # --- Coverage floor: greedy's exact cardinality (pre-wave-15 seating). ---
+    # Reproduces HEAD's greedy on the aggregated per-(source,segment) cells:
+    # sources in descending best-seat order, each taking its highest-scoring
+    # free primary seat, else its highest-scoring free exempt seat. We only
+    # need the resulting COUNT to floor the LAP at, but computing it exactly
+    # keeps the parity guarantee tight.
+    prim_by_src: Dict[int, list] = {}
+    exempt_by_src: Dict[int, list] = {}
+    for (r, j), (score, _c) in prim_cell.items():
+        prim_by_src.setdefault(r, []).append((score, j))
+    for (r, j), (score, _c) in exempt_cell.items():
+        exempt_by_src.setdefault(r, []).append((score, j))
+    for d in (prim_by_src, exempt_by_src):
+        for lst in d.values():
+            lst.sort(key=lambda t: (-t[0], t[1]))   # (-score, j)
+    rows_with_opts = sorted(set(prim_by_src) | set(exempt_by_src))
+    g_order = sorted(
+        rows_with_opts,
+        key=lambda r: (-(prim_by_src[r][0][0] if prim_by_src.get(r)
+                         else exempt_by_src[r][0][0]), sources[r]))
+    g_taken: set = set()
+    cov_g = 0
+    for r in g_order:
+        seat = next((j for _s, j in prim_by_src.get(r, []) if j not in g_taken), None)
         if seat is None:
-            # Every non-drop-worthy seat is taken (or this source only fits
-            # drops): coverage still wins — fall back onto an exempted drop
-            # segment rather than dropping the source from the video.
-            seat = next(((j, c) for score, j, c in fallback_by_source[src]
-                         if j not in taken), None)
+            seat = next((j for _s, j in exempt_by_src.get(r, []) if j not in g_taken),
+                        None)
         if seat is not None:
-            j, cand = seat
-            reserved[j] = cand
-            taken.add(j)
+            g_taken.add(seat)
+            cov_g += 1
+
+    # --- Tier shift: exempt strictly below primary, from actual ranges. ---
+    prim_scores = [v[0] for v in prim_cell.values()]
+    exempt_scores = [v[0] for v in exempt_cell.values()]
+    if prim_scores and exempt_scores:
+        p_span = max(prim_scores) - min(prim_scores)
+        e_span = max(exempt_scores) - min(exempt_scores)
+        shift = p_span + e_span + 1.0        # Emax - shift < Pmin, guaranteed
+    else:
+        shift = 0.0
+
+    # --- Cost matrix: rows = sources, cols = [segments | (n_src-cov_g) dummies].
+    # Minimizing cost == maximizing value. Shared dummy cols (cost 0) cap the
+    # number of unseated sources at n_src - cov_g -> at least cov_g get seated.
+    BIG = 1.0e6
+    n_dummy = n_src - cov_g
+    n_cols = n_seg + n_dummy
+    cost = np.full((n_src, n_cols), BIG, dtype=float)
+    for col in range(n_seg, n_cols):
+        cost[:, col] = 0.0                   # any source may sit out here
+
+    GRID = 1.0e-9
+    # Total epsilon across the matrix must stay strictly under one grid step so
+    # it can only order exact ties, never flip a genuine >1e-9 score gap.
+    eps_unit = GRID / (16.0 * (n_src * max(n_cols, 1) + 1))
+
+    def _fill(cell: Dict[tuple, tuple], delta: float) -> None:
+        for (r, j), (score, _c) in cell.items():
+            v = score - delta
+            qv = round(v / GRID) * GRID
+            # +eps increasing in (r, j): lower segment index is cheaper, so
+            # exact ties resolve toward the lower j (greedy's tie-break).
+            cost[r, j] = -qv + (r * n_cols + j) * eps_unit
+
+    # Primary first (real value); exempt only where no primary holds the cell,
+    # so a drop seat above threshold counts as primary exactly as today.
+    _fill(prim_cell, 0.0)
+    _fill({k: v for k, v in exempt_cell.items() if k not in prim_cell}, shift)
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+
+    reserved: Dict[int, Dict] = {}
+    for r, col in zip(row_ind.tolist(), col_ind.tolist()):
+        if col >= n_seg:
+            continue                         # dummy column -> source unseated
+        j = col
+        seat = prim_cell.get((r, j)) or exempt_cell.get((r, j))
+        if seat is not None:                 # skip forbidden cells (no option)
+            reserved[j] = seat[1]
     return reserved
 
 

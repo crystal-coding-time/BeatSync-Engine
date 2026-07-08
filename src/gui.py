@@ -395,7 +395,7 @@ def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
     return [path for path in (_as_existing_source_path(p) for p in file_paths) if path]
 
 
-def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
+def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
                        custom_fps: float, session_state: dict,
                        fit_mode: str = 'crop',
@@ -410,6 +410,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        semantic_variety: float = 0.4,
                        speed_ramps: bool = False,
                        split_screen: bool = True,
+                       crossfades: bool = False,
                        text_entries: str = '', text_position: str = 'bottom',
                        text_scale: float = 1.0,
                        settings: dict | None = None,
@@ -432,32 +433,48 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             semantic_variety = settings.get('semantic_variety', semantic_variety)
             speed_ramps = settings.get('speed_ramps', speed_ramps)
             split_screen = settings.get('split_screen', split_screen)
+            crossfades = settings.get('crossfades', crossfades)
             text_entries = settings.get('text_entries', text_entries)
             text_position = settings.get('text_position', text_position)
             text_scale = settings.get('text_scale', text_scale)
         parallel_workers = PARALLEL_WORKERS
 
         # Initialize session state if needed
-        if 'original_audio_path' not in session_state:
-            session_state['original_audio_path'] = None
+        if 'original_audio_paths' not in session_state:
+            session_state['original_audio_paths'] = None
             session_state['original_video_paths'] = []
         if 'session_dir' not in session_state or not os.path.isdir(session_state['session_dir']):
             session_state['session_dir'] = tempfile.mkdtemp(prefix='beatsync_', dir=GRADIO_TEMP_DIR)
         session_dir = session_state['session_dir']
 
-        # Handle audio by referencing the selected file path directly.
-        if audio_file:
-            if audio_file != session_state.get('original_audio_path'):
-                local_audio_path = _as_existing_source_path(audio_file)
-                if local_audio_path:
-                    session_state['local_audio_path'] = local_audio_path
-                    session_state['original_audio_path'] = audio_file
-                else:
-                    return None, '❌ Error: Could not access audio file', session_state
-            else:
-                local_audio_path = session_state.get('local_audio_path')
-        else:
+        # Audio may now be one song or several, ordered. Normalize to a
+        # deduped, order-preserving list of selections. A single-song
+        # selection (len == 1) flows through exactly as before: the cache
+        # value and every downstream value stay byte-identical to the old
+        # single-path behavior.
+        if isinstance(audio_files, (str, bytes)):
+            audio_files = [audio_files] if audio_files else []
+        audio_selection: list[str] = []
+        _seen_audio: set = set()
+        for _a in (audio_files or []):
+            if _a and _a not in _seen_audio:
+                _seen_audio.add(_a)
+                audio_selection.append(_a)
+        if not audio_selection:
             return None, '❌ Error: No audio file selected', session_state
+
+        # Reference the selected file paths directly; the cache key is now the
+        # ordered list. _as_existing_source_paths drops anything unreadable, so
+        # a length mismatch means at least one selected file is gone.
+        if audio_selection != session_state.get('original_audio_paths'):
+            local_audio_paths = _as_existing_source_paths(audio_selection)
+            if local_audio_paths and len(local_audio_paths) == len(audio_selection):
+                session_state['local_audio_paths'] = local_audio_paths
+                session_state['original_audio_paths'] = audio_selection
+            else:
+                return None, '❌ Error: Could not access audio file', session_state
+        else:
+            local_audio_paths = session_state.get('local_audio_paths')
 
         # Handle videos by referencing selected file paths directly.
         if video_files:
@@ -474,7 +491,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             return None, '❌ Error: No video files selected', session_state
 
         # Verify files exist
-        if not local_audio_path or not os.path.exists(local_audio_path):
+        if not local_audio_paths or not all(p and os.path.exists(p) for p in local_audio_paths):
              return None, f"❌ Error: Audio file is missing or inaccessible.", session_state
         if not local_video_paths or not all(p and os.path.exists(p) for p in local_video_paths):
              return None, f"❌ Error: Video files are missing or inaccessible.", session_state
@@ -521,13 +538,51 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         output_path = os.path.join(output_folder, filename)
         temp_output = os.path.join(session_dir, filename)
 
-        selected_beats, beat_info = analyze_beats_auto(
-            local_audio_path,
-            use_gpu=use_gpu,
-            video_files=local_video_paths,
-            progress_callback=progress_callback,
-            console_callback=lambda stage, message: console_logger.stage_line(stage, message) if console_logger else None,
-        )
+        _audio_console_cb = (lambda stage, message:
+                             console_logger.stage_line(stage, message) if console_logger else None)
+        if len(local_audio_paths) == 1:
+            # Single song: byte-identical to the pre-multisong path.
+            local_audio_path = local_audio_paths[0]
+            selected_beats, beat_info = analyze_beats_auto(
+                local_audio_path,
+                use_gpu=use_gpu,
+                video_files=local_video_paths,
+                progress_callback=progress_callback,
+                console_callback=_audio_console_cb,
+            )
+        else:
+            # Multi-song: concatenate the ordered tracks into one continuous
+            # wav and analyze the whole timeline. Lazy import keeps the
+            # single-song path free of any dependency on the module; a missing
+            # module raises a clear, user-facing error only here, where more
+            # than one song was actually requested. The returned trio maps 1:1
+            # onto the single-song values: (concat wav, cut beats, beat_info).
+            try:
+                import multisong
+            except ImportError:
+                return (None,
+                        '❌ Error: Multiple songs selected, but the multi-song '
+                        'module (src/multisong.py) is unavailable. Select a '
+                        'single song, or install/enable multi-song support.',
+                        session_state)
+            # work_dir is the per-session temp dir, NOT the processing dir:
+            # create_music_video clears the processing dir at render start,
+            # which would delete the concat wav before the audio mux reads it.
+            # session_dir lives under GRADIO_TEMP_DIR and is cleaned on app
+            # startup, so the concat wav has the right lifecycle.
+            local_audio_path, selected_beats, beat_info = multisong.analyze_and_concat(
+                local_audio_paths,
+                session_dir,
+                video_files=local_video_paths,
+                use_gpu=use_gpu,
+                enable_qwen_semantics=True,
+                qwen_model_path=None,
+                progress_callback=progress_callback,
+                console_callback=_audio_console_cb,
+            )
+            _total_audio = float(beat_info.get('audio_duration') or 0.0)
+            print(f"🎶 Multi-song: {len(local_audio_paths)} tracks → total "
+                  f"{int(_total_audio) // 60}:{int(_total_audio) % 60:02d}")
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
 
@@ -536,8 +591,14 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 
         # Resolve the effect palette once per render; the recipe line makes a
         # look reproducible (it lands in the render log via redirected stdout).
+        # The Shuffle effect seed derives from the song filename when the seed
+        # is 0. For multi-song it derives from the FIRST song (deterministic —
+        # the concat wav's name is not stable across runs, whereas the first
+        # song is); the derivation itself is unchanged. local_audio_paths[0]
+        # equals local_audio_path in the single-song case, so single-song
+        # renders are byte-identical.
         palette_ids, resolved_seed, recipe_line = resolve_effect_palette(
-            effect_mode, effect_palette, effect_seed, local_audio_path)
+            effect_mode, effect_palette, effect_seed, local_audio_paths[0])
         if effect_style and effect_style != 'clean':
             print(f"   🎛 {recipe_line}")
 
@@ -557,6 +618,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             'semantic_variety': semantic_variety,
             'speed_ramps': bool(speed_ramps),
             'split_screen': bool(split_screen),
+            'crossfades': bool(crossfades),
             'text_entries': [line.strip() for line in (text_entries or '').splitlines() if line.strip()],
             'text_position': text_position,
             'text_scale': text_scale,
@@ -637,14 +699,14 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         return None, error_msg, session_state
 
 
-def process_video(audio_file: str, video_files: VideoFilesInput,
+def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
                  custom_fps: float, fit_mode: str, output_format: str,
                  effect_style: str,
                  effect_intensity: float, effect_mode: str,
                  effect_palette: List[str], effect_seed: float,
                  look_cube: str, variety: float, semantic_variety: float, speed_ramps: bool,
-                 split_screen: bool,
+                 split_screen: bool, crossfades: bool,
                  text_entries: str, text_position: str,
                  text_scale: float, session_state: dict) -> Iterator[StatusResult]:
     status_queue: queue.Queue[str | None] = queue.Queue()
@@ -668,6 +730,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
         'semantic_variety': semantic_variety,
         'speed_ramps': bool(speed_ramps),
         'split_screen': bool(split_screen),
+        'crossfades': bool(crossfades),
         'text_entries': text_entries,
         'text_position': text_position,
         'text_scale': text_scale,
@@ -683,7 +746,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
         try:
             with contextlib.redirect_stdout(render_console), contextlib.redirect_stderr(render_console):
                 result = _process_video_impl(
-                    audio_file=audio_file,
+                    audio_files=audio_files,
                     video_files=video_files,
                     output_filename=output_filename,
                     processing_mode=processing_mode,
@@ -781,7 +844,58 @@ def create_ui() -> gr.Blocks:
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown('### 📁 Input Files')
-                audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=[t for ext in ['.mp3', '.wav', '.flac'] for t in (ext, ext.upper())], type='filepath', elem_id='audio-file-input')
+                # Multi-song: the audio input mirrors the video dropzone
+                # pattern below (accumulating gr.State + list; see the
+                # gradio#10325 note there). Order matters — songs play in the
+                # order they were added, so the list is numbered and removal
+                # keeps the remaining order intact.
+                audio_dropzone = gr.File(label=LABEL_AUDIO_FILE, file_count='multiple', file_types=[t for ext in ['.mp3', '.wav', '.flac'] for t in (ext, ext.upper())], type='filepath', elem_id='audio-file-input', height=110)
+                audio_state = gr.State([])
+                audio_list = gr.CheckboxGroup(choices=[], value=[], label='🎵 Loaded songs (0)', info='Songs play in this order. Tick files to remove them', visible=False)
+                with gr.Row():
+                    remove_audio_btn = gr.Button('🗑 Remove selected', size='sm', visible=False)
+                    clear_audio_btn = gr.Button('♻️ Clear all', size='sm', visible=False)
+
+                def _audio_list_updates(files):
+                    shown = len(files) > 0
+                    return (
+                        gr.update(choices=[(f"{n + 1}. {os.path.basename(f)}", f) for n, f in enumerate(files)],
+                                  value=[], label=f'🎵 Loaded songs ({len(files)})', visible=shown),
+                        gr.update(visible=shown),
+                        gr.update(visible=shown),
+                    )
+
+                def _add_audio(new_files, files):
+                    files = list(files or [])
+                    for f in (new_files or []):
+                        if f not in files:
+                            files.append(f)
+                    return (files, None, *_audio_list_updates(files))
+
+                def _remove_audio(selected, files):
+                    selected = set(selected or [])
+                    files = [f for f in (files or []) if f not in selected]
+                    return (files, *_audio_list_updates(files))
+
+                def _clear_audio():
+                    return ([], *_audio_list_updates([]))
+
+                audio_dropzone.upload(
+                    _add_audio,
+                    inputs=[audio_dropzone, audio_state],
+                    outputs=[audio_state, audio_dropzone, audio_list, remove_audio_btn, clear_audio_btn],
+                )
+                remove_audio_btn.click(
+                    _remove_audio,
+                    inputs=[audio_list, audio_state],
+                    outputs=[audio_state, audio_list, remove_audio_btn, clear_audio_btn],
+                )
+                clear_audio_btn.click(
+                    _clear_audio,
+                    inputs=None,
+                    outputs=[audio_state, audio_list, remove_audio_btn, clear_audio_btn],
+                )
+
                 # Include uppercase variants: Gradio's drag-drop filter is case-sensitive
                 # (gradio#10746), unlike its file picker.
                 # Still images ride along with the video pipeline (Ken Burns
@@ -907,6 +1021,9 @@ def create_ui() -> gr.Blocks:
                     split_screen_input = gr.Checkbox(
                         value=True, label='Pair vertical clips (split screen)',
                         info='Renders some high-energy segments as two vertical clips side by side. Needs two or more vertical sources; fires on hard cuts only. H.264/HEVC modes only.')
+                    crossfades_input = gr.Checkbox(
+                        value=False, label='Crossfade calm cuts',
+                        info='Dissolves ~1 in 3 calm (soft/flow) boundaries instead of hard-cutting. Re-encodes those boundary chunks; hard cuts stay the fast default. H.264/HEVC modes only.')
 
                     gr.Markdown('**Framing**')
                     fit_mode_input = gr.Radio(
@@ -948,13 +1065,13 @@ def create_ui() -> gr.Blocks:
         ).then(
             fn=process_video,
             inputs=[
-                audio_input, video_state,
+                audio_state, video_state,
                 output_filename, processing_mode, custom_fps,
                 fit_mode_input, output_format_input,
                 effect_style_input, effect_intensity_input,
                 effect_mode_input, effect_palette_input, effect_seed_input,
                 look_input, variety_input, semantic_variety_input, speed_ramps_input,
-                split_screen_input,
+                split_screen_input, crossfades_input,
                 text_entries_input, text_position_input, text_scale_input,
                 session_state
             ],

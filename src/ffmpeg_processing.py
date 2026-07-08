@@ -1679,7 +1679,8 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                                 retime: dict = None,
                                 *, anchor: dict = None,
                                 partner: dict = None,
-                                local_beats: List[float] = None) -> bool:
+                                local_beats: List[float] = None,
+                                extend_frames: int = 0) -> bool:
     """
     Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
 
@@ -1719,12 +1720,29 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
     Minimal/clean renders pass) keeps every chain byte-identical to the
     pulse-free engine. Duo panes never pulse (their echo fill is a rare
     fallback and the composed frame already carries the beat effects).
+
+    extend_frames (optional, crossfade assembly only): render this many EXTRA
+    output frames beyond the planned segment window, appended to the tail.
+    Used for the A side of a chosen crossfade boundary: the boundary-chunk
+    re-encode needs D extra tail frames of A to dissolve into B. Only the
+    -vframes cap and the decoded SOURCE window grow — every effect/text/fit
+    expression is still planned on the ORIGINAL segment duration (the extra
+    frames just let the existing chain run on; wave-11's tpad clone guards a
+    source that can't supply the extension). extend_frames=0 (the default,
+    and what every non-crossfade segment passes) is byte-identical to the
+    pre-crossfade engine.
     """
     try:
         # ✅ FRAME-ACCURATE: Calculate exact output frame count first; the
         # source window derives from it (and the retime spec, if any).
-        output_frame_count = max(1, seconds_to_frame_count(duration, fps))
-        exact_output_duration = frame_count_to_seconds(output_frame_count, fps)
+        # exact_output_duration is the ORIGINAL segment length — it drives
+        # every effect/fit/pan expression, so those stay planned on the
+        # planned window even when extend_frames pads the tail. The extra
+        # crossfade frames only grow -vframes and the decoded source window.
+        base_frame_count = max(1, seconds_to_frame_count(duration, fps))
+        extra_frames = max(0, int(extend_frames or 0))
+        output_frame_count = base_frame_count + extra_frames
+        exact_output_duration = frame_count_to_seconds(base_frame_count, fps)
         # source_fps drives both the interp over-provision (retime_source_window)
         # and the minterpolate target rate (build_segment_pre_filters); cached, so
         # cheap. Only probed when a retime is present so the non-retime path stays
@@ -1733,6 +1751,10 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         segment_source_fps = get_cached_video_fps(video_file) if retime else None
         exact_source_duration = retime_source_window(
             exact_output_duration, retime, fps, source_fps=segment_source_fps)
+        # Crossfade A side: decode D extra source frames so -vframes has real
+        # tail content to blend out (bounded by output_frame_count either way).
+        if extra_frames:
+            exact_source_duration += frame_count_to_seconds(extra_frames, fps)
 
         # Still images have no timeline: -loop 1 serves the single frame for
         # exactly the segment window, so seeking, -stream_loop and retiming
@@ -1989,6 +2011,108 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
     except Exception as e:
         print(f"   ⚠️  Error extracting clip: {e}")
         return False
+
+
+# --- Opt-in crossfades on calm boundaries -----------------------------------
+# xfade transitions used for calm-boundary crossfades. fade is the common
+# case; the wipes/smooth are the occasional variation (seeded per boundary).
+XFADE_TRANSITIONS = ('fade', 'wipeleft', 'wiperight', 'smoothup')
+
+
+def _segment_encoder_args(use_nvenc: bool, gpu_encoder: str) -> List[str]:
+    """The exact encoder args a segment extraction uses, so a re-encoded
+    crossfade chunk stream-copy-concats with the untouched segments."""
+    if use_nvenc:
+        return get_gpu_quality_args(gpu_encoder, include_pix_fmt=True)
+    return get_cpu_h264_quality_args(include_pix_fmt=True)
+
+
+def build_crossfade_chunk(file_a_ext: str, file_b: str, output_file: str,
+                          len_a_frames: int, len_b_frames: int, d_frames: int,
+                          fps: float, transition: str,
+                          use_nvenc: bool, gpu_encoder: str = 'h264_nvenc') -> bool:
+    """Re-encode one calm boundary as a single xfade crossfade chunk.
+
+    Inputs: A_ext holds len_a + D frames (the extra D tail frames come from
+    extract_clip_segment_ffmpeg(extend_frames=D)); B holds its normal len_b
+    frames. xfade output length = offset + len(B) = len_a + len_b, so the
+    combined chunk holds EXACTLY the frame count of the two segments it
+    replaces — the run-level frame guard and the audio bound are untouched
+    (the concat list just has one longer entry instead of two).
+
+    offset/duration come from frame counts via frame_count_to_seconds (never
+    float guesswork): the transition starts exactly at A's original cut frame
+    and lasts D frames. The chunk is encoded with the SAME encoder args as the
+    segments so the final concat stays a stream copy. Returns True only when
+    the output verifies at exactly len_a + len_b frames.
+    """
+    total_frames = int(len_a_frames) + int(len_b_frames)
+    d_frames = max(1, int(d_frames))
+    offset_secs = frame_count_to_seconds(int(len_a_frames), fps)
+    dur_secs = frame_count_to_seconds(d_frames, fps)
+    if transition not in XFADE_TRANSITIONS:
+        transition = 'fade'
+    # setsar=1 mirrors the segments' fit chains; format is pinned by the
+    # encoder's -pix_fmt so the chunk matches the segment SPS/PPS on concat.
+    filter_complex = (
+        f"[0:v][1:v]xfade=transition={transition}"
+        f":duration={dur_secs:.6f}:offset={offset_secs:.6f},setsar=1[outv]"
+    )
+    cmd = [FFMPEG_PATH]
+    cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
+    cmd.extend(['-i', file_a_ext, '-i', file_b])
+    cmd.extend(['-filter_complex', filter_complex, '-map', '[outv]'])
+    cmd.extend(['-vframes', str(total_frames)])
+    cmd.extend(_segment_encoder_args(use_nvenc, gpu_encoder))
+    cmd.extend([
+        '-an',
+        '-fps_mode', 'cfr',
+        '-r', str(fps),
+        '-fflags', '+genpts',
+        '-movflags', '+faststart',
+        '-y',
+        output_file,
+    ])
+    result = _run_media_command(cmd, timeout=180)
+    if result.returncode != 0:
+        print(f"   ⚠️  Crossfade chunk failed: {_short_ffmpeg_error(result.stderr, 400)}")
+        return False
+    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+        return False
+    return _verify_segment_frames(output_file, total_frames)
+
+
+def truncate_segment_to_frames(input_file: str, output_file: str,
+                               frames: int, fps: float,
+                               use_nvenc: bool, gpu_encoder: str = 'h264_nvenc') -> bool:
+    """Re-encode a segment down to its first `frames` frames.
+
+    Only used as the crossfade fallback: if a chunk re-encode fails, the A
+    side was extracted D frames long, so it must be trimmed back to its
+    planned length before a plain hard-cut concat — otherwise the extra tail
+    frames would drift the timeline. Same encoder args as the segments so the
+    result still stream-copy-concats."""
+    frames = max(1, int(frames))
+    cmd = [FFMPEG_PATH]
+    cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
+    cmd.extend(['-i', input_file, '-vframes', str(frames)])
+    cmd.extend(_segment_encoder_args(use_nvenc, gpu_encoder))
+    cmd.extend([
+        '-an',
+        '-fps_mode', 'cfr',
+        '-r', str(fps),
+        '-fflags', '+genpts',
+        '-movflags', '+faststart',
+        '-y',
+        output_file,
+    ])
+    result = _run_media_command(cmd, timeout=120)
+    if result.returncode != 0:
+        print(f"   ⚠️  Crossfade truncate fallback failed: {_short_ffmpeg_error(result.stderr, 400)}")
+        return False
+    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+        return False
+    return _verify_segment_frames(output_file, frames)
 
 
 def extract_prores_segment_random(video_file: str, duration: float, fps: float,
