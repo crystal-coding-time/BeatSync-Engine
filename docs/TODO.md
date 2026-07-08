@@ -68,9 +68,20 @@ fallback when unavailable (Windows/Intel/missing package → byte-identical to w
 | 14.2 | Pipeline integration: structure labels refine stage-3 sections; drum-stem onsets replace SuperFlux weight when available; vocal-presence cut penalty; bass-step drop confirmation; all gated on availability | `src/auto_mode/*` | 💾 |
 | 14.3 | Integration: cross-check, docs sync, smoke (with + without backend), restart | (lead) | 💾 |
 
-## Backlog / opt-in follow-ups
+## Wave 15 — crossfades, optimal seating, motion smear (in flight, owner "proceed" 2026-07-08)
 
-- RIFE 4.6 via rife-ncnn-vulkan pre-pass (cached, framemd5-verified intermediates; models >4.6 broken on Apple Silicon)
-- Flow motion-blur effect primitive (minterpolate/tmix); FFglitch datamosh profile (later)
-- xfade crossfades on low-energy boundaries (pre-existing roadmap item)
-- Backburnered by owner: Real-ESRGAN. Rejected: preset picker.
+| # | Task | File(s) | Status |
+|---|------|---------|--------|
+| 15.1 | Opt-in xfade crossfades on calm boundaries: extend segment A by D frames, xfade(A_ext, B) replaces both in the concat list — total timeline frames invariant, frame guards pass | `src/gui.py`, `src/video_processor.py`, `src/ffmpeg_processing.py` | 🤖 Agent P |
+| 15.2 | Coverage reservations seated via linear-sum assignment (scipy, no new dep) instead of greedy best-first; drop-exemption semantics preserved | `src/auto_mode/stage6_av_planner.py` | 🤖 Agent Q |
+| 15.3 | `motion_smear` effect primitive (tmix burst on drop cuts, frame-count-safe) | `src/effects.py` | 🤖 Agent R |
+| 15.4 | Integration: cross-check, docs sync, smoke, restart | (lead) | ⬜ |
+
+## Wave 16 — multi-song extended videos (queued behind wave 15; owner-requested 2026-07-08)
+
+Multiple audio files → one extended video. Per-song stages 1–4 (own beat grid/sections/
+structure/stems/loudness; caches stay per-file), timelines merged with cumulative offsets
+(song joins = locked cut boundaries), ONE global stage-6 plan (coverage/variety/semantic
+diversity span the whole video), audio pre-concatenated sample-exactly, render side unchanged.
+V1 = clean hard joins; audio crossfade + loudness matching are follow-ups. Starts after wave 15
+commits (file overlap with in-flight agents).

@@ -79,7 +79,6 @@ Status key: ✅ done · 🚧 in progress · ⬜ planned
 - Rendering: **Pillow → transparent PNG → ffmpeg `overlay`** (core filter), NOT drawtext — Homebrew ffmpeg ships without libfreetype/libass. Bonus: real word wrapping, stroke + shadow, any TTF (auto-detects Arial Bold on macOS; `BEATSYNC_FONT` overrides)
 - GUI: text entries box, position (lower third/center/top), size slider
 - Gotcha encoded in code: ffmpeg `fade` rejects negative `st` — continuation segments omit the fade-in filter instead
-- Later ideas: per-entry timing control, color/font options in GUI, text file import
 
 ## Hardening pass ✅ (2026-07-06)
 Code-review fixes across the render pipeline; verified with repeat-run `framemd5` comparisons and targeted repros:
