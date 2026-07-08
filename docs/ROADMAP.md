@@ -342,9 +342,5 @@ flash-attn, #20921 wedged slot). Fixes:
 - Parent backstop: `min(7200, 300 + 15·candidates)` s (`BEATSYNC_QWEN_BATCH_TIMEOUT`) —
   7200 cap because a healthy 1000+-candidate batch legitimately needs >1 h at ~3.3 s/frame
 
-## Phase 5 — full automation ⬜
-- Watch-folder mode built on the existing `video_processor.py` CLI: drop audio + clips, video appears in `output/`
-- launchd job on macOS; candidate for running on the-all-thing server later
-
 ## Documentation policy
 Every feature change updates: this file (status + any new hook points), `README.mac.md` (user-facing usage), and `CLAUDE.md` if conventions change.
