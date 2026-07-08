@@ -26,6 +26,7 @@ import numpy as np
 
 from gpu_cpu_utils import GPU_AVAILABLE, cp
 from ffmpeg_processing import (
+    FFPROBE_PATH,
     detect_video_scene_changes,
     get_video_duration,
     get_video_fps,
@@ -360,16 +361,29 @@ def analyze_video_sources(
                             f"{_safe_name(job['video_file'])}: {exc}"
                         )
                         print("   ↪ Retrying that video safely in serial mode...")
-                        results_by_index[job["index"]] = _analyze_single_video(
-                            job["video_file"],
-                            use_gpu,
-                            ai_available,
-                            qwen_model_path,
-                            audio_profile or {},
-                            True,
-                            job["index"],
-                            len(existing),
-                        )
+                        try:
+                            results_by_index[job["index"]] = _analyze_single_video(
+                                job["video_file"],
+                                use_gpu,
+                                ai_available,
+                                qwen_model_path,
+                                audio_profile or {},
+                                True,
+                                job["index"],
+                                len(existing),
+                            )
+                        except Exception as retry_exc:
+                            print(
+                                f"   ⚠️  Serial retry also failed for "
+                                f"{_safe_name(job['video_file'])}: {retry_exc}"
+                            )
+                            print(
+                                "   ↪ Storing an empty result for it so the other "
+                                "videos still get analyzed and cached."
+                            )
+                            results_by_index[job["index"]] = _empty_video_result(
+                                job["video_file"]
+                            )
         else:
             print("   CPU visual analysis workers: 1 (serial)")
             for job in jobs:
@@ -484,6 +498,119 @@ def analyze_video_sources(
     }
 
 
+def _parse_fps_fraction(fps_str) -> float | None:
+    """Evaluate an ffprobe frame-rate string ('30000/1001', '30/1', '25') the
+    same way get_video_fps does; None when unparseable so the caller can fall
+    back to the standalone getter."""
+    if not fps_str:
+        return None
+    fps_str = str(fps_str).strip()
+    try:
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            return float(num) / float(den)
+        return float(fps_str)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _probe_media_fields(video_file: str) -> tuple[float, float, int, int]:
+    """One ffprobe call for (duration, fps, width, height).
+
+    Collapses the three separate ffprobe spawns (get_video_duration,
+    get_video_fps, get_video_resolution) into a single combined invocation.
+    Every field falls back to its standalone getter when the combined probe
+    fails or a field is missing/unparseable, so the returned values are exactly
+    what the three getters would have produced — including the image-source
+    synthetic values: get_video_duration / get_video_fps short-circuit on stills
+    (SYNTHETIC_IMAGE_DURATION and 30.0), so for an image we deliberately skip the
+    combined probe's real ~1-frame duration and image2 demuxer default fps and
+    take those from the getters, while width/height still come from the probe
+    (get_video_resolution probes stills anyway).
+
+    Uses the same ffprobe binary resolution as the rest of the codebase
+    (FFPROBE_PATH from ffmpeg_processing → bundled bin/ffprobe, else PATH).
+    """
+    is_image = is_image_source(video_file)
+    duration = None
+    fps = None
+    width = None
+    height = None
+    try:
+        probe_cmd = [
+            FFPROBE_PATH,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate,avg_frame_rate,width,height",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            video_file,
+        ]
+        result = subprocess.run(
+            probe_cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            streams = data.get("streams") or []
+            stream = streams[0] if streams else {}
+            fmt = data.get("format") or {}
+            try:
+                width = int(stream["width"])
+                height = int(stream["height"])
+            except (KeyError, TypeError, ValueError):
+                width = height = None
+            if not is_image:
+                # Match get_video_fps: evaluate r_frame_rate exactly.
+                fps = _parse_fps_fraction(stream.get("r_frame_rate"))
+                try:
+                    duration = float(fmt["duration"])
+                except (KeyError, TypeError, ValueError):
+                    duration = None
+    except Exception:
+        # Any probe/parse failure → each field falls back to its getter below.
+        pass
+
+    if duration is None:
+        duration = get_video_duration(video_file)
+    if fps is None:
+        fps = get_video_fps(video_file)
+    if width is None or height is None:
+        width, height = get_video_resolution(video_file)
+    return float(duration), float(fps), int(width), int(height)
+
+
+def _empty_video_result(video_file: str) -> Dict:
+    """Minimal valid analysis result for a source that failed even the serial
+    retry. Mirrors the exact key shape _analyze_single_video returns (empty
+    candidates, safe metadata) so the caller can still cache every sibling and
+    finish the run instead of one bad file crashing the whole batch.
+
+    ai_deferred=False keeps the deferred-Qwen pass from touching it;
+    ai_enabled=False keeps a later _load_cache(require_ai=True) from trusting the
+    cached empty result as an AI hit, so the file is re-analyzed on the next run.
+    """
+    return {
+        "analysis_version": ANALYSIS_VERSION,
+        "video_file": os.path.abspath(video_file),
+        "source_name": _safe_name(video_file),
+        "duration": 0.0,
+        "fps": 24.0,
+        "width": 0,
+        "height": 0,
+        "scene_changes": [],
+        "candidate_count": 0,
+        "candidates": [],
+        "analysis_seconds": 0.0,
+        "timings": {},
+        "ai_enabled": False,
+        "ai_deferred": False,
+    }
+
+
 def _analyze_single_video(
     video_file: str,
     use_gpu: bool,
@@ -501,9 +628,10 @@ def _analyze_single_video(
     print(f"   Analyzing video {prefix}{name}")
 
     step_started = time.perf_counter()
-    duration = max(0.0, float(get_video_duration(video_file)))
-    fps = max(1.0, float(get_video_fps(video_file)))
-    width, height = get_video_resolution(video_file)
+    probe_duration, probe_fps, probe_width, probe_height = _probe_media_fields(video_file)
+    duration = max(0.0, float(probe_duration))
+    fps = max(1.0, float(probe_fps))
+    width, height = probe_width, probe_height
     timings["metadata_seconds"] = time.perf_counter() - step_started
     print(
         f"      Metadata: {duration:.1f}s, {fps:.3g} fps, "
@@ -660,6 +788,11 @@ def _complete_deferred_qwen(
     print(f"   Running deferred Qwen semantic analysis {label}: {name}")
     started = time.perf_counter()
     qwen_info = {}
+    # Only a real Qwen success (no exception AND at least one merged semantic
+    # tag) may mark this video ai_enabled. Otherwise a transient llama-server
+    # failure would be written to the AI-keyed cache and accepted forever by
+    # _load_cache(require_ai=True), so the tagging would never be retried.
+    qwen_ok = False
     try:
         qwen_info = _annotate_candidates_with_qwen(
             video_file=video_data["video_file"],
@@ -669,6 +802,7 @@ def _complete_deferred_qwen(
             use_gpu=use_gpu,
             audio_profile=audio_profile,
         )
+        qwen_ok = int((qwen_info or {}).get("qwen_tag_count", 0)) > 0
     except Exception as e:
         print(f"      Warning: Qwen semantic analysis failed for {name}: {e}")
 
@@ -680,8 +814,13 @@ def _complete_deferred_qwen(
     timings["total_seconds"] = float(timings.get("total_seconds", video_data.get("analysis_seconds", 0.0))) + qwen_seconds
     video_data["analysis_seconds"] = timings["total_seconds"]
     video_data["ai_deferred"] = False
-    video_data["ai_enabled"] = True
+    video_data["ai_enabled"] = qwen_ok
     video_data["candidate_count"] = len(candidates)
+    if not qwen_ok:
+        print(
+            "      Deferred Qwen produced no semantic tags; leaving this video "
+            "ai_enabled=False so it retries on the next run."
+        )
     print(
         f"      ⏱ Deferred Qwen total: {_fmt_seconds(qwen_seconds)}; "
         f"video total now {_fmt_seconds(video_data['analysis_seconds'])}"
@@ -804,12 +943,22 @@ def _complete_deferred_qwen_batch(
         timings["total_seconds"] = float(timings.get("total_seconds", video_data.get("analysis_seconds", 0.0))) + qwen_seconds
         video_data["analysis_seconds"] = timings["total_seconds"]
         video_data["ai_deferred"] = False
-        video_data["ai_enabled"] = True
+        # Same rule as the single-video deferred path: only a video that
+        # actually merged semantic tags may be cached as an AI result. A video
+        # whose merge came back empty (its requests all failed inside an
+        # otherwise-successful batch) keeps ai_enabled=False so
+        # _load_cache(require_ai=True) re-runs Qwen for it next time.
+        video_data["ai_enabled"] = merged_count > 0
         video_data["candidate_count"] = len(candidates)
         print(
             f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)} "
             f"for {_safe_name(video_data.get('video_file', 'video'))}"
         )
+        if merged_count == 0:
+            print(
+                "      No semantic tags merged for this video; leaving it "
+                "ai_enabled=False so Qwen retries on the next run."
+            )
         print(
             f"      ⏱ Shared-Qwen video cost: {_fmt_seconds(qwen_seconds)} "
             f"(prefetch {_fmt_seconds(timings['qwen_prefetch_seconds'])}, "

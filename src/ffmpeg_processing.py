@@ -1187,21 +1187,40 @@ def get_cpu_h264_quality_args(include_pix_fmt: bool = True) -> List[str]:
 _SOURCE_DURATION_CACHE: dict = {}
 
 
-def get_cached_video_duration(video_file: str) -> float:
-    """Duration lookup with a per-run cache (segments hit the same sources repeatedly)."""
+def _cached_video_duration(video_file: str) -> Tuple[float, bool]:
+    """(duration, known) with a per-run cache (segments hit sources repeatedly).
+
+    known=False flags a probe failure: the returned value is a safe 0.0
+    sentinel, NOT a real duration. Callers that clamp a start against it stay
+    safe (max_start -> 0, so no seek past a real EOF), and get_loop_input_args
+    reads the flag to force the loop path instead of trusting the sentinel.
+    A transient ffprobe error is never cached, so a later segment can recover.
+    """
     if is_image_source(video_file):
         # ffprobe reports one frame (~0.04s) for a still; the synthetic
         # duration lets stills fill any segment (extraction loops them).
-        return SYNTHETIC_IMAGE_DURATION
+        return SYNTHETIC_IMAGE_DURATION, True
     cached = _SOURCE_DURATION_CACHE.get(video_file)
-    if cached is None:
-        cached = _probe_video_duration(video_file)
-        if cached is None:
-            # Don't cache failures: a transient ffprobe error must not pin the
-            # fallback duration for the rest of the run.
-            return 10.0
-        _SOURCE_DURATION_CACHE[video_file] = cached
-    return cached
+    if cached is not None:
+        return cached, True
+    probed = _probe_video_duration(video_file)
+    if probed is None:
+        # Don't cache failures: a transient ffprobe error must not pin the
+        # fallback for the rest of the run.
+        return 0.0, False
+    _SOURCE_DURATION_CACHE[video_file] = probed
+    return probed, True
+
+
+def get_cached_video_duration(video_file: str) -> float:
+    """Duration lookup with a per-run cache (segments hit the same sources repeatedly).
+
+    Returns 0.0 on probe failure (uncached). 0.0 is safe through every clamp
+    consumer (start clamps to 0) and routes get_loop_input_args onto the loop
+    path so an unknown length can never seek past a real EOF.
+    """
+    duration, _known = _cached_video_duration(video_file)
+    return duration
 
 
 def get_loop_input_args(video_file: str, start_time: float, duration: float) -> Tuple[List[str], float]:
@@ -1214,7 +1233,15 @@ def get_loop_input_args(video_file: str, start_time: float, duration: float) -> 
     with a nonzero start the caller must seek in the filter chain (trim=start=)
     instead of with -ss.
     """
-    src_duration = get_cached_video_duration(video_file)
+    src_duration, known = _cached_video_duration(video_file)
+    if not known:
+        # Unknown source length (probe failed): force an infinite stream_loop
+        # from the start. This can never seek past a real EOF and never skips
+        # looping a source that might be shorter than the window. The
+        # downstream -t / -vframes cap always bounds the output, so an infinite
+        # loop cannot run away; start_time resets to 0 so we take the -ss 0
+        # (not filter-seek) path where the bound is guaranteed present.
+        return ['-stream_loop', '-1'], 0.0
     if src_duration <= 0.05:
         return [], start_time
     if start_time + duration <= src_duration - 0.02:
@@ -1258,21 +1285,31 @@ _SOURCE_FPS_CACHE: dict = {}
 
 
 def get_cached_video_fps(video_file: str) -> float:
-    """fps lookup with a per-run cache (the planner probes per segment)."""
-    cached = _SOURCE_FPS_CACHE.get(video_file)
-    if cached is None:
-        cached = get_video_fps(video_file)
-        _SOURCE_FPS_CACHE[video_file] = cached
-    return cached
+    """fps lookup with a per-run cache (the planner probes per segment).
 
-
-def get_video_fps(video_file: str) -> float:
-    """Get the FPS of a video file using ffprobe."""
+    Mirrors get_cached_video_duration: a probe failure returns the 30.0
+    fallback WITHOUT caching it, so one transient ffprobe error can't pin
+    fps=30.0 (indistinguishable from a real 30fps source) for the whole run
+    and skew stage6's retime gating (source_fps < 24 skip, >= 50 slow-mo gate).
+    """
     if is_image_source(video_file):
         # A still has no timebase; ffprobe would report the image2 demuxer
         # default (25) which must not masquerade as a real source fps.
         # Callers detecting output fps should skip image sources entirely.
         return 30.0
+    cached = _SOURCE_FPS_CACHE.get(video_file)
+    if cached is None:
+        cached = _probe_video_fps(video_file)
+        if cached is None:
+            # Don't cache failures: a transient ffprobe error must not pin the
+            # 30fps fallback for the rest of the run.
+            return 30.0
+        _SOURCE_FPS_CACHE[video_file] = cached
+    return cached
+
+
+def _probe_video_fps(video_file: str) -> float | None:
+    """fps via ffprobe; None on failure so callers can avoid caching it."""
     try:
         probe_cmd = [
             FFPROBE_PATH,
@@ -1282,7 +1319,7 @@ def get_video_fps(video_file: str) -> float:
             '-of', 'default=noprint_wrappers=1:nokey=1',
             video_file
         ]
-        
+
         result = _run_media_command(probe_cmd, timeout=10)
         if result.returncode != 0:
             raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
@@ -1298,7 +1335,18 @@ def get_video_fps(video_file: str) -> float:
         return fps
     except Exception as e:
         print(f"   ⚠️  Could not get video FPS with ffprobe ({os.path.basename(video_file)}): {e}")
-        return 30.0  # Default fallback
+        return None
+
+
+def get_video_fps(video_file: str) -> float:
+    """Get the FPS of a video file using ffprobe."""
+    if is_image_source(video_file):
+        # A still has no timebase; ffprobe would report the image2 demuxer
+        # default (25) which must not masquerade as a real source fps.
+        # Callers detecting output fps should skip image sources entirely.
+        return 30.0
+    fps = _probe_video_fps(video_file)
+    return 30.0 if fps is None else fps  # Default fallback
 
 
 def get_video_resolution(video_file: str) -> Tuple[int, int]:
@@ -1495,8 +1543,13 @@ def _retime_filters(retime: dict, output_duration: float, fps: float) -> List[st
     # for any positive speeds, which fps= requires.
     T = max(0.05, float(output_duration))
     a = (s1 - s0) / T
+    # max(0, ...) guards the sqrt domain: for a decelerating ramp the radicand
+    # goes negative past tau_zero, and ffmpeg's sqrt of a negative yields NOPTS
+    # which stalls the downstream fps stage (segment comes up short). Unreachable
+    # via the sole call site today (stage6 gates leave >=0.077s margin), so this
+    # is a no-op for every reachable input — it only clamps an out-of-domain tail.
     expr = (
-        f"(sqrt({s0 * s0:.8f}+{2.0 * a:.8f}*PTS*TB)-{s0:.6f})/{a:.8f}/TB"
+        f"(sqrt(max(0,{s0 * s0:.8f}+{2.0 * a:.8f}*PTS*TB))-{s0:.6f})/{a:.8f}/TB"
     )
     return [f"setpts='{expr}'"]
 
@@ -1526,6 +1579,16 @@ def build_segment_pre_filters(exact_duration: float, fps: float,
     filters = [trim_filter, "setpts=PTS-STARTPTS"]
     if retime:
         filters.extend(_retime_filters(retime, output_duration or exact_duration, fps))
+    # Hold the last frame if the demuxer under-delivers. GIFs (and some VFR
+    # sources) carry a long display duration on their FINAL frame — container
+    # duration 3.75s but last packet at pts 2.5 — and fps= stops at the last
+    # packet instead of honoring that trailing display time, so a window that
+    # ends inside the gap comes up short and the frame guard kills the render
+    # (reproduced: 3-frame GIF, 75/105 frames). Cloning the last frame is the
+    # correct rendering for display-duration sources; a no-op whenever the
+    # input actually covers the window. Every consumer of this chain caps
+    # output with -vframes, which bounds the open-ended pad.
+    filters.append("tpad=stop_mode=clone:stop=-1")
     filters.append(f"fps={fps}")
     return filters
 

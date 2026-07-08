@@ -279,7 +279,8 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
 
     try:
         y_harmonic, y_percussive = librosa.effects.hpss(y)
-    except Exception:
+    except Exception as e:
+        print(f"   ⚠️  HPSS harmonic/percussive split failed; using raw audio for both: {e}")
         y_harmonic, y_percussive = y, y
 
     _notify_progress(progress_callback, 1)

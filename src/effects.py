@@ -152,6 +152,10 @@ def _fx_push_pull_zoom(ctx) -> None:
     # Custom/shuffle only (never fires in curated mode).
     if ctx['curated'] or not ctx['target_size']:
         return
+    if any('zoompan' in f for f in ctx['filters']):
+        # One zoompan per segment: punch_fill/punch_zoom (which run earlier in
+        # _CUSTOM_SEQUENCE) win over the sustained push/pull if either fired.
+        return
     push_selected = 'push_in' in ctx['palette']
     pull_selected = 'pull_out' in ctx['palette']
     duration = 0.0
@@ -248,6 +252,7 @@ def _fx_shake(ctx) -> None:
         f"crop=w=in_w-{2 * a}:h=in_h-{2 * a}"
         f":x='{a}+{a}*sin(t*41)*exp(-t*3)':y='{a}+{a}*cos(t*57)*exp(-t*3)'"
     )
+    ctx['needs_scale_restore'] = True  # crop shrank the frame below target_size
 
 
 def _fx_white_flash(ctx) -> None:
@@ -473,7 +478,8 @@ _TRANSITION_WINDOW = 0.2
 
 
 def _transition_filters(spec: Dict, side: str, duration: float, k: float,
-                        target_size: Optional[Tuple[int, int]]) -> List[str]:
+                        target_size: Optional[Tuple[int, int]],
+                        ctx: Optional[Dict] = None) -> List[str]:
     """Build the tail ('transition_out') or head ('transition_in') chain."""
     kind = str(spec.get('type', ''))
     if duration <= 0.3:
@@ -505,6 +511,8 @@ def _transition_filters(spec: Dict, side: str, duration: float, k: float,
         filters.append(f"crop=w=in_w-{2 * a}:h=in_h-{2 * a}:x='{x_expr}':y={a}")
         filters.append(f"dblur=angle=0:radius={radius}:enable='{gates[0]}'")
         filters.append(f"dblur=angle=0:radius={radius * 2}:enable='{gates[1]}'")
+        if ctx is not None:
+            ctx['needs_scale_restore'] = True  # crop shrank the frame below target_size
     elif kind == 'glitch_cut':
         shift = 6 + int(round(4 * k))
         noise = 14 + int(round(10 * k))
@@ -689,6 +697,10 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
         'pack_cap': 3 if (hype or not curated) else 2,
         'pack': 0,
         'mirror_used': False,
+        # Set True only by filters that shrink the frame below target_size
+        # (shake's crop; the whip_pan transition's crop) so the trailing
+        # restore scale runs only when it's actually needed.
+        'needs_scale_restore': False,
     }
 
     for pid in sequence:
@@ -715,11 +727,15 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
         for side in ('transition_in', 'transition_out'):
             spec = clip.get(side)
             if isinstance(spec, dict) and spec.get('type'):
-                filters.extend(_transition_filters(spec, side, seg_duration, k, target_size))
+                filters.extend(_transition_filters(spec, side, seg_duration, k, target_size, ctx))
 
-    # Zoom/shake crops shrink the frame; restore exact target dimensions so
-    # concat sees identical streams.
-    if filters and target_size:
+    # Only shake's crop and the whip_pan transition's crop actually shrink the
+    # frame below target_size (zoompan sets an explicit s=WxH; dutch_tilt and
+    # the mirror/kaleido chains crop-and-recombine back to the input size;
+    # everything else is a 1:1 per-pixel filter) — restore exact target
+    # dimensions only when one of those fired, so concat sees identical
+    # streams without a redundant same-size swscale pass on every segment.
+    if filters and target_size and ctx['needs_scale_restore']:
         filters.append(f"scale={target_size[0]}:{target_size[1]}")
 
     return filters

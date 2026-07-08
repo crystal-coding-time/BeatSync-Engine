@@ -138,7 +138,8 @@ def analyze_rhythm_bands(y: np.ndarray, sr: int, beat_times: np.ndarray,
                 curve = cp.asnumpy(curve)
             curve = _normalize(_smooth(np.asarray(curve, dtype=float), 3))
             outputs[name] = np.interp(beat_times, frame_times, curve, left=float(curve[0]), right=float(curve[-1]))
-        except Exception:
+        except Exception as e:
+            print(f"      ⚠️ Rhythm band '{name}' extraction failed; using zeros: {e}")
             outputs[name] = np.zeros(len(beat_times), dtype=float)
 
     return outputs["kick"], outputs["bass"], outputs["clap"], outputs["hihat"]

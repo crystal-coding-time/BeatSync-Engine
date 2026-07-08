@@ -746,16 +746,50 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         # feed extract_prores_segment_random (source + start): partner dicts
         # never reach the ProRes path.
 
-        # Convert all input videos to ProRes (video only, no audio)
+        # Convert input videos to ProRes (video only, no audio).
+        #
+        # When a plan exists we only ever look up its DISTINCT sources in
+        # prores_map (line ~782), so converting the whole library would burn
+        # real-time re-encodes on files no segment references (e.g. ~700 dead
+        # conversions for a 300-cut plan over a 1000-file library). Convert
+        # only the referenced subset: each entry's primary video_file plus,
+        # defensively, any duo partner's — the planner excludes duos from
+        # lossless, but we don't lean on that. The map-miss fallback pool
+        # (prores_files) is seeded from this same subset. It preserves the
+        # original video_files order (filtered to the subset) so the fallback
+        # RNG iterates a stable ordering; in a consistent plan-exists run every
+        # planned source is in the subset, so line ~782 always hits the map and
+        # the map-miss branch never fires — output stays byte-identical.
+        #
+        # With NO plan (legacy pure-random path) any source can be sampled, so
+        # convert all of them exactly as before — byte-for-byte identical.
+        if planned_clip_sequence:
+            referenced = set()
+            for entry in planned_clip_sequence:
+                primary = entry.get('video_file')
+                if primary:
+                    referenced.add(os.path.abspath(primary))
+                partner = entry.get('partner')
+                if isinstance(partner, dict):
+                    partner_file = partner.get('video_file')
+                    if partner_file:
+                        referenced.add(os.path.abspath(partner_file))
+            convert_sources = [vf for vf in video_files
+                               if os.path.abspath(vf) in referenced]
+            print(f"🎯 Plan references {len(convert_sources)} of {len(video_files)} "
+                  f"sources; converting only those to ProRes")
+        else:
+            convert_sources = list(video_files)
+
         prores_files = []
         prores_map = {}
-        for idx, video_file in enumerate(video_files, 1):
-            print(f"Converting {idx}/{len(video_files)}...")
+        for idx, video_file in enumerate(convert_sources, 1):
+            print(f"Converting {idx}/{len(convert_sources)}...")
             prores_file = convert_to_prores_proxy(video_file, prores_dir, prores_fps,
                                                   target_size=target_size, fit_mode=fit_mode)
             prores_files.append(prores_file)
             prores_map[os.path.abspath(video_file)] = prores_file
-        
+
         print(f"✓ All videos converted to ProRes 422 Proxy (video only)")
         
         # Create segments from ProRes files with FRAME-PERFECT precision

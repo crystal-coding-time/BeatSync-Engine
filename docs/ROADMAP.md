@@ -215,6 +215,39 @@ the process inputs list order untouched by construction:
 - Frame fit is now Auto (the smart ladder) / Blurred background / Letterbox; `'stretch'`
   survives for headless/settings callers only
 
+## Wave 11 — review-driven hardening + perf ✅ (2026-07-08)
+Fixes from a multi-agent, adversarially-verified pipeline review (13 confirmed findings +
+1 latent hardening; tracker in `docs/TODO.md`). No new features; behavior changes only on
+failure paths and one effects edge case:
+- **Qwen results are only cached as AI-complete on real success** (≥1 merged semantic tag) in
+  both the deferred single-video and batch merge paths — a transient llama-server failure now
+  retries on the next run instead of being pinned in the AI cache (`video_analysis.py`)
+- **One corrupt source can no longer discard a whole analysis batch**: the serial retry stores
+  an empty result and the siblings still reach the cache
+- **Probe-failure hygiene**: fps probe failures are no longer cached (they pinned fps=30 for the
+  run and skewed retime gating); an unknown duration forces `-stream_loop -1` from t=0 instead of
+  a fictitious 10s (which could seek past EOF and abort on the frame guard); analysis metadata now
+  uses one combined ffprobe call per source instead of three
+- **Effects**: `push_in`/`pull_out` gained the one-zoompan-per-segment guard (Custom/Shuffle
+  rhythm segments could stack two zoompans); the trailing restore `scale` is emitted only after
+  dimension-shrinking filters (shake, whip pan) — chains are otherwise unchanged, verified over a
+  73k-case before/after matrix
+- **Perf**: stage-6 candidate scoring memoized by (candidate, target) — 8–12× faster planning on
+  large libraries, plans byte-identical at every variety level; ProRes precise mode converts only
+  the sources the plan references instead of the whole library; loop-invariant percentile hoisted
+  (stage 3) and vectorized nearest-beat lookup (stage 4), both value-identical
+- **Silent failures now log**: HPSS fallback and rhythm-band zero-fills print ⚠️ warnings
+- Latent hardening: decel-ramp `setpts` sqrt radicand clamped with `max(0,…)` (unreachable via
+  current planner gates; guards future callers — negative radicand stalls ffmpeg's fps stage)
+- **GIF/VFR trailing-frame fix** (owner-reported failed render): a GIF whose *final* frame
+  carries a long display duration (container says 3.75s, last packet at 2.5s) came up short
+  through `fps=` when a segment window ended inside the gap — the frame guard then correctly
+  refused the drifted timeline. `build_segment_pre_filters` now inserts
+  `tpad=stop_mode=clone:stop=-1` before `fps=`: the last frame is held through the window
+  (the correct rendering for display-duration sources), a no-op when the input covers the
+  window, and always bounded by `-vframes`. Pre-existing bug, not a wave-11 regression —
+  reproduced and verified against the failing render (149/149 clips, frame guards pass)
+
 ## Stage-5 hardening ✅ (2026-07-07)
 Incident: an owner render froze for ~35 min inside llama-server (Homebrew llama.cpp 9870,
 Qwen3VL-2B + mmproj) — a slot wedged mid-prompt while `/health` stayed ok; the worker had

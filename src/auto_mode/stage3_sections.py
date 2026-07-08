@@ -39,9 +39,10 @@ def analyze_sections(y: np.ndarray, y_harmonic: np.ndarray, y_percussive: np.nda
     wave = np.asarray(features.get("wave", []), dtype=float)
     if novelty.size == len(beat_times):
         threshold = _safe_percentile(novelty, 91, 0.90)
+        wave_gate = _safe_percentile(wave, 45, 0.45)
         last_added = -999.0
         for idx, value in enumerate(novelty):
-            if value >= threshold and wave[idx] >= _safe_percentile(wave, 45, 0.45):
+            if value >= threshold and wave[idx] >= wave_gate:
                 t = float(beat_times[idx])
                 if 0.0 < t < duration and t - last_added >= cfg.section_min_seconds:
                     boundaries.append(t)

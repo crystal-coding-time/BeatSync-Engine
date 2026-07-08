@@ -263,6 +263,35 @@ def add_rare_micro_cuts(selected: np.ndarray, beat_times: np.ndarray, features: 
     return np.concatenate([selected, np.asarray(extras, dtype=float)])
 
 
+def _nearest_beat_indices(beat_times: np.ndarray, times: np.ndarray) -> np.ndarray:
+    """Vectorized equivalent of ``[int(np.argmin(np.abs(beat_times - t))) for t in times]``.
+
+    Assumes beat_times is sorted ascending (the beat grid always is). The
+    distance from a sorted array to any query point is minimized at one of
+    the two neighbors straddling ``t`` found by np.searchsorted, so those two
+    are the only VALUES that can attain the minimum. np.argmin returns the
+    FIRST minimal index, so both tie cases must resolve to the earliest one:
+    an exact midpoint tie between two distinct beats picks the earlier beat
+    (``left_dist <= right_dist`` prefers left), and duplicate beat values
+    must map to the first index holding that value -- a second searchsorted
+    with side="left" on the winning value does exactly that.
+    """
+    beat_times = np.asarray(beat_times, dtype=float)
+    n = beat_times.size
+    times = np.asarray(times, dtype=float)
+    if n <= 1:
+        return np.zeros(times.shape, dtype=int)
+    raw = np.searchsorted(beat_times, times, side="left")
+    left = np.clip(raw - 1, 0, n - 1)
+    right = np.clip(raw, 0, n - 1)
+    left_dist = np.abs(beat_times[left] - times)
+    right_dist = np.abs(beat_times[right] - times)
+    nearest_val = np.where(left_dist <= right_dist,
+                           beat_times[left], beat_times[right])
+    # First occurrence of the winning value = argmin's first-minimum index.
+    return np.searchsorted(beat_times, nearest_val, side="left")
+
+
 def final_wave_cleanup(selected: np.ndarray, beat_times: np.ndarray, features: Dict,
                        audio_duration: float, cfg: AutoWaveConfig) -> np.ndarray:
     arr = np.asarray(selected, dtype=float)
@@ -281,8 +310,9 @@ def final_wave_cleanup(selected: np.ndarray, beat_times: np.ndarray, features: D
     min_allowed = int(max(1, round(len(beat_times) * cfg.target_cut_ratio_min)))
     if arr.size > max_allowed:
         keep_scores = []
-        for t in arr:
-            idx = int(np.argmin(np.abs(beat_times - t)))
+        nearest_idx = _nearest_beat_indices(beat_times, arr)
+        for idx in nearest_idx:
+            idx = int(idx)
             s = float(features["impact_score"][idx])
             if bool(features["is_phrase_anchor"][idx]):
                 s += 0.55

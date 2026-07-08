@@ -27,6 +27,43 @@ def _stable_rng(*parts) -> random.Random:
     return random.Random(seed)
 
 
+class _ScoreCache:
+    """Per-run memo for ``_score_candidate(candidate, profile)``.
+
+    ``_score_candidate`` reads exactly one field off ``profile`` --
+    ``profile.get("target", "flow")`` -- everything else it uses comes from
+    ``candidate``. So its result only varies along two axes: which candidate,
+    and which target. This class memoizes on those two axes for a single
+    ``build_planned_clip_sequence()`` run, so the O(candidates x segments)
+    scoring the auction, coverage-reservation, duo-partner and materialize
+    call sites all did independently collapses to O(candidates x distinct
+    targets) real evaluations (5 targets: drop/soft/build/rhythm/flow).
+
+    Candidates are plain dicts drawn, by reference, from one shared
+    ``candidates`` list for the whole run -- no call site copies a candidate
+    dict before scoring it -- so ``id(candidate)`` is a safe, collision-free
+    key for the lifetime of this cache. The candidate dict's own ``"id"``
+    field is deliberately NOT used as the key: sample/real candidate data can
+    carry duplicate or ``None`` ids, which would corrupt the cache.
+    """
+
+    __slots__ = ("_index_of", "_scores")
+
+    def __init__(self, candidates: Sequence[Dict]):
+        self._index_of = {id(c): i for i, c in enumerate(candidates)}
+        self._scores: Dict[tuple, float] = {}
+
+    def score(self, candidate: Dict, profile: Dict) -> float:
+        target = profile.get("target", "flow")
+        idx = self._index_of.get(id(candidate))
+        key = (idx, target)
+        if key not in self._scores:
+            # Call the real scorer once per (candidate, target) -- never
+            # reimplement its math here.
+            self._scores[key] = _score_candidate(candidate, profile)
+        return self._scores[key]
+
+
 # --- Split-screen duo segments (see docs/DESIGN_split_screen.md) -------------
 # A duo pairs the auction's primary clip with a partner clip from a different
 # cross-orientation source (portrait sources on a landscape canvas, or the
@@ -83,6 +120,7 @@ def build_planned_clip_sequence(
     candidates = [c for c in candidates if c.get("video_file")]
     if not candidates:
         return []
+    score_cache = _ScoreCache(candidates)
 
     cut_times_arr = np.asarray(cut_times, dtype=float)
     durations_arr = np.asarray(segment_durations, dtype=float)
@@ -103,7 +141,8 @@ def build_planned_clip_sequence(
         fair_share = len(profiles) / max(1, source_count)
         file_rate = 0.012 + 1.3 * variety / max(1.0, fair_share)
         file_cap = float("inf")
-        reservations = _plan_coverage_reservations(candidates, profiles)
+        reservations = _plan_coverage_reservations(candidates, profiles,
+                                                   score_cache)
 
     # Duo pairing needs ≥2 distinct cross-orientation, non-still sources; the
     # context is None whenever duos are impossible (including lossless mode:
@@ -132,6 +171,7 @@ def build_planned_clip_sequence(
                 index=i,
                 file_rate=file_rate,
                 file_cap=file_cap,
+                score_cache=score_cache,
             )
         if not candidate:
             continue
@@ -139,6 +179,7 @@ def build_planned_clip_sequence(
             candidate=candidate,
             profile=profile,
             index=i,
+            score_cache=score_cache,
         )
         partner_candidate = None
         if duo_pair_files is not None:
@@ -154,6 +195,7 @@ def build_planned_clip_sequence(
                 usage=usage,
                 file_rate=file_rate,
                 file_cap=file_cap,
+                score_cache=score_cache,
             )
         if partner_candidate is not None:
             planned_clip["partner"] = _materialize_partner(
@@ -284,7 +326,8 @@ def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
 
 
 def _plan_coverage_reservations(candidates: Sequence[Dict],
-                                profiles: Sequence[Dict]) -> Dict[int, Dict]:
+                                profiles: Sequence[Dict],
+                                score_cache: "_ScoreCache | None" = None) -> Dict[int, Dict]:
     """Reserve one segment per source: its best (candidate, segment) pairing.
 
     Deterministic: sources are seated in descending best-seat-score order,
@@ -298,9 +341,11 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
     for c in candidates:
         by_source.setdefault(str(c.get("video_file")), []).append(c)
 
+    _score = score_cache.score if score_cache is not None else _score_candidate
+
     # Auction-best approximation per segment (raw scores, no deque state),
     # used only for the drop exemption threshold.
-    best_raw = [max(_score_candidate(c, p) for c in candidates) for p in profiles]
+    best_raw = [max(_score(c, p) for c in candidates) for p in profiles]
 
     options_by_source: Dict[str, List] = {}
     fallback_by_source: Dict[str, List] = {}
@@ -309,7 +354,7 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
         exempted = []
         for c in by_source[src]:
             for j, p in enumerate(profiles):
-                score = _score_candidate(c, p)
+                score = _score(c, p)
                 required = max(0.05, p["duration"])
                 cand_duration = max(0.05, float(c.get("duration", required)))
                 if cand_duration < required * 0.55:
@@ -531,13 +576,15 @@ def _choose_candidate(
     index: int,
     file_rate: float = 0.012,
     file_cap: float = 0.18,
+    score_cache: "_ScoreCache | None" = None,
 ) -> Dict | None:
     best_candidate = None
     best_score = -999.0
     rng = _stable_rng(index, profile.get("target"), profile.get("start"))
+    _score = score_cache.score if score_cache is not None else _score_candidate
 
     for candidate in candidates:
-        score = _score_candidate(candidate, profile)
+        score = _score(candidate, profile)
         cid = candidate.get("id")
         video_file = candidate.get("video_file")
 
@@ -682,10 +729,12 @@ def _plan_source_window(candidate: Dict, profile: Dict) -> tuple:
     return start_time, source_duration
 
 
-def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
+def _materialize_clip(candidate: Dict, profile: Dict, index: int,
+                      score_cache: "_ScoreCache | None" = None) -> Dict:
     final_duration = max(0.05, float(profile["duration"]))
     start_time, source_duration = _plan_source_window(candidate, profile)
     target = profile.get("target", "flow")
+    _score = score_cache.score if score_cache is not None else _score_candidate
 
     return {
         "index": index,
@@ -695,7 +744,7 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
         "source_duration": source_duration,
         "final_duration": final_duration,
         "target": target,
-        "score": _score_candidate(candidate, profile),
+        "score": _score(candidate, profile),
         "candidate_id": candidate.get("id"),
         "tags": list(candidate.get("tags", [])),
         "subject_anchor": _rebase_subject_anchor(candidate, start_time,
@@ -757,6 +806,7 @@ def _maybe_choose_duo_partner(
     usage: Counter,
     file_rate: float,
     file_cap: float,
+    score_cache: "_ScoreCache | None" = None,
 ) -> Dict | None:
     """Partner candidate for a duo segment, or None to render the primary solo.
 
@@ -787,6 +837,7 @@ def _maybe_choose_duo_partner(
     primary_brightness = _clamp(primary.get("brightness", 0.5), default=0.5)
     best_candidate = None
     best_score = -999.0
+    _score = score_cache.score if score_cache is not None else _score_candidate
     for candidate in candidates:
         video_file = candidate.get("video_file")
         if video_file == primary_file or video_file not in pair_files:
@@ -798,7 +849,7 @@ def _maybe_choose_duo_partner(
         # Same shape as the primary auction: fit score minus recent-use and
         # usage penalties (plus the short-source penalty — a looping pane on
         # a drop is worse than no pane at all).
-        score = _score_candidate(candidate, profile)
+        score = _score(candidate, profile)
         cid = candidate.get("id")
         if cid in recent_ids:
             score -= 0.28
