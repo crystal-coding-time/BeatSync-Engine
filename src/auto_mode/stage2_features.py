@@ -18,13 +18,27 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
                           y_harmonic: Optional[np.ndarray] = None,
                           audio_file: Optional[str] = None,
                           start_time: float = 0.0,
-                          duration: Optional[float] = None) -> Dict:
+                          duration: Optional[float] = None,
+                          mel_S: Optional[np.ndarray] = None) -> Dict:
     """Extract beat-synchronous energy/rhythm data with smooth wave behavior."""
     duration = len(y) / sr
 
+    # One shared full-mix STFT: spectral_centroid's y= path is literally
+    # np.abs(stft(y, same n_fft/hop/window))**1, and analyze_rhythm_bands runs
+    # the identical stft call, so both can reuse this one (bit-identical).
+    # rms deliberately stays on its y= path: librosa computes time-domain frame
+    # RMS from y (no STFT at all) but windowed spectral RMS from S — different
+    # numbers, and there is no redundant transform to save.
+    stft_full = librosa.stft(y, n_fft=cfg.n_fft, hop_length=cfg.hop_length)
     rms_curve = librosa.feature.rms(y=y, frame_length=cfg.n_fft, hop_length=cfg.hop_length)[0]
-    centroid_curve = librosa.feature.spectral_centroid(y=y, sr=sr, n_fft=cfg.n_fft, hop_length=cfg.hop_length)[0]
-    flux_curve = librosa.onset.onset_strength(y=y_percussive, sr=sr, hop_length=cfg.hop_length)
+    centroid_curve = librosa.feature.spectral_centroid(S=np.abs(stft_full), sr=sr, n_fft=cfg.n_fft, hop_length=cfg.hop_length)[0]
+    # mel_S is the same log-power mel onset_strength would build internally
+    # (stage1 shares it too); flux differs from stage1's onset_env only by the
+    # post-mel aggregation (mean here vs median there).
+    if mel_S is not None:
+        flux_curve = librosa.onset.onset_strength(S=mel_S, sr=sr, hop_length=cfg.hop_length)
+    else:
+        flux_curve = librosa.onset.onset_strength(y=y_percussive, sr=sr, hop_length=cfg.hop_length)
 
     rms_curve_n = _normalize(_smooth(rms_curve, 7))
     centroid_curve_n = _normalize(_smooth(centroid_curve, 7))
@@ -36,7 +50,7 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
     flux = _interp_to_beats(flux_curve_n, beat_times, sr, cfg.hop_length)
     onset = _interp_to_beats(onset_n, beat_times, sr, cfg.hop_length)
 
-    kick, bass, clap, hihat = analyze_rhythm_bands(y, sr, beat_times, cfg, use_gpu)
+    kick, bass, clap, hihat = analyze_rhythm_bands(y, sr, beat_times, cfg, use_gpu, stft=stft_full)
 
     # Musical novelty, but smoothed so it does not create twitchy cuts.
     novelty = _normalize(0.50 * flux + 0.35 * onset + 0.15 * np.abs(np.gradient(rms)))
@@ -83,9 +97,16 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
     # SuperFlux onset strength (librosa SuperFlux recipe: lag=2, max_size=3 on
     # the percussive component, package hop kept for frame-time alignment).
     try:
-        superflux_curve = librosa.onset.onset_strength(
-            y=y_percussive, sr=sr, hop_length=cfg.hop_length, lag=2, max_size=3
-        )
+        # SuperFlux's lag/max_size tweaks also apply after the mel, so the
+        # shared spectrogram feeds this call unchanged as well.
+        if mel_S is not None:
+            superflux_curve = librosa.onset.onset_strength(
+                S=mel_S, sr=sr, hop_length=cfg.hop_length, lag=2, max_size=3
+            )
+        else:
+            superflux_curve = librosa.onset.onset_strength(
+                y=y_percussive, sr=sr, hop_length=cfg.hop_length, lag=2, max_size=3
+            )
         superflux_curve = _normalize(_smooth(np.asarray(superflux_curve, dtype=float), 3))
         onset_superflux = _normalize(_interp_to_beats(superflux_curve, beat_times, sr, cfg.hop_length))
     except Exception as e:
@@ -126,6 +147,10 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
         "rms_curve": rms_curve_n,
         "centroid_curve": centroid_curve_n,
         "flux_curve": flux_curve_n,
+        # Raw (pre-normalization) flux curve so stage3's heuristic path can
+        # reuse it instead of recomputing the identical onset_strength call.
+        # Internal to the stage pipeline: not packaged into beat_info.
+        "flux_curve_raw": flux_curve,
         "onset_superflux": onset_superflux,
         "harmonic_change": harmonic_change,
         "loudness": loudness,
@@ -217,9 +242,15 @@ def compute_loudness(audio_file: Optional[str], start_time: float,
 
 
 def analyze_rhythm_bands(y: np.ndarray, sr: int, beat_times: np.ndarray,
-                         cfg: AutoWaveConfig, use_gpu: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Beat-level kick/bass/clap/hihat strength."""
-    stft = librosa.stft(y, n_fft=cfg.n_fft, hop_length=cfg.hop_length)
+                         cfg: AutoWaveConfig, use_gpu: bool = False,
+                         stft: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Beat-level kick/bass/clap/hihat strength.
+
+    ``stft`` lets the caller pass a precomputed complex STFT of ``y`` at
+    cfg.n_fft/cfg.hop_length; when omitted it is computed here as before.
+    """
+    if stft is None:
+        stft = librosa.stft(y, n_fft=cfg.n_fft, hop_length=cfg.hop_length)
     freqs = librosa.fft_frequencies(sr=sr, n_fft=cfg.n_fft)
 
     use_cupy = bool(use_gpu and GPU_AVAILABLE and cp is not None)

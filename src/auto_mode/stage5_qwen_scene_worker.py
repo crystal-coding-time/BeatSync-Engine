@@ -614,38 +614,6 @@ def _adaptive_llama_slots(device: Dict[str, Any] | None = None) -> int:
     return 2
 
 
-def _select_vulkan_device(paths: LlamaPaths) -> Tuple[str | None, str]:
-    override = os.environ.get("BEATSYNC_QWEN_LLAMA_DEVICE", "").strip()
-    if override:
-        if override.lower() in {"none", "cpu"}:
-            return None, "CPU/no Vulkan override"
-        return override, f"{override} (env override)"
-
-    try:
-        result = subprocess.run(
-            [str(paths.list_exe), "--list-devices"],
-            cwd=str(paths.llama_dir),
-            env=_llama_env(paths),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=20,
-            check=False,
-        )
-    except Exception as exc:
-        return None, f"device list unavailable: {exc}"
-
-    devices = _parse_devices((result.stdout or "") + "\n" + (result.stderr or ""))
-    if not devices:
-        return None, "no Vulkan devices reported"
-
-    discrete = [device for device in devices if device["discrete"]]
-    pool = discrete or devices
-    selected = max(pool, key=lambda item: (item["free_mib"], item["total_mib"]))
-    return selected["id"], f"{selected['id']}: {selected['name']}"
-
-
 def _select_vulkan_device_info(paths: LlamaPaths) -> Tuple[str | None, str, Dict[str, Any] | None]:
     override = os.environ.get("BEATSYNC_QWEN_LLAMA_DEVICE", "").strip()
     if override:

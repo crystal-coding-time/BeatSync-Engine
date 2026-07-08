@@ -92,7 +92,12 @@ def analyze_sections(y: np.ndarray, y_harmonic: np.ndarray, y_percussive: np.nda
         try:
             chroma = librosa.feature.chroma_stft(y=y_harmonic, sr=sr, hop_length=cfg.hop_length, n_fft=cfg.n_fft)
             mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=10, hop_length=cfg.hop_length)
-            onset = librosa.onset.onset_strength(y=y_percussive, sr=sr, hop_length=cfg.hop_length)[np.newaxis, :]
+            # Stage2 already computed this exact onset_strength call; reuse the
+            # raw curve (same array object => bit-identical, one less mel STFT).
+            flux_raw = features.get("flux_curve_raw")
+            if flux_raw is None:
+                flux_raw = librosa.onset.onset_strength(y=y_percussive, sr=sr, hop_length=cfg.hop_length)
+            onset = np.asarray(flux_raw)[np.newaxis, :]
             min_frames = min(chroma.shape[1], mfcc.shape[1], onset.shape[1])
             frame_features = np.vstack([
                 librosa.util.normalize(chroma[:, :min_frames], axis=1),

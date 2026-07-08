@@ -41,18 +41,31 @@ def _beat_this_grid(y: np.ndarray, sr: int) -> Optional[Tuple[np.ndarray, np.nda
 
 
 def detect_master_beat_grid(y_percussive: np.ndarray, sr: int, cfg: AutoWaveConfig,
-                            y_full: np.ndarray = None) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
+                            y_full: np.ndarray = None,
+                            mel_S: np.ndarray = None) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     """Returns (beat_times, tempo, beat_frames, onset_env, downbeat_times).
 
     downbeat_times is empty for the librosa backend; the beat_this backend
     (BEATSYNC_BEAT_BACKEND=beat_this) fills it from the transformer model.
+
+    ``mel_S`` is an optional precomputed log-power mel spectrogram of
+    ``y_percussive`` (onset_strength's own default feature); the aggregation
+    happens after the mel, so sharing it is bit-identical to the y= path.
     """
-    onset_env = librosa.onset.onset_strength(
-        y=y_percussive,
-        sr=sr,
-        hop_length=cfg.hop_length,
-        aggregate=np.median,
-    )
+    if mel_S is not None:
+        onset_env = librosa.onset.onset_strength(
+            S=mel_S,
+            sr=sr,
+            hop_length=cfg.hop_length,
+            aggregate=np.median,
+        )
+    else:
+        onset_env = librosa.onset.onset_strength(
+            y=y_percussive,
+            sr=sr,
+            hop_length=cfg.hop_length,
+            aggregate=np.median,
+        )
     onset_env = _normalize(_smooth(onset_env, 3))
 
     no_downbeats = np.asarray([], dtype=float)

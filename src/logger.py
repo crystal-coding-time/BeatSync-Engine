@@ -2,7 +2,6 @@
 import os
 import sys
 import subprocess
-import librosa
 from typing import Dict
 from importlib import metadata
 
@@ -186,7 +185,9 @@ def print_startup_banner():
     ffmpeg_type = "Portable" if FFMPEG_FOUND else "System"
     print(f"   FFmpeg: {ffmpeg_type} | NVENC: {'[OK]' if nvenc else '[NO]'}")
     print(f"   CPU Optimization: {cpu_count} threads detected")
-    print(f"   Librosa: {librosa.__version__}")
+    # Version via package metadata: importing librosa here costs seconds at
+    # startup and the banner string is byte-identical either way.
+    print(f"   Librosa: {metadata.version('librosa')}")
     print(CONSOLE_SEPARATOR + "\n")
 
 if __name__ == '__main__':

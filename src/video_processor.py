@@ -972,14 +972,40 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         else:
             convert_sources = list(video_files)
 
-        prores_files = []
+        # Proxy conversions are independent whole-source re-encodes, so they
+        # go through the worker pool. One caveat: the proxy filename derives
+        # from the source BASENAME, so two sources sharing a basename share
+        # one output path (the old serial loop simply let the later conversion
+        # overwrite the earlier one). Those must not run concurrently — group
+        # conversions by proxy stem and convert each group serially in input
+        # order inside a single pooled task, preserving the serial
+        # last-one-wins file content. prores_files/prores_map are filled by
+        # original index, so list order (which the seeded fallback choice
+        # depends on) never depends on completion order.
+        prores_files: List[Optional[str]] = [None] * len(convert_sources)
         prores_map = {}
-        for idx, video_file in enumerate(convert_sources, 1):
-            print(f"Converting {idx}/{len(convert_sources)}...")
-            prores_file = convert_to_prores_proxy(video_file, prores_dir, prores_fps,
-                                                  target_size=target_size, fit_mode=fit_mode)
-            prores_files.append(prores_file)
-            prores_map[os.path.abspath(video_file)] = prores_file
+
+        conversion_groups: Dict[str, List[int]] = {}
+        for idx, video_file in enumerate(convert_sources):
+            stem = os.path.splitext(os.path.basename(video_file))[0]
+            conversion_groups.setdefault(stem, []).append(idx)
+
+        def _convert_group(indices: List[int]) -> List[Tuple[int, str]]:
+            return [(idx, convert_to_prores_proxy(
+                        convert_sources[idx], prores_dir, prores_fps,
+                        target_size=target_size, fit_mode=fit_mode))
+                    for idx in indices]
+
+        completed_conversions = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            conversion_futures = [executor.submit(_convert_group, indices)
+                                  for indices in conversion_groups.values()]
+            for future in as_completed(conversion_futures):
+                for idx, prores_file in future.result():
+                    prores_files[idx] = prores_file
+                    prores_map[os.path.abspath(convert_sources[idx])] = prores_file
+                    completed_conversions += 1
+                    print(f"   ✓ Converted {completed_conversions}/{len(convert_sources)}")
 
         print(f"✓ All videos converted to ProRes 422 Proxy (video only)")
         
@@ -993,13 +1019,17 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         print(f"   Audio: Stripped (will add music at the end)")
         print(f"   FPS: {prores_fps} (fixed)")
         
-        segment_files = []
+        segment_files: List[Optional[str]] = [None] * len(segment_durations)
         segments_dir = os.path.join(session_temp_dir, 'segments')
         os.makedirs(segments_dir, exist_ok=True)
-        
+
+        # Phase 1 (serial): resolve every segment's source and start time in
+        # index order, so all seeded draws happen in exactly the order the old
+        # serial loop made them. Phase 2 then only runs ffmpeg jobs, which
+        # never touch the RNG streams.
+        extraction_jobs: List[Tuple[int, str, float, float]] = []
         for i, exact_duration in enumerate(segment_durations):
             # Duration comes from the absolute frame-locked timeline.
-            frame_count = int(segment_frames[i])
             planned_clip = planned_clip_sequence[i] if planned_clip_sequence else None
 
             if planned_clip:
@@ -1020,15 +1050,33 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 max_start = max(0.0, prores_duration - float(exact_duration))
                 segment_start = _stable_rng('prores_start', i, prores_file).uniform(0.0, max_start)
 
-            # Extract segment
-            segment_file = extract_prores_segment_random(
-                prores_file, exact_duration, prores_fps, segments_dir, i,
-                start_time=segment_start
-            )
-            segment_files.append(segment_file)
+            extraction_jobs.append((i, prores_file, exact_duration, segment_start))
 
-            if (i + 1) % 10 == 0:
-                print(f"   ✓ Extracted {i + 1}/{total_clips} segments (frame-perfect)")
+        # Phase 2 (pooled): each extraction is an independent ffmpeg run
+        # writing its own segment_<index>.mov; results are collected by index
+        # so completion order can never reorder the timeline.
+        completed_segments = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(
+                    extract_prores_segment_random, prores_file, exact_duration,
+                    prores_fps, segments_dir, i, start_time=segment_start): i
+                for i, prores_file, exact_duration, segment_start in extraction_jobs
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    segment_files[idx] = future.result()
+                except Exception as e:
+                    # The serial loop let extraction errors propagate; keep
+                    # that contract (a missing segment would silently drift
+                    # every later cut against the audio).
+                    raise RuntimeError(
+                        f"ProRes segment {idx + 1}/{total_clips} extraction failed: {e}"
+                    ) from e
+                completed_segments += 1
+                if completed_segments % 10 == 0:
+                    print(f"   ✓ Extracted {completed_segments}/{total_clips} segments (frame-perfect)")
         
         print(f"✓ Extracted all {len(segment_files)} segments (frame-perfect, video only)")
         
@@ -1063,7 +1111,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         
         # Cleanup
         print(f"🧹 Cleaning up temporary files...")
-        time.sleep(1.0)
+        if os.name == 'nt':
+            # Windows can hold file handles briefly after ffmpeg exits; give
+            # the OS a beat before deleting. POSIX has no such lag.
+            time.sleep(1.0)
         gc.collect()
         
         for segment_file in segment_files:

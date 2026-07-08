@@ -283,10 +283,20 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         print(f"   ⚠️  HPSS harmonic/percussive split failed; using raw audio for both: {e}")
         y_harmonic, y_percussive = y, y
 
+    # Stages 1-2 read onset strength off the same percussive signal three times
+    # (median beat grid, mean flux, SuperFlux). All three build the identical
+    # log-power mel internally, so compute it once here and share it. The
+    # parameters replicate onset_strength's default feature exactly: default
+    # n_fft=2048 (the stage calls never passed n_fft), fmax=sr/2, then
+    # np.abs + power_to_db, matching librosa's onset_strength_multi.
+    mel_S = librosa.power_to_db(np.abs(librosa.feature.melspectrogram(
+        y=y_percussive, sr=sr, hop_length=cfg.hop_length, fmax=0.5 * sr,
+    )))
+
     _notify_progress(progress_callback, 1)
     print("   🥁 Step 1: Detecting stable beat grid...")
     beat_times, tempo, beat_frames, onset_env, downbeat_times = detect_master_beat_grid(
-        y_percussive, sr, cfg, y_full=y
+        y_percussive, sr, cfg, y_full=y, mel_S=mel_S
     )
     if len(beat_times) < 2:
         raise ValueError("Auto Mode could not detect enough rhythmic events to build a cut plan.")
@@ -301,7 +311,7 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     features = analyze_wave_features(
         y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu,
         y_harmonic=y_harmonic, audio_file=audio_file,
-        start_time=start_time, duration=duration,
+        start_time=start_time, duration=duration, mel_S=mel_S,
     )
     if downbeat_times.size:
         # Real downbeats replace the naive every-4th-beat grid: bar anchors are

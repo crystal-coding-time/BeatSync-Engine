@@ -3,7 +3,7 @@
 macOS port of a Windows-only beat-synced music video generator. Owner is learning self-hosting; explain non-obvious decisions briefly.
 
 ## Ground rules
-- **The only docs are this file and `README.mac.md` (user-facing usage). Every feature change keeps both accurate in the same commit — need-to-know only, no roadmaps or TODO files.**
+- **The only durable docs are this file and `README.mac.md` (user-facing usage). Every feature change keeps both accurate in the same commit — need-to-know only. Temporary TODO/tracking files are fine during multi-step work, but delete them when the work they track is complete.**
 - Work on the `mac-port` branch. `origin` is upstream (`Merserk/BeatSync-Engine`, read-only); push to the `fork` remote (`crystal-coding-time/BeatSync-Engine`). Keep Windows behavior intact: platform-specific code branches on `os.name == 'nt'` or falls back from bundled `bin/` paths to `PATH` lookups.
 - Python env: `.venv` (Homebrew python@3.13), no CuPy on Mac. Launch with `./run.sh` (Gradio UI on 7860).
 - Working rhythm: land a change uncommitted → restart the service → owner tests → commit only on his OK.

@@ -21,6 +21,7 @@ import random
 import shutil
 import uuid
 import re
+from dataclasses import dataclass
 from typing import Tuple, List
 
 
@@ -45,14 +46,31 @@ NVENC_AQ_STRENGTH = '12'
 
 
 def _run_media_command(cmd: List[str], timeout: int) -> subprocess.CompletedProcess[str]:
-    """Run an FFmpeg/FFprobe command with consistent capture settings."""
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    """Run an FFmpeg/FFprobe command with consistent capture settings.
+
+    A hung process (TimeoutExpired) comes back as a synthesized failed result
+    (returncode 124, stderr notes the timeout) so every caller's existing
+    `returncode != 0` fallback handles it — the exception never escapes
+    mid-pipeline."""
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        def _as_text(raw) -> str:
+            if isinstance(raw, bytes):
+                return raw.decode('utf-8', errors='replace')
+            return raw or ''
+        detail = f"timed out after {timeout}s"
+        stderr = _as_text(exc.stderr)
+        stderr = f"{stderr}\n{detail}".strip() if stderr else detail
+        return subprocess.CompletedProcess(cmd, returncode=124,
+                                           stdout=_as_text(exc.stdout),
+                                           stderr=stderr)
 
 
 def _safe_remove_file(path: str | None) -> None:
@@ -559,7 +577,102 @@ def get_fit_filters(target_size: Tuple[int, int], fit_mode: str, *,
     ]
 
 
-_SOURCE_DISPLAY_INFO_CACHE: dict = {}
+@dataclass(frozen=True)
+class MediaInfo:
+    """One ffprobe's worth of per-source facts (a single spawn per file).
+
+    A None field means ffprobe ran fine but could not report that property
+    (audio files have no video stream; some containers carry no format-level
+    duration). sar defaults to 1.0 — missing/degenerate sample aspect ratios
+    ("0:1", "N/A") mean square pixels, exactly like the old display probe.
+    """
+    duration: float | None
+    fps: float | None
+    width: int | None
+    height: int | None
+    sar: float = 1.0
+
+
+def _probe_media_info(video_file: str) -> MediaInfo | None:
+    """Every per-source fact in ONE ffprobe spawn; None when the probe itself
+    fails (nonzero exit / timeout / unparseable JSON) so callers never cache
+    a transient error. Field-level parse gaps are permanent facts about the
+    file and come back as None fields on an otherwise valid MediaInfo."""
+    try:
+        probe_cmd = [
+            FFPROBE_PATH,
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries',
+            'stream=width,height,r_frame_rate,sample_aspect_ratio:format=duration',
+            '-of', 'json',
+            video_file,
+        ]
+        result = _run_media_command(probe_cmd, timeout=10)
+        if result.returncode != 0:
+            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
+        data = json.loads(result.stdout)
+    except Exception as e:
+        print(f"   ⚠️  Could not probe media info ({os.path.basename(video_file)}): {e}")
+        return None
+
+    duration = None
+    try:
+        # ffprobe emits duration as a string; float() of it equals the old
+        # text-mode probe's float(stdout.strip()) exactly.
+        duration = float((data.get('format') or {})['duration'])
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    fps = width = height = None
+    sar = 1.0
+    streams = data.get('streams') or []
+    if streams:
+        stream = streams[0]
+        try:
+            width = int(stream['width'])
+            height = int(stream['height'])
+        except (KeyError, TypeError, ValueError):
+            width = height = None
+        fps_str = str(stream.get('r_frame_rate') or '')
+        try:
+            # Same fraction math as the old fps probe ("30000/1001", "30/1",
+            # bare "30").
+            if '/' in fps_str:
+                num, den = fps_str.split('/')
+                fps = float(num) / float(den)
+            elif fps_str:
+                fps = float(fps_str)
+        except (ValueError, ZeroDivisionError):
+            fps = None
+        raw_sar = str(stream.get('sample_aspect_ratio') or '')
+        if ':' in raw_sar:
+            try:
+                num, den = raw_sar.split(':', 1)
+                if float(num) > 0 and float(den) > 0:
+                    sar = float(num) / float(den)
+            except ValueError:
+                pass
+    return MediaInfo(duration=duration, fps=fps, width=width, height=height,
+                     sar=sar)
+
+
+_MEDIA_INFO_CACHE: dict = {}
+
+
+def _get_media_info(video_file: str) -> MediaInfo | None:
+    """Cached single-probe lookup (segments hit the same sources repeatedly).
+
+    Only successful probes are cached — the per-property "never cache
+    failures" contract: a transient ffprobe error returns None and stays
+    uncached so a later lookup can recover."""
+    cached = _MEDIA_INFO_CACHE.get(video_file)
+    if cached is not None:
+        return cached
+    info = _probe_media_info(video_file)
+    if info is not None:
+        _MEDIA_INFO_CACHE[video_file] = info
+    return info
 
 
 def get_cached_display_info(video_file: str):
@@ -569,36 +682,10 @@ def get_cached_display_info(video_file: str):
     which is what fit decisions must compare — scale's
     force_original_aspect_ratio only looks at storage dimensions.
     """
-    cached = _SOURCE_DISPLAY_INFO_CACHE.get(video_file)
-    if cached is not None:
-        return cached
-    try:
-        probe_cmd = [
-            FFPROBE_PATH,
-            '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height,sample_aspect_ratio',
-            '-of', 'json',
-            video_file,
-        ]
-        result = _run_media_command(probe_cmd, timeout=10)
-        if result.returncode != 0:
-            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
-        stream = json.loads(result.stdout)['streams'][0]
-        width = int(stream['width'])
-        height = int(stream['height'])
-        sar = 1.0
-        raw_sar = str(stream.get('sample_aspect_ratio') or '')
-        if ':' in raw_sar:
-            num, den = raw_sar.split(':', 1)
-            if float(num) > 0 and float(den) > 0:
-                sar = float(num) / float(den)
-        info = (width * sar, float(height), sar)
-        _SOURCE_DISPLAY_INFO_CACHE[video_file] = info
-        return info
-    except Exception as e:
-        print(f"   ⚠️  Could not probe display size ({os.path.basename(video_file)}): {e}")
+    info = _get_media_info(video_file)
+    if info is None or info.width is None or info.height is None:
         return None
+    return (info.width * info.sar, float(info.height), info.sar)
 
 
 def _crop_loss(display_size: Tuple[float, float],
@@ -1184,9 +1271,6 @@ def get_cpu_h264_quality_args(include_pix_fmt: bool = True) -> List[str]:
     return args
 
 
-_SOURCE_DURATION_CACHE: dict = {}
-
-
 def _cached_video_duration(video_file: str) -> Tuple[float, bool]:
     """(duration, known) with a per-run cache (segments hit sources repeatedly).
 
@@ -1200,16 +1284,10 @@ def _cached_video_duration(video_file: str) -> Tuple[float, bool]:
         # ffprobe reports one frame (~0.04s) for a still; the synthetic
         # duration lets stills fill any segment (extraction loops them).
         return SYNTHETIC_IMAGE_DURATION, True
-    cached = _SOURCE_DURATION_CACHE.get(video_file)
-    if cached is not None:
-        return cached, True
-    probed = _probe_video_duration(video_file)
-    if probed is None:
-        # Don't cache failures: a transient ffprobe error must not pin the
-        # fallback for the rest of the run.
+    info = _get_media_info(video_file)
+    if info is None or info.duration is None:
         return 0.0, False
-    _SOURCE_DURATION_CACHE[video_file] = probed
-    return probed, True
+    return info.duration, True
 
 
 def get_cached_video_duration(video_file: str) -> float:
@@ -1252,36 +1330,14 @@ def get_loop_input_args(video_file: str, start_time: float, duration: float) -> 
     return ['-stream_loop', str(loops)], start_time
 
 
-def _probe_video_duration(video_file: str) -> float | None:
-    """Duration via ffprobe; None on failure so callers can avoid caching it."""
-    try:
-        probe_cmd = [
-            FFPROBE_PATH,
-            '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_file
-        ]
-
-        result = _run_media_command(probe_cmd, timeout=10)
-        if result.returncode != 0:
-            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
-        duration = float(result.stdout.strip())
-        return duration
-    except Exception as e:
-        print(f"   ⚠️  Could not get video duration with ffprobe ({os.path.basename(video_file)}): {e}")
-        return None
-
-
 def get_video_duration(video_file: str) -> float:
     """Get the duration of a video file using ffprobe."""
     if is_image_source(video_file):
         return SYNTHETIC_IMAGE_DURATION
-    duration = _probe_video_duration(video_file)
-    return 10.0 if duration is None else duration  # Default fallback
-
-
-_SOURCE_FPS_CACHE: dict = {}
+    info = _get_media_info(video_file)
+    if info is None or info.duration is None:
+        return 10.0  # Default fallback
+    return info.duration
 
 
 def get_cached_video_fps(video_file: str) -> float:
@@ -1297,45 +1353,10 @@ def get_cached_video_fps(video_file: str) -> float:
         # default (25) which must not masquerade as a real source fps.
         # Callers detecting output fps should skip image sources entirely.
         return 30.0
-    cached = _SOURCE_FPS_CACHE.get(video_file)
-    if cached is None:
-        cached = _probe_video_fps(video_file)
-        if cached is None:
-            # Don't cache failures: a transient ffprobe error must not pin the
-            # 30fps fallback for the rest of the run.
-            return 30.0
-        _SOURCE_FPS_CACHE[video_file] = cached
-    return cached
-
-
-def _probe_video_fps(video_file: str) -> float | None:
-    """fps via ffprobe; None on failure so callers can avoid caching it."""
-    try:
-        probe_cmd = [
-            FFPROBE_PATH,
-            '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=r_frame_rate',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_file
-        ]
-
-        result = _run_media_command(probe_cmd, timeout=10)
-        if result.returncode != 0:
-            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
-        fps_str = result.stdout.strip()
-
-        # Parse fraction (e.g., "30000/1001" or "30/1")
-        if '/' in fps_str:
-            num, den = fps_str.split('/')
-            fps = float(num) / float(den)
-        else:
-            fps = float(fps_str)
-
-        return fps
-    except Exception as e:
-        print(f"   ⚠️  Could not get video FPS with ffprobe ({os.path.basename(video_file)}): {e}")
-        return None
+    info = _get_media_info(video_file)
+    if info is None or info.fps is None:
+        return 30.0
+    return info.fps
 
 
 def get_video_fps(video_file: str) -> float:
@@ -1345,34 +1366,18 @@ def get_video_fps(video_file: str) -> float:
         # default (25) which must not masquerade as a real source fps.
         # Callers detecting output fps should skip image sources entirely.
         return 30.0
-    fps = _probe_video_fps(video_file)
-    return 30.0 if fps is None else fps  # Default fallback
+    info = _get_media_info(video_file)
+    if info is None or info.fps is None:
+        return 30.0  # Default fallback
+    return info.fps
 
 
 def get_video_resolution(video_file: str) -> Tuple[int, int]:
     """Get the resolution (width, height) of a video file using ffprobe."""
-    try:
-        probe_cmd = [
-            FFPROBE_PATH,
-            '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'json',
-            video_file
-        ]
-        
-        result = _run_media_command(probe_cmd, timeout=10)
-        if result.returncode != 0:
-            raise RuntimeError(_short_ffmpeg_error(result.stderr, 300) or "ffprobe failed")
-        data = json.loads(result.stdout)
-
-        width = data['streams'][0]['width']
-        height = data['streams'][0]['height']
-
-        return (width, height)
-    except Exception as e:
-        print(f"   ⚠️  Could not get video resolution with ffprobe ({os.path.basename(video_file)}): {e}")
+    info = _get_media_info(video_file)
+    if info is None or info.width is None or info.height is None:
         return (1920, 1080)  # Default fallback
+    return (info.width, info.height)
 
 
 def seconds_to_frame_count(seconds: float, fps: float) -> int:
@@ -1668,6 +1673,66 @@ def _lut3d_filter(cube_path: str) -> str:
     return f"lut3d=file='{escaped}'"
 
 
+def _segment_encoder_args(use_nvenc: bool, gpu_encoder: str) -> List[str]:
+    """The exact encoder args a segment extraction uses, so a re-encoded
+    crossfade chunk stream-copy-concats with the untouched segments."""
+    if use_nvenc:
+        return get_gpu_quality_args(gpu_encoder, include_pix_fmt=True)
+    return get_cpu_h264_quality_args(include_pix_fmt=True)
+
+
+def _segment_encode_tail(output_frame_count: int, fps: float, use_nvenc: bool,
+                         gpu_encoder: str, output_file: str) -> List[str]:
+    """The shared encode/mux tail of every segment-shaped render:
+    -vframes cap (the frame-count authority) → encoder args → no-audio CFR
+    mux flags → output path. One definition keeps all call sites emitting
+    byte-identical argv."""
+    args = ['-vframes', str(output_frame_count)]
+    args.extend(_segment_encoder_args(use_nvenc, gpu_encoder))
+    args.extend([
+        '-an',
+        '-fps_mode', 'cfr',  # Constant frame rate
+        '-r', str(fps),   # Exact output FPS
+        '-fflags', '+genpts',
+        '-movflags', '+faststart',
+        '-y',
+        output_file,
+    ])
+    return args
+
+
+# _run_and_verify_segment detail for a clean encode whose OUTPUT failed the
+# checks (missing/empty file or frame-count mismatch). Callers that only log
+# encoder errors compare against this to keep those failures silent.
+_VERIFY_FAILED_DETAIL = "output verification failed"
+
+
+def _run_and_verify_segment(cmd: List[str], output_file: str,
+                            output_frame_count: int,
+                            timeout: int = 120) -> Tuple[bool, str]:
+    """Run a segment-shaped encode and apply the standard checks:
+    returncode → output exists and is non-empty → exact frame-count guard
+    (returncode 0 does not prove the window held enough source: -vframes
+    truncates a short window without complaint, and one short segment drifts
+    every later cut).
+
+    Returns (ok, failure_detail). ffmpeg-level failures carry the stderr
+    tail; output-check failures carry _VERIFY_FAILED_DETAIL. A hung encoder
+    (TimeoutExpired) degrades into the same (False, detail) path instead of
+    raising, so callers' existing fallbacks handle it."""
+    try:
+        result = _run_media_command(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    if result.returncode != 0:
+        return False, _short_ffmpeg_error(result.stderr, 400)
+    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+        return False, _VERIFY_FAILED_DETAIL
+    if not _verify_segment_frames(output_file, output_frame_count):
+        return False, _VERIFY_FAILED_DETAIL
+    return True, ""
+
+
 def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: float,
                                 output_file: str, fps: float, target_size: Tuple[int, int],
                                 use_nvenc: bool,
@@ -1821,28 +1886,13 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                 # briefly-short branch by repeating its last frame
                 # (framesync default), so the cap — not the shortest branch —
                 # stays the frame-count authority.
-                cmd.extend(['-vframes', str(output_frame_count)])
-                if use_nvenc:
-                    cmd.extend(get_gpu_quality_args(gpu_encoder, include_pix_fmt=True))
-                else:
-                    cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
-                cmd.extend([
-                    '-an',
-                    '-fps_mode', 'cfr',
-                    '-r', str(fps),
-                    '-fflags', '+genpts',
-                    '-movflags', '+faststart',
-                    '-y',
-                    output_file
-                ])
-                result = _run_media_command(cmd, timeout=120)
-                if (result.returncode == 0
-                        and os.path.exists(output_file)
-                        and os.path.getsize(output_file) > 0
-                        and _verify_segment_frames(output_file, output_frame_count)):
+                cmd.extend(_segment_encode_tail(output_frame_count, fps,
+                                                use_nvenc, gpu_encoder,
+                                                output_file))
+                ok, detail = _run_and_verify_segment(cmd, output_file,
+                                                     output_frame_count)
+                if ok:
                     return True
-                detail = (_short_ffmpeg_error(result.stderr, 400)
-                          if result.returncode != 0 else "output verification failed")
                 print(f"   ⚠️  Duo render failed for {os.path.basename(output_file)} ({detail}) — retrying solo")
                 partner = None
 
@@ -1970,42 +2020,16 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         else:
             cmd.extend(['-vf', filter_complex])
 
-        # ✅ FRAME-ACCURATE DURATION: Use -vframes instead of -t
-        cmd.extend(['-vframes', str(output_frame_count)])
-        
-        # Video encoding
-        if use_nvenc:
-            cmd.extend(get_gpu_quality_args(gpu_encoder, include_pix_fmt=True))
-        else:
-            cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
-        
-        # No audio, frame-accurate settings
-        cmd.extend([
-            '-an',
-            '-fps_mode', 'cfr',  # Constant frame rate
-            '-r', str(fps),   # Exact output FPS
-            '-fflags', '+genpts',
-            '-movflags', '+faststart',
-            '-y',
-            output_file
-        ])
-        
-        result = _run_media_command(cmd, timeout=120)
-        
-        if result.returncode != 0:
-            print(f"   ⚠️  FFmpeg error: {result.stderr}")
-            return False
-        
-        # Verify output exists and has content
-        if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-            return False
+        # ✅ FRAME-ACCURATE DURATION: -vframes (not -t) caps the output; the
+        # shared tail carries the encoder + no-audio CFR mux flags.
+        cmd.extend(_segment_encode_tail(output_frame_count, fps, use_nvenc,
+                                        gpu_encoder, output_file))
 
-        # Frame-count guard on every segment: returncode 0 does not prove the
-        # window held enough source (-vframes truncates a short window without
-        # complaint), and one short segment drifts every later cut.
-        if not _verify_segment_frames(output_file, output_frame_count):
+        ok, detail = _run_and_verify_segment(cmd, output_file, output_frame_count)
+        if not ok:
+            if detail != _VERIFY_FAILED_DETAIL:
+                print(f"   ⚠️  FFmpeg error: {detail}")
             return False
-
         return True
 
     except Exception as e:
@@ -2017,14 +2041,6 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
 # xfade transitions used for calm-boundary crossfades. fade is the common
 # case; the wipes/smooth are the occasional variation (seeded per boundary).
 XFADE_TRANSITIONS = ('fade', 'wipeleft', 'wiperight', 'smoothup')
-
-
-def _segment_encoder_args(use_nvenc: bool, gpu_encoder: str) -> List[str]:
-    """The exact encoder args a segment extraction uses, so a re-encoded
-    crossfade chunk stream-copy-concats with the untouched segments."""
-    if use_nvenc:
-        return get_gpu_quality_args(gpu_encoder, include_pix_fmt=True)
-    return get_cpu_h264_quality_args(include_pix_fmt=True)
 
 
 def build_crossfade_chunk(file_a_ext: str, file_b: str, output_file: str,
@@ -2062,24 +2078,13 @@ def build_crossfade_chunk(file_a_ext: str, file_b: str, output_file: str,
     cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
     cmd.extend(['-i', file_a_ext, '-i', file_b])
     cmd.extend(['-filter_complex', filter_complex, '-map', '[outv]'])
-    cmd.extend(['-vframes', str(total_frames)])
-    cmd.extend(_segment_encoder_args(use_nvenc, gpu_encoder))
-    cmd.extend([
-        '-an',
-        '-fps_mode', 'cfr',
-        '-r', str(fps),
-        '-fflags', '+genpts',
-        '-movflags', '+faststart',
-        '-y',
-        output_file,
-    ])
-    result = _run_media_command(cmd, timeout=180)
-    if result.returncode != 0:
-        print(f"   ⚠️  Crossfade chunk failed: {_short_ffmpeg_error(result.stderr, 400)}")
-        return False
-    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-        return False
-    return _verify_segment_frames(output_file, total_frames)
+    cmd.extend(_segment_encode_tail(total_frames, fps, use_nvenc, gpu_encoder,
+                                    output_file))
+    ok, detail = _run_and_verify_segment(cmd, output_file, total_frames,
+                                         timeout=180)
+    if not ok and detail != _VERIFY_FAILED_DETAIL:
+        print(f"   ⚠️  Crossfade chunk failed: {detail}")
+    return ok
 
 
 def truncate_segment_to_frames(input_file: str, output_file: str,
@@ -2095,24 +2100,13 @@ def truncate_segment_to_frames(input_file: str, output_file: str,
     frames = max(1, int(frames))
     cmd = [FFMPEG_PATH]
     cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
-    cmd.extend(['-i', input_file, '-vframes', str(frames)])
-    cmd.extend(_segment_encoder_args(use_nvenc, gpu_encoder))
-    cmd.extend([
-        '-an',
-        '-fps_mode', 'cfr',
-        '-r', str(fps),
-        '-fflags', '+genpts',
-        '-movflags', '+faststart',
-        '-y',
-        output_file,
-    ])
-    result = _run_media_command(cmd, timeout=120)
-    if result.returncode != 0:
-        print(f"   ⚠️  Crossfade truncate fallback failed: {_short_ffmpeg_error(result.stderr, 400)}")
-        return False
-    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-        return False
-    return _verify_segment_frames(output_file, frames)
+    cmd.extend(['-i', input_file])
+    cmd.extend(_segment_encode_tail(frames, fps, use_nvenc, gpu_encoder,
+                                    output_file))
+    ok, detail = _run_and_verify_segment(cmd, output_file, frames)
+    if not ok and detail != _VERIFY_FAILED_DETAIL:
+        print(f"   ⚠️  Crossfade truncate fallback failed: {detail}")
+    return ok
 
 
 def extract_prores_segment_random(video_file: str, duration: float, fps: float,
