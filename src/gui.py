@@ -407,6 +407,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        effect_seed: float = 0,
                        look_cube: str = '',
                        variety: float = 0.4,
+                       semantic_variety: float = 0.4,
                        speed_ramps: bool = False,
                        split_screen: bool = True,
                        text_entries: str = '', text_position: str = 'bottom',
@@ -428,6 +429,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             effect_seed = settings.get('effect_seed', effect_seed)
             look_cube = settings.get('look_cube', look_cube)
             variety = settings.get('variety', variety)
+            semantic_variety = settings.get('semantic_variety', semantic_variety)
             speed_ramps = settings.get('speed_ramps', speed_ramps)
             split_screen = settings.get('split_screen', split_screen)
             text_entries = settings.get('text_entries', text_entries)
@@ -552,6 +554,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             'effect_seed': resolved_seed,
             'look_cube': (None if is_prores else (look_cube or None)),
             'variety': variety,
+            'semantic_variety': semantic_variety,
             'speed_ramps': bool(speed_ramps),
             'split_screen': bool(split_screen),
             'text_entries': [line.strip() for line in (text_entries or '').splitlines() if line.strip()],
@@ -640,7 +643,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  effect_style: str,
                  effect_intensity: float, effect_mode: str,
                  effect_palette: List[str], effect_seed: float,
-                 look_cube: str, variety: float, speed_ramps: bool,
+                 look_cube: str, variety: float, semantic_variety: float, speed_ramps: bool,
                  split_screen: bool,
                  text_entries: str, text_position: str,
                  text_scale: float, session_state: dict) -> Iterator[StatusResult]:
@@ -662,6 +665,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
         'effect_seed': effect_seed,
         'look_cube': look_cube,
         'variety': variety,
+        'semantic_variety': semantic_variety,
         'speed_ramps': bool(speed_ramps),
         'split_screen': bool(split_screen),
         'text_entries': text_entries,
@@ -894,6 +898,9 @@ def create_ui() -> gr.Blocks:
                     variety_input = gr.Slider(
                         0.0, 1.0, value=0.4, step=0.05, label='Source variety',
                         info='0 = pure quality picks (some uploads may never appear). Higher guarantees every source at least one moment and spreads usage more evenly.')
+                    semantic_variety_input = gr.Slider(
+                        0.0, 1.0, value=0.4, step=0.05, label='Visual variety',
+                        info='Avoid runs of visually similar shots (needs the DINOv2 model — scripts/fetch_dinov2.py).')
                     speed_ramps_input = gr.Checkbox(
                         value=False, label='Speed ramps (experimental)',
                         info='Beat-aware retiming: slow-mo drifts on calm parts, rushes through builds, decel ramps and freeze hits on drops. Frame counts stay exact; H.264/HEVC modes only.')
@@ -946,7 +953,7 @@ def create_ui() -> gr.Blocks:
                 fit_mode_input, output_format_input,
                 effect_style_input, effect_intensity_input,
                 effect_mode_input, effect_palette_input, effect_seed_input,
-                look_input, variety_input, speed_ramps_input,
+                look_input, variety_input, semantic_variety_input, speed_ramps_input,
                 split_screen_input,
                 text_entries_input, text_position_input, text_scale_input,
                 session_state

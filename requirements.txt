@@ -5,6 +5,9 @@ llvmlite==0.47.0
 numpy==2.4.4
 opencv-python-headless==4.13.0.92
 pillow==12.2.0
+# Visual-variety embeddings (DINOv2 via scripts/fetch_dinov2.py); CPU inference,
+# feature degrades gracefully if absent
+onnxruntime==1.27.0
 cupy-cuda13x[ctk]==14.1.1
 # Optional macOS downbeat backend (BEATSYNC_BEAT_BACKEND=beat_this) — not
 # installed by the Windows flow; install manually:

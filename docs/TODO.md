@@ -29,20 +29,32 @@ From the 2026-07-07 adversarially-verified pipeline review (13 confirmed/plausib
 | 11.15 | Integration: cross-file check, ROADMAP.md sync, headless smoke (determinism + frame guards), restart run.sh | (lead) | — | 💾 |
 | 11.16 | Owner-reported render failure (clip 133, 75/105 frames): GIF trailing display-duration gap — `tpad=stop_mode=clone` before `fps=` in the shared segment chain; pre-existing bug, reproduced + fixed against the real render | `src/ffmpeg_processing.py` | High | 💾 |
 
-## Wave 12 — source variety + semantic diversity ⏸ (owner picks direction after wave 11)
+## Wave 12 — semantic diversity + fair-share variety 💾 (committed 2026-07-08)
 
-- Approach A: DINOv2 ViT-S/14 (ONNX, CPU) embeddings in the existing analysis frame pass → deterministic
-  online cosine clustering → windowed-MMR + cluster-run penalties in the stage6 auction (0 = byte-identical)
-- Approach B: proportional-fair EWMA usage term replacing the linear uncapped file penalty (reservations stay)
-- Approach C (optional): min-cost-flow reservation seating (OR-Tools), auction untouched
-- Prereq: 11.10 (score memoization) — done in wave 11
+Approach A (DINOv2 embeddings + windowed-MMR/cluster penalties) + Approach B (proportional-fair
+usage). Approach C (min-cost-flow seating) stays backlog. Contract: candidates gain optional
+`embedding` (384-d unit list, 4dp) + `visual_cluster` (int) keys; sidecar cache keeps existing
+analysis/Qwen caches valid (no ANALYSIS_VERSION bump).
 
-## Wave 13 — pacing + kinetic ⏸ (owner picks direction)
+| # | Task | File(s) | Status |
+|---|------|---------|--------|
+| 12.1 | Embedding infra: DINOv2 ViT-S/14 ONNX (CPU, deterministic), sidecar per-video cache, online cosine clustering, fetch script, kill switches | `src/visual_embeddings.py`, `scripts/fetch_dinov2.py` (new) | 💾 |
+| 12.2 | Auction: windowed-MMR + cluster-run penalties (`semantic_variety`, 0 = byte-identical) + proportional-fair EWMA usage term for variety>0 (variety=0 stays exact legacy) | `src/auto_mode/stage6_av_planner.py` | 💾 |
+| 12.3 | Plumbing: Visual variety slider (Advanced), settings threading, embed annotation call before planning (graceful skip) | `src/gui.py`, `src/video_processor.py` | 💾 |
+| 12.4 | Integration: fetch model, cross-check, docs sync (ROADMAP + README), smoke (with + without model), restart | (lead) | 💾 |
 
-- Tier 0 audio (no deps): SuperFlux onsets + backtracking, strict-margin HPSS pseudo-stems,
-  tonnetz harmonic-change cut candidates for flow/soft, ffmpeg ebur128 momentary LUFS as impact scalar
-- Inline `minterpolate` slow-mo (measured deterministic, ~12s CPU per output second; +4-frame
-  over-provision; lifts the ≥50fps gate for sub-0.6x)
+## Wave 13 — pacing + kinetic (in flight, owner approved)
+
+Contract: features dict gains `onset_superflux` / `harmonic_change` / `loudness` (per-beat,
+normalized, zero-filled + ⚠️ on failure); planned clips gain optional `loudness` float;
+retime specs gain optional `interp` factor (deep slow-mo on 24–50fps sources only).
+
+| # | Task | File(s) | Status |
+|---|------|---------|--------|
+| 13.1 | SuperFlux onset + tonnetz harmonic-change + ebur128 momentary-loudness per-beat features; conservative cut-score integration (onset bonus everywhere, HCDF bonus in low-percussive sections) | `src/auto_mode/stage2_features.py`, `stage4_select.py`, `__init__.py` | 🤖 Agent I |
+| 13.2 | Loudness → segment profiles → planned clips; `interp` retime spec (lifts ≥50fps gate for sub-0.6x) + inline `minterpolate` in the retime chain (+4-frame over-provision, tpad synergy) | `src/auto_mode/stage6_av_planner.py`, `src/ffmpeg_processing.py` | 🤖 Agent J |
+| 13.3 | Loudness-scaled punch/flash amplitudes (byte-identical when key absent) | `src/effects.py` | 🤖 Agent K |
+| 13.4 | Integration: cross-check, docs sync, smoke (determinism + frame guards + interp render cost), restart | (lead) | ⬜ |
 
 ## Backlog / opt-in follow-ups
 

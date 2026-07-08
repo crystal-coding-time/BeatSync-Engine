@@ -215,6 +215,30 @@ the process inputs list order untouched by construction:
 - Frame fit is now Auto (the smart ladder) / Blurred background / Letterbox; `'stretch'`
   survives for headless/settings callers only
 
+## Wave 12 — semantic diversity + fair-share variety ✅ (2026-07-08)
+Two upgrades to stage-6 planning (tracker `docs/TODO.md`; designs from the 2026-07-07 research):
+- **Visual variety** (new GUI slider, Advanced, default 0.4): avoids runs of visually similar
+  shots even across different files. `src/visual_embeddings.py` embeds one frame per analysis
+  candidate with DINOv2 ViT-S/14 via ONNX Runtime (CPU-only single-threaded → deterministic;
+  vectors unit-normalized and 4dp-quantized; per-video sidecar cache in the analysis cache dir
+  keyed by file+model signature — existing analysis/Qwen caches stay valid) and clusters them
+  online by cosine threshold. The auction subtracts a cluster-run penalty (−0.14·sv) and a
+  windowed MMR penalty (−0.22·sv·max(0, max_cos_sim−0.55) vs the last 6 picks; dots rounded to
+  4dp before max — the determinism firewall). Fetch the model with `scripts/fetch_dinov2.py`
+  (~87 MB, gitignored); missing model/onnxruntime or `BEATSYNC_DISABLE_EMBED=1` degrades to
+  zero penalty. sv=0 (and mere key presence) is byte-identical to legacy plans. Duo partners
+  pay and record the same penalties
+- **Proportional-fair source variety** (variety>0 redesigned; variety=0 exact legacy): the
+  linear uncapped per-file reuse penalty — which late in long videos swamped content scores and
+  degenerated to score-blind round-robin — is replaced by a lazily-decayed EWMA fair-share
+  pressure term (`_FairShareEWMA`, τ=24 segments): only sources above fair share pay,
+  proportionally (−variety·0.30·max(0, share·sources−1)). Verified: a dominant high-quality
+  source keeps a bounded, quality-justified lead instead of flattening; coverage reservations
+  unchanged and still hard. **variety>0 plans change vs wave 11 (deliberate)**
+- Plumbing: `semantic_variety` threaded gui → settings → `create_music_video` →
+  `build_planned_clip_sequence`; annotation runs just before planning, never in ProRes mode.
+  `onnxruntime==1.27.0` added to requirements (feature degrades gracefully without it)
+
 ## Wave 11 — review-driven hardening + perf ✅ (2026-07-08)
 Fixes from a multi-agent, adversarially-verified pipeline review (13 confirmed findings +
 1 latent hardening; tracker in `docs/TODO.md`). No new features; behavior changes only on

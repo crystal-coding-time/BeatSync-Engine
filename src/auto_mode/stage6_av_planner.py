@@ -10,6 +10,11 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 
+# Proportional-fair usage pressure (variety>0): how many segments of history one
+# appearance is worth. Larger = slower forgetting = the fair-share view reaches
+# further back. 24 segments ≈ a few phrases at typical cut rates.
+_PF_TAU = 24.0
+
 
 def _clamp(value, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
     try:
@@ -64,6 +69,45 @@ class _ScoreCache:
         return self._scores[key]
 
 
+class _FairShareEWMA:
+    """Lazy-decayed EWMA of per-source appearances, for proportional-fair usage.
+
+    Replaces the linear ``usage[file] * file_rate`` reuse penalty when
+    variety>0 (see ``build_planned_clip_sequence``). Each source stores
+    ``(value, last_index)``; both reads and writes decay that value by
+    ``(1 - 1/TAU) ** (index - last_index)`` at the moment they touch it, so no
+    O(sources) sweep runs per segment — only the single ``total()`` call the
+    scorer makes once per segment does, which is fine at dozens of sources.
+
+    Determinism: pure float math over integer step counts (``index`` is the
+    segment index, monotonically non-decreasing across appends), so identical
+    inputs replay bit-identically. Reads always see ``index >= last_index``
+    (an entry is written at the segment where it is picked and only read on
+    that or a later segment), so the exponent is never negative.
+    """
+
+    __slots__ = ("_decay", "_state")
+
+    def __init__(self, tau: float = _PF_TAU):
+        self._decay = 1.0 - 1.0 / tau
+        self._state: Dict[object, tuple] = {}
+
+    def value(self, key, index: int) -> float:
+        entry = self._state.get(key)
+        if entry is None:
+            return 0.0
+        val, last = entry
+        return val * self._decay ** (index - last)
+
+    def total(self, index: int) -> float:
+        return sum(val * self._decay ** (index - last)
+                   for val, last in self._state.values())
+
+    def add(self, key, index: int, amount: float = 1.0) -> None:
+        # Decay the running value to `index`, then credit this appearance.
+        self._state[key] = (self.value(key, index) + amount, index)
+
+
 # --- Split-screen duo segments (see docs/DESIGN_split_screen.md) -------------
 # A duo pairs the auction's primary clip with a partner clip from a different
 # cross-orientation source (portrait sources on a landscape canvas, or the
@@ -94,6 +138,7 @@ def build_planned_clip_sequence(
     fps: float = 30.0,
     split_screen: bool = False,
     target_size: tuple | None = None,
+    semantic_variety: float = 0.0,
 ) -> List[Dict]:
     """Build exact source clip choices for every output segment.
 
@@ -102,8 +147,30 @@ def build_planned_clip_sequence(
 
     variety=0 is the exact legacy quality auction (no coverage guarantee —
     weak sources can lose every pick). Any variety>0 reserves one segment per
-    source so everything the user uploaded appears at least once, and scales
-    the per-source reuse penalty toward an even spread at 1.0.
+    source so everything the user uploaded appears at least once, and applies
+    proportional-fair usage pressure that pushes over-used sources toward an
+    even spread at 1.0.
+
+    PLAN STABILITY / SLIDER SEMANTICS
+      * variety=0 AND semantic_variety=0 (AND split_screen=False) reproduce the
+        pre-wave-12 plan byte-for-byte — the legacy quality auction, untouched.
+        The mere PRESENCE of ``embedding`` / ``visual_cluster`` keys on
+        candidates changes nothing at semantic_variety=0.
+      * variety>0 plans CHANGE vs. wave 11 (accepted, deliberate): the linear,
+        capped ``file_rate`` reuse penalty is replaced by an EWMA
+        proportional-fair pressure term (``_FairShareEWMA``). The old formula
+        scaled ``file_rate`` linearly and uncapped it, which late in long
+        videos swamped content scores and degenerated to score-blind
+        round-robin; PF instead penalizes only sources running ABOVE their fair
+        share (``share * source_count > 1``), so content ordering survives. The
+        variety slider's meaning is redesigned; variety=0 is unchanged.
+
+    semantic_variety (0..1, needs candidate ``embedding``/``visual_cluster``
+    keys from src/visual_embeddings.py — both OPTIONAL, missing → no penalty)
+    discourages runs of visually similar shots: a cluster-run penalty plus a
+    windowed max-cosine-similarity (MMR-style) penalty against recently picked
+    embeddings. semantic_variety=0 short-circuits the whole feature (no deque
+    bookkeeping, no embedding arithmetic) so it cannot perturb legacy plans.
 
     split_screen=False (the default) produces byte-identical plans to the
     pre-duo planner. When True, some eligible drop/rhythm segments gain an
@@ -129,20 +196,41 @@ def build_planned_clip_sequence(
 
     profiles = _build_segment_profiles(cut_times_arr, durations_arr, beat_info)
     variety = _clamp(variety)
+    semantic_variety = _clamp(semantic_variety)
 
-    # Legacy reuse penalty: 0.012/use capped at 0.18 — too weak for coverage
-    # (the cap means a source ~0.5 below the leaders can never win). With
-    # variety on, the rate scales so a leader at its fair share of segments
-    # yields to unused sources, and the cap goes away.
+    # Legacy reuse penalty: 0.012/use capped at 0.18 (variety=0 only — kept
+    # byte-identical). variety>0 no longer uses it: proportional-fair usage
+    # pressure (below, `pf_ewma`) replaces it, so weak-but-unused sources win
+    # without a leader's penalty growing without bound.
     file_rate, file_cap = 0.012, 0.18
+    source_count = len({c.get("video_file") for c in candidates})
     reservations: Dict[int, Dict] = {}
+    pf_ewma: "_FairShareEWMA | None" = None
     if variety > 0.0:
-        source_count = len({c.get("video_file") for c in candidates})
-        fair_share = len(profiles) / max(1, source_count)
-        file_rate = 0.012 + 1.3 * variety / max(1.0, fair_share)
-        file_cap = float("inf")
+        pf_ewma = _FairShareEWMA()
         reservations = _plan_coverage_reservations(candidates, profiles,
                                                    score_cache)
+
+    # Semantic diversity state (semantic_variety>0 only). Each candidate's
+    # embedding is converted to a float64 array exactly ONCE here, keyed by
+    # id(candidate) like _ScoreCache (candidates are shared by reference for
+    # the whole run). Missing/malformed embeddings simply get no entry →
+    # graceful zero penalty. recent_clusters / recent_embeds are the sliding
+    # windows the MMR-style penalties compare against.
+    embed_arrays: Dict[int, np.ndarray] = {}
+    recent_clusters: deque = deque(maxlen=4)
+    recent_embeds: deque = deque(maxlen=6)
+    if semantic_variety > 0.0:
+        for c in candidates:
+            emb = c.get("embedding")
+            if emb is None:
+                continue
+            try:
+                arr = np.asarray(emb, dtype=np.float64)
+            except (TypeError, ValueError):
+                continue
+            if arr.ndim == 1 and arr.size > 0:
+                embed_arrays[id(c)] = arr
 
     # Duo pairing needs ≥2 distinct cross-orientation, non-still sources; the
     # context is None whenever duos are impossible (including lossless mode:
@@ -172,6 +260,13 @@ def build_planned_clip_sequence(
                 file_rate=file_rate,
                 file_cap=file_cap,
                 score_cache=score_cache,
+                variety=variety,
+                source_count=source_count,
+                pf_ewma=pf_ewma,
+                semantic_variety=semantic_variety,
+                recent_clusters=recent_clusters,
+                recent_embeds=recent_embeds,
+                embed_arrays=embed_arrays,
             )
         if not candidate:
             continue
@@ -196,6 +291,13 @@ def build_planned_clip_sequence(
                 file_rate=file_rate,
                 file_cap=file_cap,
                 score_cache=score_cache,
+                variety=variety,
+                source_count=source_count,
+                pf_ewma=pf_ewma,
+                semantic_variety=semantic_variety,
+                recent_clusters=recent_clusters,
+                recent_embeds=recent_embeds,
+                embed_arrays=embed_arrays,
             )
         if partner_candidate is not None:
             planned_clip["partner"] = _materialize_partner(
@@ -205,12 +307,24 @@ def build_planned_clip_sequence(
         recent_videos.append(candidate.get("video_file"))
         usage[candidate.get("id")] += 1
         usage[candidate.get("video_file")] += 1
+        if variety > 0.0:
+            # Reservations flow through here too (they materialize above like
+            # any pick), so a seated source counts toward its fair share.
+            pf_ewma.add(candidate.get("video_file"), i)
+        if semantic_variety > 0.0:
+            _record_semantic(candidate, recent_clusters, recent_embeds,
+                             embed_arrays)
         if partner_candidate is not None:
             # A pane appearance is an appearance: the partner pays the same
             # reuse/recency costs going forward and counts for coverage.
             recent_videos.append(partner_candidate.get("video_file"))
             usage[partner_candidate.get("id")] += 1
             usage[partner_candidate.get("video_file")] += 1
+            if variety > 0.0:
+                pf_ewma.add(partner_candidate.get("video_file"), i)
+            if semantic_variety > 0.0:
+                _record_semantic(partner_candidate, recent_clusters,
+                                 recent_embeds, embed_arrays)
 
     if len(planned) != len(durations_arr):
         return []
@@ -567,6 +681,49 @@ def _target_for_segment(section: Dict, wave: float, impact: float, rhythm: float
     return "flow"
 
 
+def _record_semantic(candidate: Dict, recent_clusters: deque,
+                     recent_embeds: deque,
+                     embed_arrays: Dict[int, np.ndarray]) -> None:
+    """Push a just-picked candidate's cluster/embedding onto the MMR windows.
+
+    Missing keys append nothing (graceful degradation); the embedding array is
+    the one precomputed up front, never re-derived here.
+    """
+    cluster = candidate.get("visual_cluster")
+    if cluster is not None:
+        recent_clusters.append(cluster)
+    emb = embed_arrays.get(id(candidate))
+    if emb is not None:
+        recent_embeds.append(emb)
+
+
+def _semantic_penalty(candidate: Dict, semantic_variety: float,
+                      recent_clusters: deque, recent_embeds: deque,
+                      embed_arrays: Dict[int, np.ndarray]) -> float:
+    """Diversity penalty for a candidate given the recent-pick windows.
+
+    Two terms, both zero when the candidate lacks the relevant key (graceful
+    degradation) or the window is empty:
+      * cluster-run: -0.14 * sv when this candidate's visual_cluster is one of
+        the last few picked clusters.
+      * windowed MMR: -0.22 * sv * max(0, max_cos_sim - 0.55) against the last
+        few picked embeddings. Each dot product is rounded to 4dp BEFORE the
+        max — that quantization is the determinism firewall against float
+        reassociation drift, so it must not be removed.
+    Returns a POSITIVE amount to subtract from the score.
+    """
+    penalty = 0.0
+    cluster = candidate.get("visual_cluster")
+    if cluster is not None and cluster in recent_clusters:
+        penalty += 0.14 * semantic_variety
+    e_cand = embed_arrays.get(id(candidate))
+    if e_cand is not None and recent_embeds:
+        max_sim = max(round(float(np.dot(e_cand, e_recent)), 4)
+                      for e_recent in recent_embeds)
+        penalty += 0.22 * semantic_variety * max(0.0, max_sim - 0.55)
+    return penalty
+
+
 def _choose_candidate(
     candidates: Sequence[Dict],
     profile: Dict,
@@ -577,11 +734,23 @@ def _choose_candidate(
     file_rate: float = 0.012,
     file_cap: float = 0.18,
     score_cache: "_ScoreCache | None" = None,
+    variety: float = 0.0,
+    source_count: int = 1,
+    pf_ewma: "_FairShareEWMA | None" = None,
+    semantic_variety: float = 0.0,
+    recent_clusters: "deque | None" = None,
+    recent_embeds: "deque | None" = None,
+    embed_arrays: "Dict[int, np.ndarray] | None" = None,
 ) -> Dict | None:
     best_candidate = None
     best_score = -999.0
     rng = _stable_rng(index, profile.get("target"), profile.get("start"))
     _score = score_cache.score if score_cache is not None else _score_candidate
+
+    # Proportional-fair usage denominator, computed once per segment (O(sources)
+    # once, not per candidate). variety=0 keeps the legacy linear file penalty.
+    use_pf = variety > 0.0 and pf_ewma is not None
+    pf_total = pf_ewma.total(index) if use_pf else 0.0
 
     for candidate in candidates:
         score = _score(candidate, profile)
@@ -593,12 +762,22 @@ def _choose_candidate(
         if video_file in recent_videos:
             score -= 0.10
         score -= min(0.28, usage[cid] * 0.10)
-        score -= min(file_cap, usage[video_file] * file_rate)
+        if use_pf:
+            share = pf_ewma.value(video_file, index) / max(1e-9, pf_total)
+            pressure = share * source_count
+            score -= variety * 0.30 * max(0.0, pressure - 1.0)
+        else:
+            score -= min(file_cap, usage[video_file] * file_rate)
 
         required_source = max(0.05, profile["duration"])
         candidate_duration = max(0.05, float(candidate.get("duration", required_source)))
         if candidate_duration < required_source * 0.55:
             score -= 0.18
+
+        if semantic_variety > 0.0:
+            score -= _semantic_penalty(candidate, semantic_variety,
+                                       recent_clusters, recent_embeds,
+                                       embed_arrays)
 
         score += rng.random() * 0.015
         if score > best_score:
@@ -807,6 +986,13 @@ def _maybe_choose_duo_partner(
     file_rate: float,
     file_cap: float,
     score_cache: "_ScoreCache | None" = None,
+    variety: float = 0.0,
+    source_count: int = 1,
+    pf_ewma: "_FairShareEWMA | None" = None,
+    semantic_variety: float = 0.0,
+    recent_clusters: "deque | None" = None,
+    recent_embeds: "deque | None" = None,
+    embed_arrays: "Dict[int, np.ndarray] | None" = None,
 ) -> Dict | None:
     """Partner candidate for a duo segment, or None to render the primary solo.
 
@@ -838,6 +1024,8 @@ def _maybe_choose_duo_partner(
     best_candidate = None
     best_score = -999.0
     _score = score_cache.score if score_cache is not None else _score_candidate
+    use_pf = variety > 0.0 and pf_ewma is not None
+    pf_total = pf_ewma.total(index) if use_pf else 0.0
     for candidate in candidates:
         video_file = candidate.get("video_file")
         if video_file == primary_file or video_file not in pair_files:
@@ -848,7 +1036,9 @@ def _maybe_choose_duo_partner(
 
         # Same shape as the primary auction: fit score minus recent-use and
         # usage penalties (plus the short-source penalty — a looping pane on
-        # a drop is worse than no pane at all).
+        # a drop is worse than no pane at all). A pane appearance is an
+        # appearance, so it carries the same PF pressure / semantic diversity
+        # terms as a solo pick.
         score = _score(candidate, profile)
         cid = candidate.get("id")
         if cid in recent_ids:
@@ -856,11 +1046,21 @@ def _maybe_choose_duo_partner(
         if video_file in recent_videos:
             score -= 0.10
         score -= min(0.28, usage[cid] * 0.10)
-        score -= min(file_cap, usage[video_file] * file_rate)
+        if use_pf:
+            share = pf_ewma.value(video_file, index) / max(1e-9, pf_total)
+            pressure = share * source_count
+            score -= variety * 0.30 * max(0.0, pressure - 1.0)
+        else:
+            score -= min(file_cap, usage[video_file] * file_rate)
         required_source = max(0.05, profile["duration"])
         candidate_duration = max(0.05, float(candidate.get("duration", required_source)))
         if candidate_duration < required_source * 0.55:
             score -= 0.18
+
+        if semantic_variety > 0.0:
+            score -= _semantic_penalty(candidate, semantic_variety,
+                                       recent_clusters, recent_embeds,
+                                       embed_arrays)
 
         anchor = candidate.get("subject_anchor")
         try:

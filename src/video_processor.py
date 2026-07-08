@@ -581,6 +581,11 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         speed_ramps = settings.get('speed_ramps', speed_ramps)
         split_screen = settings.get('split_screen', split_screen)
 
+    # Visual variety only travels via the settings dict (no positional kwarg
+    # on this function) — read it alongside the other settings, defaulting to
+    # the same 0.4 the GUI slider ships with.
+    semantic_variety = float((settings or {}).get('semantic_variety', 0.4))
+
     video_creation_started = time.perf_counter()
 
     if max_workers is None:
@@ -686,12 +691,35 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     # converse). Both render branches below reuse this same resolution.
     target_size = resolve_target_resolution(output_format, video_files)
     render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
+
+    # Visual variety: cluster visually-similar candidates via DINOv2 embeddings
+    # so stage6 can avoid back-to-back similar-looking shots. Lazy/guarded
+    # import — the pipeline must keep running if the embeddings module or its
+    # model weights aren't installed. Never runs in ProRes precise mode (that
+    # branch stays untouched footage, no planner variety games either).
+    if semantic_variety > 0 and not lossless_mode:
+        candidates = ((beat_info or {}).get('video_analysis') or {}).get('candidates')
+        if candidates:
+            try:
+                from visual_embeddings import annotate_candidates_with_embeddings
+                embed_stats = annotate_candidates_with_embeddings(
+                    candidates, sim_threshold=0.82)
+                if embed_stats.get('available'):
+                    print(f"   🎨 Visual embeddings: {embed_stats.get('embedded', 0)} candidates, "
+                          f"{embed_stats.get('clusters', 0)} clusters "
+                          f"({embed_stats.get('seconds', 0.0):.1f}s)")
+            except ImportError:
+                print("   ⚠️  Visual embeddings module not available; skipping visual variety")
+            except Exception as e:
+                print(f"   ⚠️  Visual embeddings failed, continuing un-annotated: {e}")
+
     planned_clip_sequence = build_planned_clip_sequence(
         cut_times=selected_beats,
         segment_durations=segment_durations,
         beat_info=beat_info,
         video_files=video_files,
         variety=variety,
+        semantic_variety=semantic_variety,
         speed_ramps=speed_ramps,
         lossless=lossless_mode,
         fps=fps,
