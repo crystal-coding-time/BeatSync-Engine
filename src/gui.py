@@ -195,9 +195,9 @@ def create_ui() -> gr.Blocks:
         gr.Markdown(f"# {UI_TITLE}")
         gr.Markdown(UI_MAIN_DESCRIPTION)
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown('### 📁 Input Files')
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=2):
+                gr.Markdown('### 1 · Media')
                 # Multi-song: the audio input mirrors the video dropzone
                 # pattern below (accumulating gr.State + list; see the
                 # gradio#10325 note there). Order matters — songs play in the
@@ -308,107 +308,129 @@ def create_ui() -> gr.Blocks:
                     outputs=[video_state, video_list, remove_videos_btn, clear_videos_btn],
                 )
 
-                # Tier 1 — creative intents only. Mechanical knobs live in the
-                # Advanced accordion below; the engine's defaults are the real UI.
-                with gr.Group():
-                    gr.Markdown('### 🎨 Create')
-                    effect_style_input = gr.Radio(
-                        choices=[('Minimal (clean cuts)', 'clean'), ('Music video (AMV)', 'amv'), ('Hype', 'hype')],
-                        value='clean', label='Style',
-                        info='How energetic the edit feels. Beat-aware effects: zooms and flashes on drops, saturation pulses on the beat. Minimal disables effects in every mode.')
-                    look_input = gr.Dropdown(
-                        choices=list_looks(), value='', label='Look',
-                        info='Color grade for the whole video (baked LUTs: film, warm/cool, day-for-night). H.264/HEVC modes only; ProRes stays ungraded.')
-                    output_format_input = gr.Dropdown(
-                        choices=[(label, key) for key, (label, _) in OUTPUT_FORMATS.items()],
-                        value=DEFAULT_OUTPUT_FORMAT, label='Output canvas',
-                        info='The frame every render targets. Fixed canvases keep one odd portrait clip from flipping the whole video; "Match best source" is the old behavior (highest-resolution source decides).')
+            # Zone 2 — every creative decision, grouped by what you're deciding.
+            # The engine's defaults are the real UI; purpose tabs hold the full
+            # control set without a catch-all "Advanced" bucket. Each control
+            # keeps its variable name/values so the settings contract is intact.
+            with gr.Column(scale=3):
+                gr.Markdown('### 2 · Direct the edit')
+                gr.Markdown("*Defaults already look good — tweak only what you want. Each control's help text says what it does.*")
+                with gr.Tabs():
+                    with gr.Tab('Vibe'):
+                        effect_style_input = gr.Radio(
+                            choices=[('Minimal (clean cuts)', 'clean'), ('Music video (AMV)', 'amv'), ('Hype', 'hype')],
+                            value='clean', label='Style',
+                            info='How energetic the edit feels. Beat-aware effects: zooms and flashes on drops, saturation pulses on the beat. Minimal disables effects in every mode.')
+                        look_input = gr.Dropdown(
+                            choices=list_looks(), value='', label='Look',
+                            info='Color grade for the whole video (baked LUTs: film, warm/cool, day-for-night). H.264/HEVC modes only; ProRes stays ungraded.')
+                        effect_intensity_input = gr.Slider(
+                            0.0, 1.0, value=0.7, step=0.05, label='Effect intensity',
+                            info='How hard the beat-aware effects hit. Lower = subtle pulses; higher = punchier zooms and flashes on the drops.')
+                        with gr.Accordion('Customize effects (optional)', open=False):
+                            effect_mode_input = gr.Radio(
+                                choices=[('Curated', 'curated'), ('Custom', 'custom'), ('Surprise shuffle', 'shuffle')],
+                                value='curated', label='Effect mode',
+                                info='Curated = the classic style presets. Custom = pick your own palette. Shuffle = a seeded random palette (same seed, same video).')
+                            # Reveal the palette only for Custom, the seed only
+                            # for Shuffle. Both are created visible=True so they
+                            # mount in the DOM immediately — a control created
+                            # hidden inside a gr.Tab isn't mounted until forced,
+                            # so its first show no-ops (the gradio tab quirk that
+                            # made this need a double-toggle). app.load then hides
+                            # whichever the default mode doesn't use; hiding an
+                            # already-mounted control is reliable, and the panel
+                            # is collapsed so there's no flash on load.
+                            effect_palette_input = gr.CheckboxGroup(
+                                choices=list_effect_choices(), value=[],
+                                label='Effect palette',
+                                info='Picked effects still land where the music calls for them (drops, builds, calm parts).')
+                            effect_seed_input = gr.Number(
+                                value=0, precision=0, label='Shuffle seed',
+                                info='0 = derived from the song. Change it to re-roll the palette; renders stay reproducible.')
 
-                with gr.Group():
-                    gr.Markdown('### 📝 Text Overlays')
-                    text_entries_input = gr.Textbox(
-                        label='Text entries (one per line)', lines=4, value='',
-                        placeholder='Leave empty for no text.\nEach line appears once, spread evenly across the video.\nPin an entry to a time with @: "@15 Finish strong" or "@1:23 Halfway"',
-                        info='Quotes, captions, titles — any text. Every line gets its own beat-snapped time window; @ pins one to a timestamp.')
+                            def _effect_mode_updates(mode):
+                                return (
+                                    gr.update(visible=mode == 'custom'),
+                                    gr.update(visible=mode == 'shuffle'),
+                                )
 
-                # Tier 2 — deliberate overrides of decisions the engine already
-                # makes well. Everything keeps its variable name and values;
-                # only the container (and some labels) changed.
-                with gr.Accordion('⚙️ Advanced', open=False):
-                    gr.Markdown('**Effects**')
-                    effect_mode_input = gr.Radio(
-                        choices=[('Curated', 'curated'), ('Custom', 'custom'), ('Surprise shuffle', 'shuffle')],
-                        value='curated', label='Effect mode',
-                        info='Curated = the classic style presets. Custom = pick your own palette. Shuffle = a seeded random palette (same seed, same video).')
-                    effect_palette_input = gr.CheckboxGroup(
-                        choices=list_effect_choices(), value=[], visible=False,
-                        label='Effect palette',
-                        info='Picked effects still land where the music calls for them (drops, builds, calm parts).')
-                    effect_seed_input = gr.Number(
-                        value=0, precision=0, visible=False, label='Shuffle seed',
-                        info='0 = derived from the song. Change it to re-roll the palette; renders stay reproducible.')
-                    effect_intensity_input = gr.Slider(0.0, 1.0, value=0.7, step=0.05,
-                                                       label='Effect intensity')
+                            effect_mode_input.change(
+                                _effect_mode_updates,
+                                inputs=[effect_mode_input],
+                                outputs=[effect_palette_input, effect_seed_input],
+                            )
+                            # Set the correct initial visibility for the default
+                            # mode (Curated → both hidden) once they're mounted.
+                            app.load(
+                                _effect_mode_updates,
+                                inputs=[effect_mode_input],
+                                outputs=[effect_palette_input, effect_seed_input],
+                            )
 
-                    def _effect_mode_updates(mode):
-                        return (
-                            gr.update(visible=mode == 'custom'),
-                            gr.update(visible=mode == 'shuffle'),
-                        )
+                    with gr.Tab('The Cut'):
+                        variety_input = gr.Slider(
+                            0.0, 1.0, value=0.4, step=0.05, label='Source variety',
+                            info='0 = pure quality picks (some uploads may never appear). Higher guarantees every source at least one moment and spreads usage more evenly.')
+                        semantic_variety_input = gr.Slider(
+                            0.0, 1.0, value=0.4, step=0.05, label='Visual variety',
+                            info='Avoid runs of visually similar shots (needs the DINOv2 model — scripts/fetch_dinov2.py).')
+                        split_screen_input = gr.Checkbox(
+                            value=True, label='Pair vertical clips (split screen)',
+                            info='Renders some high-energy segments as two vertical clips side by side. Needs two or more vertical sources; fires on hard cuts only. H.264/HEVC modes only.')
+                        crossfades_input = gr.Checkbox(
+                            value=False, label='Crossfade calm cuts',
+                            info='Dissolves ~1 in 3 calm (soft/flow) boundaries instead of hard-cutting. Re-encodes those boundary chunks; hard cuts stay the fast default. H.264/HEVC modes only.')
+                        speed_ramps_input = gr.Checkbox(
+                            value=False, label='Speed ramps (experimental)',
+                            info='Beat-aware retiming: slow-mo drifts on calm parts, rushes through builds, decel ramps and freeze hits on drops. Frame counts stay exact; H.264/HEVC modes only.')
 
-                    effect_mode_input.change(
-                        _effect_mode_updates,
-                        inputs=[effect_mode_input],
-                        outputs=[effect_palette_input, effect_seed_input],
-                    )
+                    with gr.Tab('Framing'):
+                        output_format_input = gr.Dropdown(
+                            choices=[(label, key) for key, (label, _) in OUTPUT_FORMATS.items()],
+                            value=DEFAULT_OUTPUT_FORMAT, label='Output canvas',
+                            info='The frame every render targets. Fixed canvases keep one odd portrait clip from flipping the whole video; "Match best source" is the old behavior (highest-resolution source decides).')
+                        fit_mode_input = gr.Radio(
+                            choices=[('Auto (smart)', 'crop'), ('Blurred background', 'blur'), ('Letterbox', 'pad')],
+                            value='crop', label='Frame fit',
+                            info='How sources with a different aspect ratio fill the frame. Auto picks per clip: a subject-tracked crop for small mismatches (trims at most ~15%), a graded blur fill for bigger ones, and a slow scanning pan for extreme ones (e.g. vertical phone clips). Blurred background and Letterbox force that single look on every clip.')
 
-                    gr.Markdown('**Editing**')
-                    variety_input = gr.Slider(
-                        0.0, 1.0, value=0.4, step=0.05, label='Source variety',
-                        info='0 = pure quality picks (some uploads may never appear). Higher guarantees every source at least one moment and spreads usage more evenly.')
-                    semantic_variety_input = gr.Slider(
-                        0.0, 1.0, value=0.4, step=0.05, label='Visual variety',
-                        info='Avoid runs of visually similar shots (needs the DINOv2 model — scripts/fetch_dinov2.py).')
-                    speed_ramps_input = gr.Checkbox(
-                        value=False, label='Speed ramps (experimental)',
-                        info='Beat-aware retiming: slow-mo drifts on calm parts, rushes through builds, decel ramps and freeze hits on drops. Frame counts stay exact; H.264/HEVC modes only.')
-                    split_screen_input = gr.Checkbox(
-                        value=True, label='Pair vertical clips (split screen)',
-                        info='Renders some high-energy segments as two vertical clips side by side. Needs two or more vertical sources; fires on hard cuts only. H.264/HEVC modes only.')
-                    crossfades_input = gr.Checkbox(
-                        value=False, label='Crossfade calm cuts',
-                        info='Dissolves ~1 in 3 calm (soft/flow) boundaries instead of hard-cutting. Re-encodes those boundary chunks; hard cuts stay the fast default. H.264/HEVC modes only.')
+                    with gr.Tab('Text'):
+                        text_entries_input = gr.Textbox(
+                            label='Text entries (one per line)', lines=4, value='',
+                            placeholder='Leave empty for no text.\nEach line appears once, spread evenly across the video.\nPin an entry to a time with @: "@15 Finish strong" or "@1:23 Halfway"',
+                            info='Quotes, captions, titles — any text. Every line gets its own beat-snapped time window; @ pins one to a timestamp.')
+                        with gr.Row():
+                            text_position_input = gr.Radio(
+                                choices=[('Lower third', 'bottom'), ('Center', 'center'), ('Top', 'top')],
+                                value='bottom', label='Text position')
+                            text_scale_input = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label='Text size')
 
-                    gr.Markdown('**Framing**')
-                    fit_mode_input = gr.Radio(
-                        choices=[('Auto (smart)', 'crop'), ('Blurred background', 'blur'), ('Letterbox', 'pad')],
-                        value='crop', label='Frame fit',
-                        info='How sources with a different aspect ratio fill the frame. Auto picks per clip: a subject-tracked crop for small mismatches (trims at most ~15%), a graded blur fill for bigger ones, and a slow scanning pan for extreme ones (e.g. vertical phone clips). Blurred background and Letterbox force that single look on every clip.')
+                    with gr.Tab('Export'):
+                        if NVENC_AVAILABLE:
+                            processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
+                        elif VIDEOTOOLBOX_AVAILABLE:
+                            processing_mode = gr.Radio(choices=[('Apple VideoToolbox H.264', 'h264_videotoolbox'), ('Apple VideoToolbox HEVC (H.265)', 'hevc_videotoolbox'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_videotoolbox', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_videotoolbox())
+                        else:
+                            processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
+                        gr.Markdown('*ProRes Precise Mode keeps footage pristine for external editing: effects, text overlays, looks and speed ramps are **not** applied there.*')
+                        custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
+                        output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
 
-                    gr.Markdown('**Output**')
-                    if NVENC_AVAILABLE:
-                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
-                    elif VIDEOTOOLBOX_AVAILABLE:
-                        processing_mode = gr.Radio(choices=[('Apple VideoToolbox H.264', 'h264_videotoolbox'), ('Apple VideoToolbox HEVC (H.265)', 'hevc_videotoolbox'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_videotoolbox', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_videotoolbox())
-                    else:
-                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
-                    gr.Markdown('*ProRes Precise Mode keeps footage pristine for external editing: effects, text overlays, looks and speed ramps are **not** applied there.*')
-                    custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
-                    output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
-                    with gr.Row():
-                        text_position_input = gr.Radio(
-                            choices=[('Lower third', 'bottom'), ('Center', 'center'), ('Top', 'top')],
-                            value='bottom', label='Text position')
-                        text_scale_input = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label='Text size')
+            # Zone 3 — commit and watch. The recipe line + conflict guard put the
+            # current settings' real effect right next to the render button.
+            with gr.Column(scale=2):
+                gr.Markdown('### 3 · Render & result')
 
                 # --- ProRes Precise Mode conflict guard ----------------------
-                # ProRes voids every creative control below (orchestrator's
+                # ProRes voids every creative control it lists (orchestrator's
                 # to_settings_dict look gate + the lossless_mode branches in
                 # video_processor). Greying them out is COSMETIC ONLY: disabled
                 # inputs still submit their values and the pipeline still
                 # nullifies them, so the resolved settings dict is byte-identical.
                 # This just makes the silent dependency visible. fit_mode and
-                # variety stay live — both are honored on ProRes proxies.
+                # variety stay live — both are honored on ProRes proxies. All the
+                # referenced controls live in the Zone 2 tabs, built above.
                 _prores_disabled_controls = [
                     effect_style_input, look_input,
                     effect_mode_input, effect_palette_input, effect_seed_input,
@@ -477,9 +499,6 @@ def create_ui() -> gr.Blocks:
                 app.load(_render_recipe, inputs=_recipe_inputs, outputs=recipe_readout)
 
                 process_btn = gr.Button('🎬 Create Music Video', variant='primary', size='lg')
-
-            with gr.Column(scale=1):
-                gr.Markdown('### 📺 Output')
                 status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(), lines=4, max_lines=4, elem_id='status-output-box')
                 video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
 
