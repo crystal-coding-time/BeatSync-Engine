@@ -13,6 +13,7 @@ segments until it has been readable for ~3 seconds. Fades are cut-aligned:
 each segment gets fade timings expressed in its own local clock.
 """
 
+import bisect
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -131,43 +132,54 @@ def parse_text_entries(lines: Sequence[str]) -> List[Tuple[str, Optional[float]]
     return entries
 
 
-def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
-                      cut_times: Sequence[float],
-                      beat_times: Optional[Sequence[float]] = None,
-                      planned_clip_sequence: Optional[Sequence[Dict]] = None,
-                      ) -> Tuple[Dict[int, Tuple[str, float, float, float]], List[Tuple[str, float, float]]]:
-    """Plan text on the global audio timeline, then project onto segments.
+def _segment_index_at(cut_times: Sequence[float], time_s: float) -> int:
+    """Index i with cut_times[i] <= time_s < cut_times[i+1] (cut_times is
+    sorted ascending). Falls back to the last segment index when time_s lies
+    outside the timeline, matching the previous linear scan."""
+    i = bisect.bisect_right(cut_times, time_s) - 1
+    if 0 <= i < len(cut_times) - 1:
+        return i
+    return len(cut_times) - 2
 
-    Every entry gets its own disjoint time window: unpinned entries are
-    centered in equal timeline shares, pinned entries go where asked; window
-    starts snap to the nearest beat (preferring non-drop segments). Windows
-    are then projected onto every segment they intersect, with fade timings
-    translated into each segment's local clock.
 
-    Returns (seg_map, schedule):
-      seg_map:  segment index -> (text, fade_in_start, fade_in_duration, fade_out_start)
-      schedule: [(text, window_start, window_end)] for logging.
-    """
-    cut_times = [float(t) for t in cut_times]
-    if not entries or len(cut_times) < 2:
-        return {}, []
-    timeline_start, timeline_end = cut_times[0], cut_times[-1]
-    total = timeline_end - timeline_start
-    if total <= 0.5:
-        return {}, []
+def _occupied_segments(cut_times: Sequence[float], start: float, end: float) -> Tuple[int, int]:
+    """First/last segment a (start, end) window occupies, by the same >0.01s
+    overlap rule the segment projection uses. (-1, -1) if it touches none.
 
+    Overlap requires cut_times[i+1] > start and cut_times[i] < end, so bisect
+    narrows the candidates to the few segments the window spans; the exact
+    original overlap comparison then decides (no epsilon arithmetic on the
+    bisect side, so float behavior is unchanged)."""
+    lo = max(0, bisect.bisect_right(cut_times, start) - 1)
+    hi = min(len(cut_times) - 2, bisect.bisect_left(cut_times, end) - 1)
+    first = last = -1
+    for i in range(lo, hi + 1):
+        if min(end, cut_times[i + 1]) - max(start, cut_times[i]) > 0.01:
+            if first < 0:
+                first = i
+            last = i
+    return first, last
+
+
+def _solve_placements(entries: Sequence[Tuple[str, Optional[float]]],
+                      cut_times: List[float],
+                      snap_points: List[float],
+                      planned_clip_sequence: Optional[Sequence[Dict]],
+                      timeline_start: float, timeline_end: float,
+                      ) -> List[Tuple[str, float, float]]:
+    """Give every entry its own disjoint window on the audio timeline.
+
+    Pinned entries claim their time first; auto entries then flow around them
+    (centered in equal timeline shares, retried after/before a clashing
+    window, skipped when no room remains). Returns the placed windows sorted
+    by start time."""
     def segment_at(time_s: float) -> int:
-        for i in range(len(cut_times) - 1):
-            if cut_times[i] <= time_s < cut_times[i + 1]:
-                return i
-        return len(cut_times) - 2
+        return _segment_index_at(cut_times, time_s)
 
     def is_drop_segment(i: int) -> bool:
         if not planned_clip_sequence or i >= len(planned_clip_sequence):
             return False
         return str((planned_clip_sequence[i] or {}).get('target', '')) == 'drop'
-
-    snap_points = sorted(float(b) for b in (beat_times if beat_times is not None and len(beat_times) else cut_times))
 
     def snap(time_s: float, radius: float) -> float:
         nearby = [b for b in snap_points if abs(b - time_s) <= radius]
@@ -177,21 +189,13 @@ def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
         return min(nearby, key=lambda b: (is_drop_segment(segment_at(b)), abs(b - time_s)))
 
     n = len(entries)
-    share = total / n
+    share = (timeline_end - timeline_start) / n
     duration_cap = max(1.0, min(MIN_READABLE_SECONDS + 2 * FADE_SECONDS, share * 0.95))
 
     placed: List[Tuple[str, float, float]] = []
 
     def occupied_segments(start: float, end: float) -> Tuple[int, int]:
-        # First/last segment this window occupies, by the same >0.01s overlap
-        # rule the projection loop below uses. (-1, -1) if it touches none.
-        first = last = -1
-        for i in range(len(cut_times) - 1):
-            if min(end, cut_times[i + 1]) - max(start, cut_times[i]) > 0.01:
-                if first < 0:
-                    first = i
-                last = i
-        return first, last
+        return _occupied_segments(cut_times, start, end)
 
     def overlapping(start: float, end: float) -> Optional[Tuple[str, float, float]]:
         # A segment can only carry one text overlay, so windows clash when
@@ -256,8 +260,14 @@ def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
                 continue
         placed.append((text, start, end))
 
-    schedule = sorted(placed, key=lambda w: w[1])
+    return sorted(placed, key=lambda w: w[1])
 
+
+def _project_onto_segments(schedule: List[Tuple[str, float, float]],
+                           cut_times: List[float],
+                           ) -> Dict[int, Tuple[str, float, float, float]]:
+    """Project each window onto every segment it intersects, translating fade
+    timings into the segment's local clock."""
     seg_map: Dict[int, Tuple[str, float, float, float]] = {}
     for text, ws, we in schedule:
         for i in range(len(cut_times) - 1):
@@ -276,4 +286,35 @@ def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
                 fade_in_start, fade_in_duration = 0.0, 0.0
             fade_out_start = max(0.0, local_end - FADE_SECONDS)
             seg_map[i] = (text, fade_in_start, fade_in_duration, fade_out_start)
+    return seg_map
+
+
+def plan_text_windows(entries: Sequence[Tuple[str, Optional[float]]],
+                      cut_times: Sequence[float],
+                      beat_times: Optional[Sequence[float]] = None,
+                      planned_clip_sequence: Optional[Sequence[Dict]] = None,
+                      ) -> Tuple[Dict[int, Tuple[str, float, float, float]], List[Tuple[str, float, float]]]:
+    """Plan text on the global audio timeline, then project onto segments.
+
+    Every entry gets its own disjoint time window: unpinned entries are
+    centered in equal timeline shares, pinned entries go where asked; window
+    starts snap to the nearest beat (preferring non-drop segments). Windows
+    are then projected onto every segment they intersect, with fade timings
+    translated into each segment's local clock.
+
+    Returns (seg_map, schedule):
+      seg_map:  segment index -> (text, fade_in_start, fade_in_duration, fade_out_start)
+      schedule: [(text, window_start, window_end)] for logging.
+    """
+    cut_times = [float(t) for t in cut_times]
+    if not entries or len(cut_times) < 2:
+        return {}, []
+    timeline_start, timeline_end = cut_times[0], cut_times[-1]
+    if timeline_end - timeline_start <= 0.5:
+        return {}, []
+
+    snap_points = sorted(float(b) for b in (beat_times if beat_times is not None and len(beat_times) else cut_times))
+    schedule = _solve_placements(entries, cut_times, snap_points,
+                                 planned_clip_sequence, timeline_start, timeline_end)
+    seg_map = _project_onto_segments(schedule, cut_times)
     return seg_map, schedule

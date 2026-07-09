@@ -10,6 +10,9 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 
+from .contracts import (PartnerClip, PlannedClip, RetimeSpec, Section,
+                        SegmentProfile, TransitionSpec)
+
 # Proportional-fair usage pressure (variety>0): how many segments of history one
 # appearance is worth. Larger = slower forgetting = the fair-share view reaches
 # further back. 24 segments ≈ a few phrases at typical cut rates.
@@ -139,7 +142,7 @@ def build_planned_clip_sequence(
     split_screen: bool = False,
     target_size: tuple | None = None,
     semantic_variety: float = 0.0,
-) -> List[Dict]:
+) -> List[PlannedClip]:
     """Build exact source clip choices for every output segment.
 
     Returns an empty list when no visual library is present, which tells the
@@ -243,7 +246,7 @@ def build_planned_clip_sequence(
     recent_ids = deque(maxlen=10)
     recent_videos = deque(maxlen=5)
     usage = Counter()
-    planned: List[Dict] = []
+    planned: List[PlannedClip] = []
 
     for i, profile in enumerate(profiles):
         # Reservations are consumed inside the sequential loop so adjacency
@@ -336,7 +339,7 @@ def build_planned_clip_sequence(
     return planned
 
 
-def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
+def _assign_retime_specs(planned: List[PlannedClip], candidates: Sequence[Dict],
                          fps: float) -> None:
     """Attach per-segment retime specs where the music and footage allow.
 
@@ -379,7 +382,7 @@ def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
         rng = _stable_rng("retime", clip.get("index"), video_file, target)
         roll = rng.random()
 
-        retime = None
+        retime: RetimeSpec | None = None
         if target == "soft" and roll < 0.45:
             # Slow-mo drift. On >=50fps footage the deep band (<0.6x) is real
             # source frames. On ordinary 24-50fps sources sub-0.6x used to be
@@ -455,7 +458,7 @@ def _assign_retime_specs(planned: List[Dict], candidates: Sequence[Dict],
 
 
 def _plan_coverage_reservations(candidates: Sequence[Dict],
-                                profiles: Sequence[Dict],
+                                profiles: Sequence[SegmentProfile],
                                 score_cache: "_ScoreCache | None" = None) -> Dict[int, Dict]:
     """Reserve one segment per source: a globally optimal (source, segment) seating.
 
@@ -719,7 +722,7 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
 _TRANSITION_MIN_SEG = 0.3
 
 
-def _assign_boundary_transitions(planned: List[Dict]) -> None:
+def _assign_boundary_transitions(planned: List[PlannedClip]) -> None:
     """Label consecutive clip pairs with split-transition specs.
 
     Each transition is rendered as two per-segment effect chains (an out-chain
@@ -760,7 +763,7 @@ def _assign_boundary_transitions(planned: List[Dict]) -> None:
         if kind is None:
             continue
 
-        spec: Dict = {"type": kind}
+        spec: TransitionSpec = {"type": kind}
         if kind == "whip_pan":
             # Same direction on both sides = continuous camera motion across
             # the cut.
@@ -815,7 +818,7 @@ def summarize_clip_plan(plan: Sequence[Dict],
     return summary
 
 
-def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray, beat_info: Dict) -> List[Dict]:
+def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray, beat_info: Dict) -> List[SegmentProfile]:
     beat_times = np.asarray(beat_info.get("times", []), dtype=float)
     downbeat_times = np.asarray(beat_info.get("downbeat_times", []), dtype=float)
     energy_profile = beat_info.get("energy_profile") or {}
@@ -833,7 +836,7 @@ def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray
     rhythm = np.asarray(rhythm_data.get("combined_strength", []), dtype=float)
     novelty = np.asarray(rhythm_data.get("novelty_strength", []), dtype=float)
 
-    profiles: List[Dict] = []
+    profiles: List[SegmentProfile] = []
     for i, duration in enumerate(segment_durations):
         start = float(cut_times[i])
         end = float(cut_times[i + 1])
@@ -846,7 +849,7 @@ def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray
         local_novelty = _interp_feature(start, beat_times, novelty, 0.4)
         section = _section_at(sections, mid)
         target = _target_for_segment(section, local_wave, local_impact, local_rhythm, local_novelty, local_arc)
-        profiles.append({
+        profile: SegmentProfile = {
             "index": i,
             "start": start,
             "end": end,
@@ -864,7 +867,8 @@ def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray
             "is_downbeat": bool(
                 downbeat_times.size and float(np.min(np.abs(downbeat_times - start))) <= 0.05
             ),
-        })
+        }
+        profiles.append(profile)
     return profiles
 
 
@@ -874,14 +878,14 @@ def _interp_feature(time_s: float, beat_times: np.ndarray, values: np.ndarray, d
     return _clamp(np.interp(time_s, beat_times, values, left=float(values[0]), right=float(values[-1])), default=default)
 
 
-def _section_at(sections: Sequence[Dict], time_s: float) -> Dict:
+def _section_at(sections: Sequence[Section], time_s: float) -> Dict:
     for section in sections:
         if float(section.get("start", 0.0)) <= time_s < float(section.get("end", 0.0)):
             return section
     return sections[-1] if sections else {}
 
 
-def _target_for_segment(section: Dict, wave: float, impact: float, rhythm: float, novelty: float, arc: float) -> str:
+def _target_for_segment(section: Section, wave: float, impact: float, rhythm: float, novelty: float, arc: float) -> str:
     section_type = section.get("type", "body")
     if section_type in {"drop", "finale"} and (wave >= 0.58 or impact >= 0.55):
         return "drop"
@@ -943,7 +947,7 @@ def _semantic_penalty(candidate: Dict, semantic_variety: float,
 
 def _choose_candidate(
     candidates: Sequence[Dict],
-    profile: Dict,
+    profile: SegmentProfile,
     recent_ids: deque,
     recent_videos: deque,
     usage: Counter,
@@ -1004,7 +1008,7 @@ def _choose_candidate(
     return best_candidate
 
 
-def _score_candidate(candidate: Dict, profile: Dict) -> float:
+def _score_candidate(candidate: Dict, profile: SegmentProfile) -> float:
     target = profile.get("target", "flow")
     semantic = candidate.get("semantic") or {}
     tags = {str(t).lower() for t in candidate.get("tags", [])}
@@ -1096,7 +1100,7 @@ def _rebase_subject_anchor(candidate: Dict, start_time: float,
     return out
 
 
-def _plan_source_window(candidate: Dict, profile: Dict) -> tuple:
+def _plan_source_window(candidate: Dict, profile: SegmentProfile) -> tuple:
     """(start_time, source_duration) for a candidate serving a segment.
 
     This is the single authority for source-window semantics — the primary
@@ -1125,8 +1129,8 @@ def _plan_source_window(candidate: Dict, profile: Dict) -> tuple:
     return start_time, source_duration
 
 
-def _materialize_clip(candidate: Dict, profile: Dict, index: int,
-                      score_cache: "_ScoreCache | None" = None) -> Dict:
+def _materialize_clip(candidate: Dict, profile: SegmentProfile, index: int,
+                      score_cache: "_ScoreCache | None" = None) -> PlannedClip:
     final_duration = max(0.05, float(profile["duration"]))
     start_time, source_duration = _plan_source_window(candidate, profile)
     target = profile.get("target", "flow")
@@ -1193,9 +1197,9 @@ def _duo_pair_files(candidates: Sequence[Dict], target_size) -> set | None:
 
 def _maybe_choose_duo_partner(
     candidates: Sequence[Dict],
-    profile: Dict,
+    profile: SegmentProfile,
     primary: Dict,
-    planned: List[Dict],
+    planned: List[PlannedClip],
     index: int,
     pair_files: set,
     recent_ids: deque,
@@ -1296,7 +1300,7 @@ def _maybe_choose_duo_partner(
     return best_candidate
 
 
-def _materialize_partner(candidate: Dict, profile: Dict) -> Dict:
+def _materialize_partner(candidate: Dict, profile: SegmentProfile) -> PartnerClip:
     """The additive "partner" payload carried by a duo's planned clip.
 
     Window semantics are identical to the primary's (_plan_source_window is

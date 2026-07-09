@@ -27,8 +27,10 @@ def png_to_cube(png_path: str, cube_path: str) -> None:
     with open(tmp_path, 'w', encoding='ascii') as f:
         f.write(f"# Derived from {os.path.basename(png_path)}\n"
                 f"LUT_3D_SIZE {HALD_LEVEL * HALD_LEVEL}\n")
-        for r, g, b in img.getdata():
-            f.write(f"{r / 255:.6f} {g / 255:.6f} {b / 255:.6f}\n")
+        # writelines with a generator batches the 262k tiny writes through
+        # the file object's buffer instead of one f.write call per LUT row.
+        f.writelines(f"{r / 255:.6f} {g / 255:.6f} {b / 255:.6f}\n"
+                     for r, g, b in img.getdata())
     os.replace(tmp_path, cube_path)
 
 

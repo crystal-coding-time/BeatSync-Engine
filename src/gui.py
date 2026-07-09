@@ -1,6 +1,5 @@
 import os
 import sys
-import contextlib
 import asyncio
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -61,69 +60,61 @@ def _install_windows_asyncio_connection_reset_filter() -> None:
 
 _install_windows_asyncio_connection_reset_filter()
 
-from logger import (
-    setup_environment,
-    USING_PORTABLE_PYTHON, USING_PORTABLE_CUDA, USING_CUPY_CTK, FFMPEG_FOUND
-)
+from logger import setup_environment
 
 # Initialize environment
 setup_environment()
 # NOW import other modules (after CUDA environment is set)
 import gradio as gr
-import tempfile
-import shutil
-import datetime
 import multiprocessing
-import queue
-import re
-import subprocess
-import threading
-import time
+import shutil
 import socket
-from dataclasses import dataclass, fields as dataclass_fields, replace as dataclass_replace
-from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
 
-# Import FFmpeg processing module
-from ffmpeg_processing import get_video_fps, get_video_resolution, is_image_source, FFMPEG_PATH
 from looks import ensure_look_cubes, list_looks
 
-# Shared runtime settings
+# Shared runtime settings — only the hardware-encoder flags that pick the
+# processing-mode radio's choices are read here.
 from gpu_cpu_utils import (
-    CPU_COUNT,
-    MAX_THREADS,
-    PARALLEL_WORKERS,
-    GPU_INFO,
-    GPU_AVAILABLE,
     NVENC_AVAILABLE,
     VIDEOTOOLBOX_AVAILABLE,
-    HW_ENCODERS,
-    hw_encoder_available,
-    set_gpu_mode,
 )
 from paths import (
     GRADIO_TEMP_DIR,
     get_input_dir,
     get_audio_input_dir,
     get_video_input_dir,
-    get_output_dir,
 )
 
-gpu_data = GPU_INFO
-gpu_info = f"{gpu_data['name']} ({gpu_data['cuda_version']})" if gpu_data['available'] else "CPU Mode"
+from video_processor import OUTPUT_FORMATS, DEFAULT_OUTPUT_FORMAT
+from effects import list_effect_choices
 
-from video_processor import create_music_video, OUTPUT_FORMATS, DEFAULT_OUTPUT_FORMAT
-from effects import list_effect_choices, resolve_effect_palette
+# Import UI content (only the names this module renders).
+from ui_content import (
+    UI_TITLE, UI_MAIN_DESCRIPTION,
+    LABEL_AUDIO_FILE, LABEL_VIDEO_FILES,
+    LABEL_CUSTOM_FPS, INFO_CUSTOM_FPS,
+    LABEL_PROCESSING_MODE,
+    LABEL_OUTPUT_FILENAME, INFO_OUTPUT_FILENAME,
+    get_ready_status,
+    get_processing_mode_info_nvenc,
+    get_processing_mode_info_videotoolbox,
+    get_processing_mode_info_cpu,
+)
 
-from auto_mode import analyze_beats_auto
-
-# Import UI content
-from ui_content import *
+# Render orchestration (settings model, headless pipeline, Gradio worker) lives
+# in orchestrator.py. Re-exported here so the documented smoke entry point
+# `gui._process_video_impl(...)` and the button callback keep working unchanged.
+# Imported after setup_environment() so the CUDA/FFmpeg-dependent pipeline
+# modules it pulls in initialize with the environment already configured.
+from orchestrator import (
+    _process_video_impl,
+    process_video,
+    RenderSettings,
+    SETTINGS_KEYS,
+)
 
 # Set environment variable for Gradio
 os.environ['GRADIO_TEMP_DIR'] = GRADIO_TEMP_DIR
-
-VideoFilesInput : TypeAlias = List[str]
-StatusResult : TypeAlias = Tuple[str, str, Dict]
 
 STATUS_BOX_CSS = """
 #status-output-box {
@@ -139,225 +130,6 @@ STATUS_BOX_CSS = """
 }
 """
 
-
-def _stage_status(stage_number: int) -> str:
-    return f"Stage {stage_number} is processing. Please wait."
-
-
-class RenderLogConsole:
-    """Capture legacy verbose prints to a log file while the Gradio worker runs.
-
-    The pipeline's diagnostics (including FFmpeg stderr on failures) used to be
-    discarded entirely, leaving "N clip(s) failed" with no way to see why. Now
-    everything lands in a per-run render log the error message can point at.
-    """
-
-    def __init__(self, log_dir: str, prefix: str = 'render'):
-        self.log_path = os.path.join(
-            log_dir, f"{prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        )
-        self._file = None
-        self._failed = False
-
-    def _ensure_file(self):
-        if self._file is None and not self._failed:
-            try:
-                os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
-                self._file = open(self.log_path, 'a', encoding='utf-8', errors='replace')
-            except OSError:
-                self._failed = True
-        return self._file
-
-    def write(self, text: str) -> int:
-        f = self._ensure_file()
-        if f is not None:
-            try:
-                f.write(text)
-                f.flush()
-            except OSError:
-                self._failed = True
-        return len(text)
-
-    def flush(self) -> None:
-        if self._file is not None:
-            try:
-                self._file.flush()
-            except OSError:
-                pass
-
-    def close(self) -> None:
-        if self._file is not None:
-            try:
-                self._file.close()
-            except OSError:
-                pass
-            self._file = None
-
-
-class StageConsoleLogger:
-    """Small CMD logger: stage start, up to 5 useful lines, stage end."""
-
-    def __init__(self, stream, max_lines_per_stage: int = 5):
-        self.stream = stream
-        self.max_lines_per_stage = max(1, int(max_lines_per_stage))
-        self.stage_number: int | None = None
-        self.stage_started = 0.0
-        self.stage_line_count = 0
-        self.total_started = time.perf_counter()
-
-    def start_stage(self, stage_number: int) -> None:
-        if self.stage_number == stage_number:
-            return
-        self.end_stage()
-        self.stage_number = stage_number
-        self.stage_started = time.perf_counter()
-        self.stage_line_count = 0
-        self._write(f"Stage {stage_number} processing started:\n")
-
-    def stage_line(self, stage_number: int, message: str) -> None:
-        if self.stage_number != stage_number:
-            self.start_stage(stage_number)
-        self.line(message)
-
-    def line(self, message: str) -> None:
-        if self.stage_number is None:
-            return
-        if self.stage_line_count >= self.max_lines_per_stage:
-            return
-        message = self._clean(message)
-        if message:
-            self._write(f"  {message}\n")
-            self.stage_line_count += 1
-
-    def end_stage(self) -> None:
-        if self.stage_number is None:
-            return
-        elapsed = int(round(time.perf_counter() - self.stage_started))
-        self._write(f"Stage {self.stage_number} ended in {elapsed} seconds.\n\n")
-        self.stage_number = None
-        self.stage_started = 0.0
-        self.stage_line_count = 0
-
-    def finish(self) -> None:
-        self.end_stage()
-        elapsed = int(round(time.perf_counter() - self.total_started))
-        self._write(f"Total time processing: {elapsed} seconds\n")
-
-    def _write(self, text: str) -> None:
-        self.stream.write(text)
-        self.stream.flush()
-
-    def _clean(self, text: str) -> str:
-        text = str(text).encode("ascii", "ignore").decode("ascii")
-        return re.sub(r"\s+", " ", text).strip()
-
-
-def _fmt_stage_seconds(seconds: float | int | None) -> str:
-    try:
-        return f"{float(seconds):.1f}s"
-    except Exception:
-        return "0.0s"
-
-
-def _short_model_name(model_id: str | None) -> str:
-    if not model_id:
-        return ""
-    return os.path.basename(str(model_id).rstrip("/\\")) or str(model_id)
-
-
-def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: Dict | None) -> None:
-    if console_logger is None or not isinstance(video_analysis, dict):
-        return
-
-    source_count = int(video_analysis.get("source_count") or len(video_analysis.get("videos") or []))
-    worker_count = int(video_analysis.get("worker_count") or 1)
-    cache_hits = int(video_analysis.get("cache_hits") or 0)
-    ai_enabled = bool(video_analysis.get("ai_enabled"))
-    qwen_total = int(video_analysis.get("qwen_frame_count") or 0)
-    qwen_tags = int(video_analysis.get("qwen_tag_count") or 0)
-    model_id = _short_model_name(video_analysis.get("qwen_model_id"))
-    batch_size = int(video_analysis.get("qwen_concurrency") or 0)
-
-    console_logger.line(f"Source videos: {source_count}, visual workers: {worker_count}")
-    if ai_enabled:
-        qwen_bits = ["Qwen: enabled"]
-        if model_id:
-            qwen_bits.append(f"model {model_id}")
-        if batch_size:
-            qwen_bits.append(f"batch {batch_size}")
-        console_logger.line(", ".join(qwen_bits))
-        if qwen_total:
-            inference_seconds = float(video_analysis.get("qwen_inference_seconds") or video_analysis.get("qwen_seconds") or 0.0)
-            qwen_rate = (qwen_total / inference_seconds) if inference_seconds > 0 else 0.0
-            peak_vram = float(video_analysis.get("qwen_peak_vram_gb") or 0.0)
-            perf_bits = []
-            if batch_size:
-                perf_bits.append(f"batch {batch_size}")
-            if peak_vram > 0:
-                perf_bits.append(f"~{peak_vram:.2f} GB VRAM")
-            if qwen_rate > 0:
-                perf_bits.append(f"{qwen_rate:.2f} candidates/s")
-            if perf_bits:
-                console_logger.line(f"Qwen performance: {', '.join(perf_bits)}")
-            console_logger.line(
-                f"Qwen tags: {qwen_tags}/{qwen_total} in {_fmt_stage_seconds(video_analysis.get('qwen_seconds'))}"
-            )
-    else:
-        console_logger.line("Qwen: disabled")
-
-    summary = video_analysis.get("summary")
-    if summary:
-        console_logger.line(f"Visual library: {summary}")
-    console_logger.line(
-        f"Analysis time: {_fmt_stage_seconds(video_analysis.get('analysis_seconds'))}, cache {cache_hits}/{source_count}"
-    )
-
-
-def _stage6_summary(console_logger: StageConsoleLogger | None, beat_info: Dict | None) -> None:
-    if console_logger is None or not isinstance(beat_info, dict):
-        return
-
-    render_info = beat_info.get("render_info") or {}
-    if not render_info:
-        return
-
-    cuts = int(render_info.get("render_cuts") or 0)
-    frames = int(render_info.get("timeline_frames") or 0)
-    fps = render_info.get("output_fps")
-    if cuts or frames:
-        fps_text = f" @ {float(fps):.1f} FPS" if fps is not None else ""
-        console_logger.line(f"Render timeline: {cuts} cuts, {frames} frames{fps_text}")
-
-    clip_workers = render_info.get("clip_workers")
-    requested_workers = render_info.get("requested_workers")
-    worker_text = ""
-    if clip_workers:
-        worker_text = f", workers {clip_workers}"
-        if requested_workers and requested_workers != clip_workers:
-            worker_text += f"/{requested_workers}"
-    encoder = render_info.get("encoder")
-    if encoder or worker_text:
-        console_logger.line(f"Encoder: {encoder or 'unknown'}{worker_text}")
-
-    if render_info.get("audio_duration") is not None:
-        console_logger.line(f"Audio duration: {float(render_info['audio_duration']):.2f} seconds")
-
-    plan_summary = render_info.get("plan_summary") or {}
-    if plan_summary:
-        console_logger.line(
-            "Planner: "
-            f"{int(plan_summary.get('clip_count') or 0)} clips, "
-            f"{int(plan_summary.get('source_count') or 0)} sources, "
-            f"AI moments {int(plan_summary.get('ai_tagged') or 0)}"
-        )
-
-    final_bits = []
-    if render_info.get("target_resolution"):
-        final_bits.append(f"resolution {render_info['target_resolution']}")
-    if render_info.get("final_assembly_seconds") is not None:
-        final_bits.append(f"assembly {_fmt_stage_seconds(render_info['final_assembly_seconds'])}")
-    if final_bits:
-        console_logger.line("Final: " + ", ".join(final_bits))
 
 def find_launch_port(default_port: int = 7860, search_limit: int = 20) -> int:
     """Prefer the default Gradio port, then step forward if it is busy."""
@@ -377,464 +149,6 @@ def find_launch_port(default_port: int = 7860, search_limit: int = 20) -> int:
                 return port
 
     raise OSError(f"Cannot find empty port in range: {default_port}-{default_port + search_limit - 1}")
-
-
-def _as_existing_source_path(file_path: str | None) -> str | None:
-    """Use the selected source file directly instead of copying it locally."""
-    if not file_path:
-        return None
-    try:
-        path = os.path.abspath(os.fspath(file_path))
-    except TypeError:
-        return None
-    return path if os.path.isfile(path) else None
-
-
-def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
-    if not file_paths:
-        return []
-    return [path for path in (_as_existing_source_path(p) for p in file_paths) if path]
-
-
-@dataclass(frozen=True)
-class RenderSettings:
-    """Single source of truth for the 16 per-render settings.
-
-    Field order and defaults are canonical: the headless kwargs of
-    `_process_video_impl`, the GUI settings dict, and the Gradio positional
-    boundary (`SETTINGS_KEYS` / `settings_components`) all derive from here.
-    """
-
-    fit_mode: str = 'crop'
-    output_format: str = DEFAULT_OUTPUT_FORMAT
-    effect_style: str = 'clean'
-    effect_intensity: float = 0.7
-    effect_mode: str = 'curated'
-    effect_palette: List[str] | None = None
-    effect_seed: float = 0
-    look_cube: str = ''
-    variety: float = 0.4
-    semantic_variety: float = 0.4
-    speed_ramps: bool = False
-    split_screen: bool = True
-    crossfades: bool = False
-    text_entries: str = ''
-    text_position: str = 'bottom'
-    text_scale: float = 1.0
-
-    @classmethod
-    def from_dict(cls, d: dict | None, base: 'RenderSettings | None' = None) -> 'RenderSettings':
-        """Overlay dict values on `base` (or the defaults).
-
-        A key present in the dict wins — even with an explicitly falsy/None
-        value — and unknown keys are ignored, exactly matching the old
-        per-key `settings.get(key, kwarg)` override block.
-        """
-        base = base if base is not None else cls()
-        if not d:
-            return base
-        known = {f.name for f in dataclass_fields(cls)}
-        overrides = {k: v for k, v in d.items() if k in known}
-        return dataclass_replace(base, **overrides) if overrides else base
-
-    def to_settings_dict(self, *, is_prores: bool,
-                         palette_ids, resolved_seed) -> dict:
-        """Produce the resolved settings dict `create_music_video` consumes.
-
-        Carries the per-render transforms the old inline repack applied:
-        the resolved palette/seed from `resolve_effect_palette`, the ProRes
-        look gate (ProRes stays ungraded), and text entries split into
-        stripped non-empty lines.
-        """
-        return {
-            'fit_mode': self.fit_mode,
-            'output_format': self.output_format,
-            'effect_style': self.effect_style,
-            'effect_intensity': self.effect_intensity,
-            'effect_mode': self.effect_mode,
-            'effect_palette': palette_ids,
-            'effect_seed': resolved_seed,
-            'look_cube': (None if is_prores else (self.look_cube or None)),
-            'variety': self.variety,
-            'semantic_variety': self.semantic_variety,
-            'speed_ramps': bool(self.speed_ramps),
-            'split_screen': bool(self.split_screen),
-            'crossfades': bool(self.crossfades),
-            'text_entries': [line.strip() for line in (self.text_entries or '').splitlines() if line.strip()],
-            'text_position': self.text_position,
-            'text_scale': self.text_scale,
-        }
-
-
-# Canonical key order for the Gradio boundary: process_video's positional
-# settings parameters and create_ui's settings_components list both follow
-# RenderSettings field order, and dict(zip(...)) marries them.
-SETTINGS_KEYS: tuple[str, ...] = tuple(f.name for f in dataclass_fields(RenderSettings))
-
-_RS_DEFAULTS = RenderSettings()
-
-
-def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInput,
-                       output_filename: str, processing_mode: str,
-                       custom_fps: float, session_state: dict,
-                       fit_mode: str = _RS_DEFAULTS.fit_mode,
-                       output_format: str = _RS_DEFAULTS.output_format,
-                       effect_style: str = _RS_DEFAULTS.effect_style,
-                       effect_intensity: float = _RS_DEFAULTS.effect_intensity,
-                       effect_mode: str = _RS_DEFAULTS.effect_mode,
-                       effect_palette: List[str] | None = _RS_DEFAULTS.effect_palette,
-                       effect_seed: float = _RS_DEFAULTS.effect_seed,
-                       look_cube: str = _RS_DEFAULTS.look_cube,
-                       variety: float = _RS_DEFAULTS.variety,
-                       semantic_variety: float = _RS_DEFAULTS.semantic_variety,
-                       speed_ramps: bool = _RS_DEFAULTS.speed_ramps,
-                       split_screen: bool = _RS_DEFAULTS.split_screen,
-                       crossfades: bool = _RS_DEFAULTS.crossfades,
-                       text_entries: str = _RS_DEFAULTS.text_entries,
-                       text_position: str = _RS_DEFAULTS.text_position,
-                       text_scale: float = _RS_DEFAULTS.text_scale,
-                       settings: dict | None = None,
-                       progress_callback: Callable[[str], None] | None = None,
-                       console_logger: StageConsoleLogger | None = None) -> StatusResult:
-    total_started = time.perf_counter()
-    try:
-        # The GUI passes one settings dict; the individual kwargs remain for
-        # the headless/smoke-test entry point. The dict wins where present.
-        rs = RenderSettings(
-            fit_mode=fit_mode, output_format=output_format,
-            effect_style=effect_style, effect_intensity=effect_intensity,
-            effect_mode=effect_mode, effect_palette=effect_palette,
-            effect_seed=effect_seed, look_cube=look_cube,
-            variety=variety, semantic_variety=semantic_variety,
-            speed_ramps=speed_ramps, split_screen=split_screen,
-            crossfades=crossfades, text_entries=text_entries,
-            text_position=text_position, text_scale=text_scale,
-        )
-        rs = RenderSettings.from_dict(settings, base=rs)
-        parallel_workers = PARALLEL_WORKERS
-
-        # Initialize session state if needed
-        if 'original_audio_paths' not in session_state:
-            session_state['original_audio_paths'] = None
-            session_state['original_video_paths'] = []
-        if 'session_dir' not in session_state or not os.path.isdir(session_state['session_dir']):
-            session_state['session_dir'] = tempfile.mkdtemp(prefix='beatsync_', dir=GRADIO_TEMP_DIR)
-        session_dir = session_state['session_dir']
-
-        # Audio may now be one song or several, ordered. Normalize to a
-        # deduped, order-preserving list of selections. A single-song
-        # selection (len == 1) flows through exactly as before: the cache
-        # value and every downstream value stay byte-identical to the old
-        # single-path behavior.
-        if isinstance(audio_files, (str, bytes)):
-            audio_files = [audio_files] if audio_files else []
-        audio_selection: list[str] = []
-        _seen_audio: set = set()
-        for _a in (audio_files or []):
-            if _a and _a not in _seen_audio:
-                _seen_audio.add(_a)
-                audio_selection.append(_a)
-        if not audio_selection:
-            return None, '❌ Error: No audio file selected', session_state
-
-        # Reference the selected file paths directly; the cache key is now the
-        # ordered list. _as_existing_source_paths drops anything unreadable, so
-        # a length mismatch means at least one selected file is gone.
-        if audio_selection != session_state.get('original_audio_paths'):
-            local_audio_paths = _as_existing_source_paths(audio_selection)
-            if local_audio_paths and len(local_audio_paths) == len(audio_selection):
-                session_state['local_audio_paths'] = local_audio_paths
-                session_state['original_audio_paths'] = audio_selection
-            else:
-                return None, '❌ Error: Could not access audio file', session_state
-        else:
-            local_audio_paths = session_state.get('local_audio_paths')
-
-        # Handle videos by referencing selected file paths directly.
-        if video_files:
-            if video_files != session_state.get('original_video_paths'):
-                local_video_paths = _as_existing_source_paths(video_files)
-                if local_video_paths:
-                    session_state['local_video_paths'] = local_video_paths
-                    session_state['original_video_paths'] = video_files
-                else:
-                    return None, '❌ Error: Could not access video files', session_state
-            else:
-                local_video_paths = session_state.get('local_video_paths')
-        else:
-            return None, '❌ Error: No video files selected', session_state
-
-        # Verify files exist
-        if not local_audio_paths or not all(p and os.path.exists(p) for p in local_audio_paths):
-             return None, f"❌ Error: Audio file is missing or inaccessible.", session_state
-        if not local_video_paths or not all(p and os.path.exists(p) for p in local_video_paths):
-             return None, f"❌ Error: Video files are missing or inaccessible.", session_state
-        
-        # Set GPU mode
-        use_gpu = GPU_AVAILABLE
-        set_gpu_mode(use_gpu)
-        
-        # Determine processing mode
-        is_prores = processing_mode == 'prores_proxy'
-        use_nvenc = (processing_mode in HW_ENCODERS) and hw_encoder_available(processing_mode)
-        gpu_encoder = processing_mode if use_nvenc else 'none'
-        
-        python_str = "Portable" if USING_PORTABLE_PYTHON else "System"
-        cuda_str = "CuPy CTK" if USING_CUPY_CTK else ("Portable" if USING_PORTABLE_CUDA else "System/None")
-
-        # Determine FPS
-        if custom_fps is not None and custom_fps > 0:
-            output_fps = custom_fps
-        else:
-            # Follow the fps of the highest-resolution source (the source that
-            # also decides the canvas in legacy "match best source" mode) — a
-            # 10fps GIF that happens to be first in the list must not drag the
-            # whole render down to 10fps. Still images have no real fps (probe
-            # returns a flat 30), so they can't win this pick even when they
-            # win the resolution.
-            fps_candidates = [p for p in local_video_paths if not is_image_source(p)]
-            if fps_candidates:
-                best_path = max(
-                    fps_candidates,
-                    key=lambda p: (lambda wh: wh[0] * wh[1])(get_video_resolution(p)),
-                )
-                output_fps = get_video_fps(best_path)
-            else:
-                output_fps = 30.0
-            
-        # Prepare output paths
-        output_folder = get_output_dir()
-        os.makedirs(output_folder, exist_ok=True)
-        name, _ = os.path.splitext(output_filename)
-        ext = '.mov' if is_prores else '.mp4'
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{name}_{timestamp}{ext}"
-        output_path = os.path.join(output_folder, filename)
-        temp_output = os.path.join(session_dir, filename)
-
-        _audio_console_cb = (lambda stage, message:
-                             console_logger.stage_line(stage, message) if console_logger else None)
-        if len(local_audio_paths) == 1:
-            # Single song: byte-identical to the pre-multisong path.
-            local_audio_path = local_audio_paths[0]
-            selected_beats, beat_info = analyze_beats_auto(
-                local_audio_path,
-                use_gpu=use_gpu,
-                video_files=local_video_paths,
-                progress_callback=progress_callback,
-                console_callback=_audio_console_cb,
-            )
-        else:
-            # Multi-song: concatenate the ordered tracks into one continuous
-            # wav and analyze the whole timeline. Lazy import keeps the
-            # single-song path free of any dependency on the module; a missing
-            # module raises a clear, user-facing error only here, where more
-            # than one song was actually requested. The returned trio maps 1:1
-            # onto the single-song values: (concat wav, cut beats, beat_info).
-            try:
-                import multisong
-            except ImportError:
-                return (None,
-                        '❌ Error: Multiple songs selected, but the multi-song '
-                        'module (src/multisong.py) is unavailable. Select a '
-                        'single song, or install/enable multi-song support.',
-                        session_state)
-            # work_dir is the per-session temp dir, NOT the processing dir:
-            # create_music_video clears the processing dir at render start,
-            # which would delete the concat wav before the audio mux reads it.
-            # session_dir lives under GRADIO_TEMP_DIR and is cleaned on app
-            # startup, so the concat wav has the right lifecycle.
-            local_audio_path, selected_beats, beat_info = multisong.analyze_and_concat(
-                local_audio_paths,
-                session_dir,
-                video_files=local_video_paths,
-                use_gpu=use_gpu,
-                enable_qwen_semantics=True,
-                qwen_model_path=None,
-                progress_callback=progress_callback,
-                console_callback=_audio_console_cb,
-            )
-            _total_audio = float(beat_info.get('audio_duration') or 0.0)
-            print(f"🎶 Multi-song: {len(local_audio_paths)} tracks → total "
-                  f"{int(_total_audio) // 60}:{int(_total_audio) % 60:02d}")
-        beat_times = beat_info.get('times', selected_beats)
-        _stage5_summary(console_logger, beat_info.get("video_analysis"))
-
-        if progress_callback:
-            progress_callback(_stage_status(6))
-
-        # Resolve the effect palette once per render; the recipe line makes a
-        # look reproducible (it lands in the render log via redirected stdout).
-        # The Shuffle effect seed derives from the song filename when the seed
-        # is 0. For multi-song it derives from the FIRST song (deterministic —
-        # the concat wav's name is not stable across runs, whereas the first
-        # song is); the derivation itself is unchanged. local_audio_paths[0]
-        # equals local_audio_path in the single-song case, so single-song
-        # renders are byte-identical.
-        palette_ids, resolved_seed, recipe_line = resolve_effect_palette(
-            rs.effect_mode, rs.effect_palette, rs.effect_seed, local_audio_paths[0])
-        if rs.effect_style and rs.effect_style != 'clean':
-            print(f"   🎛 {recipe_line}")
-
-        # Create video. One resolved-settings dict; looks grade H.264/HEVC
-        # renders only — ProRes stays pristine for external editing, matching
-        # effects and text.
-        resolved_settings = rs.to_settings_dict(
-            is_prores=is_prores, palette_ids=palette_ids,
-            resolved_seed=resolved_seed)
-        result_path = create_music_video(
-            local_audio_path, local_video_paths, selected_beats,
-            output_file=temp_output, max_workers=parallel_workers,
-            beat_info=beat_info, lossless_mode=is_prores,
-            use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
-            settings=resolved_settings,
-        )
-
-        # Move to output folder
-        shutil.move(result_path, output_path)
-
-        # Create preview for ProRes if needed
-        preview_path = output_path
-        if is_prores:
-            preview_filename = f"{name}_{timestamp}_preview.mp4"
-            preview_path = os.path.join(session_dir, preview_filename)
-            # Only input options (like -hwaccel) may appear before -i; the
-            # encoder settings are output options and must come after it.
-            preview_cmd = [FFMPEG_PATH, '-nostdin', '-hide_banner',
-                           '-hwaccel', 'auto', '-i', output_path]
-            if NVENC_AVAILABLE:
-                preview_cmd.extend(['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23'])
-            elif VIDEOTOOLBOX_AVAILABLE:
-                preview_cmd.extend(['-c:v', 'h264_videotoolbox', '-q:v', '55', '-allow_sw', '1'])
-            else:
-                preview_cmd.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
-            preview_cmd.extend(['-pix_fmt', 'yuv420p', '-y', preview_path])
-            preview_result = subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
-            if (preview_result.returncode != 0 or not os.path.exists(preview_path)
-                    or os.path.getsize(preview_path) == 0):
-                print(f"   ⚠️  Preview transcode failed, showing ProRes file directly: "
-                      f"{(preview_result.stderr or '').strip()[-500:]}")
-                preview_path = output_path
-        _stage6_summary(console_logger, beat_info)
-
-        # Generate status message based on mode
-        gpu_info = f"⚡ GPU: {GPU_INFO}" if use_gpu else "💻 CPU"
-        fps_info = f"{output_fps:.2f} FPS (custom)" if custom_fps else f"{output_fps:.2f} FPS (auto-detected)"
-        audio_info = "PCM 24-bit (48kHz)"
-        
-        if is_prores:
-            codec_info = "ProRes 422 Proxy (.mov) - Lossless"
-            encoder_info = "🎯 Lossless Concatenation"
-        elif use_nvenc:
-            codec_info = f"{gpu_encoder.upper()} (.mp4)"
-            encoder_info = f"⚡ {gpu_encoder.upper()}"
-        else:
-            codec_info = "H.264 (.mp4)"
-            encoder_info = "💻 libx264"
-
-        total_cuts = len(selected_beats) - 1
-        sections_info = beat_info.get('selection_info', [])
-        total_processing_seconds = time.perf_counter() - total_started
-        processing_label = gpu_encoder.upper() if use_nvenc else ("PRORES_PROXY" if is_prores else "H264_CPU")
-        
-        status_msg = get_success_message_auto(
-            total_cuts, len(beat_times),
-            beat_info.get('tempo', 120), sections_info,
-            python_str, cuda_str, MAX_THREADS, CPU_COUNT,
-            parallel_workers, gpu_info, encoder_info,
-            codec_info, fps_info, filename, audio_info,
-            audio_duration=beat_info.get('audio_duration'),
-            output_fps=output_fps,
-            total_processing_seconds=total_processing_seconds,
-            processing_label=processing_label
-        )
-        # Return preview path for display, keep session_state intact
-        return preview_path, status_msg, session_state
-
-    except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
-        import traceback
-        traceback.print_exc()
-        return None, error_msg, session_state
-
-
-def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
-                 output_filename: str, processing_mode: str,
-                 custom_fps: float, fit_mode: str, output_format: str,
-                 effect_style: str,
-                 effect_intensity: float, effect_mode: str,
-                 effect_palette: List[str], effect_seed: float,
-                 look_cube: str, variety: float, semantic_variety: float, speed_ramps: bool,
-                 split_screen: bool, crossfades: bool,
-                 text_entries: str, text_position: str,
-                 text_scale: float, session_state: dict) -> Iterator[StatusResult]:
-    status_queue: queue.Queue[str | None] = queue.Queue()
-    result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
-    initial_status = _stage_status(1)
-    console_logger = StageConsoleLogger(sys.__stdout__)
-    render_console = RenderLogConsole(get_output_dir())
-
-    # Single settings dict from here down: the style/effect/text parameter
-    # chain is order-coupled positional at the Gradio boundary only, and
-    # SETTINGS_KEYS (RenderSettings field order) is the one place that
-    # defines that order. RenderSettings.to_settings_dict() bool()-coerces
-    # the checkbox values downstream, so raw values pass through here.
-    render_settings = dict(zip(SETTINGS_KEYS, (
-        fit_mode, output_format, effect_style, effect_intensity,
-        effect_mode, effect_palette, effect_seed, look_cube,
-        variety, semantic_variety, speed_ramps, split_screen, crossfades,
-        text_entries, text_position, text_scale,
-    ), strict=True))
-
-    def progress_callback(message: str) -> None:
-        status_queue.put(message)
-        match = re.search(r"Stage (\d+) is processing", message)
-        if match:
-            console_logger.start_stage(int(match.group(1)))
-
-    def worker() -> None:
-        try:
-            with contextlib.redirect_stdout(render_console), contextlib.redirect_stderr(render_console):
-                result = _process_video_impl(
-                    audio_files=audio_files,
-                    video_files=video_files,
-                    output_filename=output_filename,
-                    processing_mode=processing_mode,
-                    custom_fps=custom_fps,
-                    settings=render_settings,
-                    session_state=session_state,
-                    progress_callback=progress_callback,
-                    console_logger=console_logger,
-                )
-        except Exception as e:
-            console_logger.line(f"Error: {e}")
-            result = None, f"❌ Error: {e}", session_state
-        finally:
-            console_logger.finish()
-            render_console.close()
-        # Point failures at the captured pipeline log (FFmpeg stderr etc.).
-        if result[1].startswith('❌') and os.path.exists(render_console.log_path):
-            result = result[0], f"{result[1]}\n📄 Full log: {render_console.log_path}", result[2]
-        result_queue.put(result)
-        status_queue.put(None)
-
-    thread = threading.Thread(target=worker, daemon=True)
-    console_logger.start_stage(1)
-    thread.start()
-
-    last_status = initial_status
-    yield None, initial_status, session_state
-
-    while True:
-        message = status_queue.get()
-        if message is None:
-            break
-        if message != last_status:
-            last_status = message
-            yield None, message, session_state
-
-    thread.join()
-    yield result_queue.get()
 
 
 def cleanup_on_startup():
@@ -874,23 +188,13 @@ def cleanup_on_startup():
 
 
 def create_ui() -> gr.Blocks:
-    # These definitions are needed within the function's scope
-    python_status = "✅ Portable (bin/python-3.13.14-embed-amd64/)" if USING_PORTABLE_PYTHON else "⚠️  System Python"
-    if USING_CUPY_CTK:
-        cuda_status = "✅ CuPy CTK (Python wheel libraries)"
-    elif USING_PORTABLE_CUDA:
-        cuda_status = "✅ Portable (bin/CUDA/v13.3)"
-    else:
-        cuda_status = "⚠️  System CUDA (or not available)"
-    ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
-    
     app = gr.Blocks(title='BeatSync Engine', theme='ocean', css=STATUS_BOX_CSS)
     with app:
         session_state = gr.State({})
 
         gr.Markdown(f"# {UI_TITLE}")
         gr.Markdown(UI_MAIN_DESCRIPTION)
-        
+
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown('### 📁 Input Files')
@@ -1101,9 +405,9 @@ def create_ui() -> gr.Blocks:
 
             with gr.Column(scale=1):
                 gr.Markdown('### 📺 Output')
-                status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
+                status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(), lines=4, max_lines=4, elem_id='status-output-box')
                 video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
-                
+
         # One component per RenderSettings field, in SETTINGS_KEYS order —
         # Gradio hands these to process_video positionally, so this list is
         # the only place the component-to-field pairing is spelled out.
@@ -1148,14 +452,14 @@ if __name__ == '__main__':
         multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError:
         pass
-    
+
     # Clean up old files only on startup
     cleanup_on_startup()
 
     # Derive .cube LUTs from the committed look PNGs (looks/*.cube is
     # gitignored — ~7 MB each, cheap to regenerate).
     ensure_look_cubes()
-    
+
     app = create_ui()
     launch_port = find_launch_port()
     app.launch(

@@ -94,6 +94,7 @@ from typing import Callable, Dict, List, Tuple
 import librosa
 import numpy as np
 from gpu_cpu_utils import GPU_AVAILABLE, clear_gpu_memory
+from .contracts import BeatFeatures, Section
 
 # ---------------------------------------------------------------------------
 # Shared numerical helpers
@@ -189,7 +190,7 @@ from .stage4_select import select_wave_cuts
 # ---------------------------------------------------------------------------
 
 
-def _build_audio_visual_profile(tempo: float, sections: List[Dict], features: Dict,
+def _build_audio_visual_profile(tempo: float, sections: List[Section], features: BeatFeatures,
                                 selected_beats: np.ndarray, beat_times: np.ndarray) -> Dict:
     wave = np.asarray(features.get("wave", []), dtype=float)
     impact = np.asarray(features.get("impact_score", []), dtype=float)
@@ -277,7 +278,7 @@ def _load_and_split_audio(audio_file: str, start_time: float, duration: float | 
     return y, sr, audio_duration, y_harmonic, y_percussive, mel_S
 
 
-def _apply_downbeat_anchors(features: Dict, beat_times: np.ndarray,
+def _apply_downbeat_anchors(features: BeatFeatures, beat_times: np.ndarray,
                             downbeat_times: np.ndarray) -> None:
     """Overwrite stage-2's naive anchors with model downbeats (cross-stage mutation).
 
@@ -305,7 +306,7 @@ def _apply_downbeat_anchors(features: Dict, beat_times: np.ndarray,
 
 
 def _load_optional_structure_and_stems(audio_file: str, beat_times: np.ndarray,
-                                       features: Dict,
+                                       features: BeatFeatures,
                                        console_callback: Callable[[int, str], None] | None) -> Dict | None:
     """Optional structure/stem backends: graft stem features, return structure (or None)."""
     # Wave-14: optional music-structure + stem-signal backend (all-in-one-mlx /
@@ -372,8 +373,8 @@ def _load_optional_structure_and_stems(audio_file: str, beat_times: np.ndarray,
     return structure
 
 
-def _pack_beat_info(features: Dict, beat_times: np.ndarray, downbeat_times: np.ndarray,
-                    selected_beats: np.ndarray, tempo: float, sections: List[Dict],
+def _pack_beat_info(features: BeatFeatures, beat_times: np.ndarray, downbeat_times: np.ndarray,
+                    selected_beats: np.ndarray, tempo: float, sections: List[Section],
                     selection_info, audio_visual_profile: Dict, video_analysis,
                     audio_duration: float, structure: Dict | None) -> Dict:
     """Package features into beat_info (the features/energy_profile/rhythm_data triple view)."""

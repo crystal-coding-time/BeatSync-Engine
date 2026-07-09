@@ -34,6 +34,7 @@ from ffmpeg_processing import (
     is_image_source,
 )
 from logger import ROOT_DIR, setup_environment
+from visual_embeddings import OptionalBackend, SidecarCache
 
 
 setup_environment()
@@ -195,37 +196,35 @@ def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | No
     return _hash_text(raw, length=24)
 
 
+# Shared sidecar cache for the full per-video analysis result. Same on-disk
+# layout as before ({sha1(stem)[:8]}_{signature}.json), pretty-printed
+# (indent=2), with logged read/write failures. make_dir_on_path=True mirrors the
+# old _cache_path, which created the cache directory up front.
+_VIDEO_ANALYSIS_CACHE = SidecarCache(
+    VIDEO_ANALYSIS_CACHE_DIR, "", indent=2,
+    log_label="video analysis cache", make_dir_on_path=True,
+)
+
+
 def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None) -> str:
-    os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
-    name = os.path.splitext(_safe_name(video_file))[0]
-    return os.path.join(
-        VIDEO_ANALYSIS_CACHE_DIR,
-        f"{_hash_text(name, 8)}_{_video_signature(video_file, enable_ai, qwen_model_path)}.json",
+    return _VIDEO_ANALYSIS_CACHE.path(
+        video_file, _video_signature(video_file, enable_ai, qwen_model_path)
     )
 
 
 def _load_cache(path: str, require_ai: bool = False) -> Dict | None:
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("analysis_version") == ANALYSIS_VERSION:
-                if require_ai and not data.get("ai_enabled"):
-                    return None
-                return data
-    except Exception as e:
-        print(f"   Warning: could not read video analysis cache: {e}")
+    data = _VIDEO_ANALYSIS_CACHE.load(path)
+    if not isinstance(data, dict):
+        return None
+    if data.get("analysis_version") == ANALYSIS_VERSION:
+        if require_ai and not data.get("ai_enabled"):
+            return None
+        return data
     return None
 
 
 def _save_cache(path: str, data: Dict) -> None:
-    try:
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_path, path)
-    except Exception as e:
-        print(f"   Warning: could not write video analysis cache: {e}")
+    _VIDEO_ANALYSIS_CACHE.save(path, data)
 
 
 def _fmt_seconds(seconds: float) -> str:
@@ -777,7 +776,7 @@ def _complete_deferred_qwen(
     qwen_model_path: str,
     audio_profile: Dict,
     label: str = "",
-) -> Dict:
+) -> None:
     candidates = video_data.get("candidates") or []
     if not candidates:
         video_data["ai_deferred"] = False
@@ -787,36 +786,72 @@ def _complete_deferred_qwen(
     name = _safe_name(video_data.get("video_file", video_data.get("source_name", "video")))
     print(f"   Running deferred Qwen semantic analysis {label}: {name}")
     started = time.perf_counter()
-    qwen_info = {}
-    # Only a real Qwen success (no exception AND at least one merged semantic
-    # tag) may mark this video ai_enabled. Otherwise a transient llama-server
-    # failure would be written to the AI-keyed cache and accepted forever by
-    # _load_cache(require_ai=True), so the tagging would never be retried.
-    qwen_ok = False
+    qwen_info: Dict = {}
+    # The single-video worker call and merge; the ai_enabled rule (only a real
+    # tag merge marks the video ai_enabled) is enforced by _apply_qwen_result,
+    # the same site the batch path uses. On any failure the flags stay off so a
+    # transient llama-server error is never cached as an AI hit.
+    applied = False
     try:
-        qwen_info = _annotate_candidates_with_qwen(
-            video_file=video_data["video_file"],
-            fps=float(video_data.get("fps") or 24.0),
-            candidates=candidates,
-            qwen_model_path=qwen_model_path,
-            use_gpu=use_gpu,
-            audio_profile=audio_profile,
-        )
-        qwen_ok = int((qwen_info or {}).get("qwen_tag_count", 0)) > 0
+        max_windows = _qwen_max_windows()
+        if max_windows == 0:
+            print("   Qwen semantic analysis skipped (BEATSYNC_QWEN_MAX_WINDOWS=0).")
+        else:
+            ai_candidates = _select_ai_candidates(candidates, max_windows)
+            if not ai_candidates:
+                qwen_info = {"qwen_frame_count": 0, "qwen_tag_count": 0}
+            else:
+                print(f"   Qwen semantic analysis: {len(ai_candidates)} candidate moments")
+                response = _run_qwen_worker(
+                    _qwen_request(
+                        qwen_model_path, use_gpu, audio_profile,
+                        video_file=video_data["video_file"],
+                        fps=float(video_data.get("fps") or 24.0),
+                        candidates=ai_candidates,
+                    ),
+                    batch=False,
+                )
+                semantics = response.get("semantics") if isinstance(response, dict) else {}
+                merged_count = _apply_qwen_result(video_data, ai_candidates, semantics)
+                applied = True
+                if not semantics:
+                    print("      Qwen returned no semantic tags; deterministic visual tags remain active.")
+                    qwen_info = {
+                        "qwen_frame_count": len(ai_candidates),
+                        "qwen_tag_count": 0,
+                        "qwen_model_id": str(response.get("model_id") or "") if isinstance(response, dict) else "",
+                        "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
+                        "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
+                    }
+                else:
+                    print(f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)}")
+                    timing = response.get("timings_by_job", {}).get("single", {}) if isinstance(response, dict) else {}
+                    qwen_info = {
+                        "qwen_frame_count": int(timing.get("frame_count") or len(ai_candidates)),
+                        "qwen_tag_count": int(timing.get("tag_count") or merged_count),
+                        "qwen_model_id": str(response.get("model_id") or "") if isinstance(response, dict) else "",
+                        "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
+                        "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
+                    }
     except Exception as e:
         print(f"      Warning: Qwen semantic analysis failed for {name}: {e}")
 
+    if not applied:
+        # Skip / no candidates / exception: reproduce the original finalization
+        # (sort + flags off). The success paths already sorted and set the flags
+        # inside _apply_qwen_result.
+        candidates.sort(key=lambda c: c.get("editorial_score", 0.0), reverse=True)
+        video_data["ai_deferred"] = False
+        video_data["ai_enabled"] = False
+        video_data["candidate_count"] = len(candidates)
+
     qwen_seconds = time.perf_counter() - started
-    candidates.sort(key=lambda c: c.get("editorial_score", 0.0), reverse=True)
     timings = video_data.setdefault("timings", {})
     timings.update(qwen_info or {})
     timings["qwen_seconds"] = qwen_seconds
     timings["total_seconds"] = float(timings.get("total_seconds", video_data.get("analysis_seconds", 0.0))) + qwen_seconds
     video_data["analysis_seconds"] = timings["total_seconds"]
-    video_data["ai_deferred"] = False
-    video_data["ai_enabled"] = qwen_ok
-    video_data["candidate_count"] = len(candidates)
-    if not qwen_ok:
+    if not video_data["ai_enabled"]:
         print(
             "      Deferred Qwen produced no semantic tags; leaving this video "
             "ai_enabled=False so it retries on the next run."
@@ -850,7 +885,7 @@ def _complete_deferred_qwen_batch(
             video_data["ai_deferred"] = False
             video_data["ai_enabled"] = False
         print("   Qwen semantic analysis skipped (BEATSYNC_QWEN_MAX_WINDOWS=0).")
-        return {"qwen_frame_count": 0, "qwen_tag_count": 0}
+        return
 
     request_jobs: List[Dict] = []
     job_to_video: Dict[str, Dict] = {}
@@ -890,11 +925,9 @@ def _complete_deferred_qwen_batch(
 
     print(f"   Running one shared Qwen worker for {len(request_jobs)} video(s) (model loads once)")
     batch_started = time.perf_counter()
-    response = _run_qwen_worker_batch(
-        jobs=request_jobs,
-        qwen_model_path=qwen_model_path,
-        use_gpu=use_gpu,
-        audio_profile=audio_profile,
+    response = _run_qwen_worker(
+        _qwen_request(qwen_model_path, use_gpu, audio_profile, jobs=request_jobs),
+        batch=True,
     )
     batch_seconds = time.perf_counter() - batch_started
     semantics_by_job = response.get("semantics_by_job") or {}
@@ -915,15 +948,9 @@ def _complete_deferred_qwen_batch(
     for job_id, video_data in job_to_video.items():
         ai_candidates = selected_by_job.get(job_id, [])
         semantics = semantics_by_job.get(str(job_id), {})
-        semantic_by_id = {str(k): v for k, v in semantics.items()} if isinstance(semantics, dict) else {}
-        merged_count = 0
-        for candidate in ai_candidates:
-            semantic = semantic_by_id.get(str(candidate.get("id")))
-            if semantic:
-                _merge_semantic(candidate, semantic)
-                merged_count += 1
-        candidates = video_data.get("candidates") or []
-        candidates.sort(key=lambda c: c.get("editorial_score", 0.0), reverse=True)
+        # Merge + sort + the ai_enabled rule all live in _apply_qwen_result (the
+        # single enforcement site shared with the single-video deferred path).
+        merged_count = _apply_qwen_result(video_data, ai_candidates, semantics)
         timing = timings_by_job.get(str(job_id), {}) if isinstance(timings_by_job, dict) else {}
         qwen_seconds = (
             float(timing.get("prefetch_seconds") or 0.0)
@@ -942,14 +969,6 @@ def _complete_deferred_qwen_batch(
         timings["qwen_peak_vram_gb"] = qwen_peak_vram_gb
         timings["total_seconds"] = float(timings.get("total_seconds", video_data.get("analysis_seconds", 0.0))) + qwen_seconds
         video_data["analysis_seconds"] = timings["total_seconds"]
-        video_data["ai_deferred"] = False
-        # Same rule as the single-video deferred path: only a video that
-        # actually merged semantic tags may be cached as an AI result. A video
-        # whose merge came back empty (its requests all failed inside an
-        # otherwise-successful batch) keeps ai_enabled=False so
-        # _load_cache(require_ai=True) re-runs Qwen for it next time.
-        video_data["ai_enabled"] = merged_count > 0
-        video_data["candidate_count"] = len(candidates)
         print(
             f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)} "
             f"for {_safe_name(video_data.get('video_file', 'video'))}"
@@ -1064,28 +1083,60 @@ def _run_qwen_worker_process(command: List[str], env: Dict[str, str], timeout: i
     return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
-def _run_qwen_worker_batch(
-    jobs: Sequence[Dict],
+def _qwen_request(
     qwen_model_path: str,
     use_gpu: bool,
     audio_profile: Dict,
+    *,
+    jobs: Sequence[Dict] | None = None,
+    video_file: str | None = None,
+    fps: float | None = None,
+    candidates: Sequence[Dict] | None = None,
 ) -> Dict:
-    os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
-    token = _hash_text(f"batch|{time.time()}|{len(jobs)}", 12)
-    request_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_batch_request_{token}.json")
-    response_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_batch_response_{token}.json")
-    worker_path = os.path.join(ROOT_DIR, "src", "auto_mode", "stage5_qwen_scene_worker.py")
-    request = {
-        "jobs": list(jobs),
+    """Build the stage-5 worker request. This is the ONLY place the wire format
+    branches: a multi-video request carries top-level ``jobs``; a single-video
+    request carries top-level ``video_file``/``fps``/``candidates``. The worker
+    process accepts both and its protocol is unchanged."""
+    request: Dict = {
         "qwen_model_path": qwen_model_path,
         "use_gpu": bool(use_gpu),
         "audio_profile": audio_profile,
     }
+    if jobs is not None:
+        request["jobs"] = list(jobs)
+    else:
+        request["video_file"] = video_file
+        request["fps"] = fps
+        request["candidates"] = [
+            {"id": c.get("id"), "start": c.get("start"), "end": c.get("end")}
+            for c in (candidates or [])
+        ]
+    return request
+
+
+def _run_qwen_worker(request: Dict, batch: bool) -> Dict:
+    """Run the stage-5 Qwen worker for one request and return its parsed
+    response dict (``{}`` on any failure). Single-video is just a 1-request
+    batch; ``batch`` only selects the temp-file naming, backstop-timeout input,
+    the stderr tail length and the log label — all preserved verbatim from the
+    two former (single / batch) implementations."""
+    os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
+    if batch:
+        jobs = request.get("jobs") or []
+        token = _hash_text(f"batch|{time.time()}|{len(jobs)}", 12)
+        prefix, label, error_tail = "qwen_batch", "Qwen batch worker", 2400
+        total_candidates = sum(len(job.get("candidates") or []) for job in jobs)
+    else:
+        token = _hash_text(f"{request.get('video_file')}|{time.time()}", 12)
+        prefix, label, error_tail = "qwen", "Qwen worker", 1800
+        total_candidates = len(request.get("candidates") or [])
+    request_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"{prefix}_request_{token}.json")
+    response_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"{prefix}_response_{token}.json")
+    worker_path = os.path.join(ROOT_DIR, "src", "auto_mode", "stage5_qwen_scene_worker.py")
     with open(request_path, "w", encoding="utf-8") as f:
         json.dump(request, f)
 
     env = _qwen_worker_environment()
-    total_candidates = sum(len(job.get("candidates") or []) for job in jobs)
     timeout = _qwen_worker_timeout(total_candidates)
     try:
         result = _run_qwen_worker_process(
@@ -1097,23 +1148,55 @@ def _run_qwen_worker_batch(
             for line in result.stdout.strip().splitlines():
                 print(f"      {line}")
         if result.returncode != 0:
-            error_tail = (result.stderr or "").strip()[-2400:]
-            print(f"      Qwen batch worker failed: {error_tail}")
+            error_tail_text = (result.stderr or "").strip()[-error_tail:]
+            print(f"      {label} failed: {error_tail_text}")
             return {}
         with open(response_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except subprocess.TimeoutExpired:
-        print("      Qwen batch worker timed out; deterministic visual tags remain active.")
+        print(f"      {label} timed out; deterministic visual tags remain active.")
         return {}
     except Exception as e:
-        print(f"      Qwen batch worker error: {e}")
+        print(f"      {label} error: {e}")
         return {}
     finally:
         # Keep Qwen worker request/response files in video_analysis_cache for
         # reproducibility and debugging. The user explicitly wants this cache
         # folder to be preserved.
         pass
+
+
+def _merge_semantics_by_id(ai_candidates: Sequence[Dict], semantics) -> int:
+    """Merge worker-returned semantics into ``ai_candidates`` by id and return
+    the number of candidates that actually received a merge. Shared merge loop
+    for the serial and deferred paths (a merge is not idempotent, so each
+    candidate is merged at most once)."""
+    semantic_by_id = {str(k): v for k, v in semantics.items()} if isinstance(semantics, dict) else {}
+    merged_count = 0
+    for candidate in ai_candidates:
+        semantic = semantic_by_id.get(str(candidate.get("id")))
+        if semantic:
+            _merge_semantic(candidate, semantic)
+            merged_count += 1
+    return merged_count
+
+
+def _apply_qwen_result(video_data: Dict, ai_candidates: Sequence[Dict], semantics) -> int:
+    """Apply a deferred Qwen result to one video and return the merge count.
+
+    This is the SINGLE place the deferred-path rule lives: only a real tag merge
+    (>= 1 candidate actually annotated) may set ``ai_enabled``. A transient
+    llama-server failure therefore never gets cached as an AI hit, so
+    ``_load_cache(require_ai=True)`` re-runs Qwen for that video next time.
+    Both deferred orchestrators (single and batch) funnel through here."""
+    merged_count = _merge_semantics_by_id(ai_candidates, semantics)
+    candidates = video_data.get("candidates") or []
+    candidates.sort(key=lambda c: c.get("editorial_score", 0.0), reverse=True)
+    video_data["ai_deferred"] = False
+    video_data["ai_enabled"] = merged_count > 0
+    video_data["candidate_count"] = len(candidates)
+    return merged_count
 
 def _build_boundaries(scene_changes: Iterable[float], duration: float) -> List[float]:
     if duration <= 0:
@@ -1315,6 +1398,37 @@ def _measure_window(cap: cv2.VideoCapture, fps: float, start: float, end: float,
     return _measure_frame_samples(frames, np.asarray(used_times, dtype=float), start, plan["duration"], use_gpu)
 
 
+def _score_from_primitives(brightness: float, contrast: float, saturation: float,
+                           sharpness: float, motion: float, colorfulness: float,
+                           peak_offset: float, duration: float) -> Dict:
+    """Shared metric scorer: turn per-window primitives into the candidate
+    metric dict. The weights, penalties and returned dict are identical to the
+    inline copy that previously lived in both _measure_frame_samples (CPU) and
+    _measure_frames_gpu (GPU); each caller still computes the primitives its own
+    way (the CPU/GPU saturation etc. difference is pre-existing and untouched).
+    subject_anchor is NOT added here — the CPU caller attaches it afterward."""
+    darkness_penalty = _clamp((0.25 - brightness) / 0.25)
+    blown_penalty = _clamp((brightness - 0.86) / 0.14)
+    quality = _clamp(
+        0.36 * sharpness
+        + 0.22 * _clamp(contrast)
+        + 0.18 * _clamp(saturation)
+        + 0.14 * (1.0 - darkness_penalty)
+        + 0.10 * (1.0 - blown_penalty)
+    )
+    return {
+        "duration": duration,
+        "brightness": _clamp(brightness),
+        "contrast": _clamp(contrast),
+        "saturation": _clamp(saturation),
+        "sharpness": _clamp(sharpness),
+        "motion": _clamp(motion),
+        "colorfulness": _clamp(colorfulness),
+        "quality_score": quality,
+        "peak_offset": _clamp(peak_offset, 0.0, duration, default=duration * 0.5),
+    }
+
+
 def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarray,
                            start: float, duration: float, use_gpu: bool = False) -> Dict:
     if not frames:
@@ -1327,8 +1441,10 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
             # both paths emit an identical schema.
             metrics["subject_anchor"] = _compute_subject_anchor(frames, sample_times, start)
             return metrics
-        except Exception:
-            pass
+        except Exception as exc:
+            # Graceful degradation: one log line, then fall through to the CPU
+            # scorer below. (Dead on Mac — no CuPy — so it never fires here.)
+            print(f"      GPU candidate metrics failed ({exc}); using CPU scorer.")
 
     gray_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
     hsv_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2HSV) for f in frames]
@@ -1355,30 +1471,14 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
         motion = 0.0
 
     colorfulness = _colorfulness(frames)
-    darkness_penalty = _clamp((0.25 - brightness) / 0.25)
-    blown_penalty = _clamp((brightness - 0.86) / 0.14)
-    quality = _clamp(
-        0.36 * sharpness
-        + 0.22 * _clamp(contrast)
-        + 0.18 * _clamp(saturation)
-        + 0.14 * (1.0 - darkness_penalty)
-        + 0.10 * (1.0 - blown_penalty)
+    metrics = _score_from_primitives(
+        brightness, contrast, saturation, sharpness, motion, colorfulness,
+        peak_offset, duration,
     )
-
-    return {
-        "duration": duration,
-        "brightness": _clamp(brightness),
-        "contrast": _clamp(contrast),
-        "saturation": _clamp(saturation),
-        "sharpness": _clamp(sharpness),
-        "motion": _clamp(motion),
-        "colorfulness": _clamp(colorfulness),
-        "quality_score": quality,
-        "peak_offset": _clamp(peak_offset, 0.0, duration, default=duration * 0.5),
-        "subject_anchor": _compute_subject_anchor(
-            frames, sample_times, start, gray_frames=gray_frames, diff_maps=diff_maps
-        ),
-    }
+    metrics["subject_anchor"] = _compute_subject_anchor(
+        frames, sample_times, start, gray_frames=gray_frames, diff_maps=diff_maps
+    )
+    return metrics
 
 
 def _use_gpu_candidate_metrics(use_gpu: bool) -> bool:
@@ -1426,27 +1526,10 @@ def _measure_frames_gpu(frames: Sequence[np.ndarray], sample_times: np.ndarray,
     yb = cp.abs(0.5 * (r + g) - b)
     colorfulness = _clamp(float(cp.asnumpy(cp.mean(cp.std(rg, axis=(1, 2)) + cp.std(yb, axis=(1, 2)))) / 95.0))
 
-    darkness_penalty = _clamp((0.25 - brightness) / 0.25)
-    blown_penalty = _clamp((brightness - 0.86) / 0.14)
-    quality = _clamp(
-        0.36 * sharpness
-        + 0.22 * _clamp(contrast)
-        + 0.18 * _clamp(saturation)
-        + 0.14 * (1.0 - darkness_penalty)
-        + 0.10 * (1.0 - blown_penalty)
+    return _score_from_primitives(
+        brightness, contrast, saturation, sharpness, motion, colorfulness,
+        peak_offset, duration,
     )
-
-    return {
-        "duration": duration,
-        "brightness": _clamp(brightness),
-        "contrast": _clamp(contrast),
-        "saturation": _clamp(saturation),
-        "sharpness": _clamp(sharpness),
-        "motion": _clamp(motion),
-        "colorfulness": _clamp(colorfulness),
-        "quality_score": quality,
-        "peak_offset": _clamp(peak_offset, 0.0, duration, default=duration * 0.5),
-    }
 
 
 def _gpu_laplacian(gray_stack):
@@ -1486,43 +1569,41 @@ def _resize_for_analysis(frame: np.ndarray, max_width: int) -> np.ndarray:
 YUNET_MODEL_ENV = "BEATSYNC_YUNET_MODEL"
 DEFAULT_YUNET_MODEL = os.path.join(ROOT_DIR, "models", "face_detection_yunet_2023mar.onnx")
 _YUNET_SCORE_THRESHOLD = 0.65
-_yunet_thread_local = threading.local()  # FaceDetectorYN is not thread-safe; one per worker thread
-_yunet_disabled = False
+
+# YuNet has no disable env of its own — the kill switch is BEATSYNC_YUNET_MODEL
+# pointing at a missing/blank path (resolve returns "" → disabled). Its detector
+# is not thread-safe, so concurrency="thread_local" keeps the original one-per-
+# worker-thread discipline plus the process-wide latch.
+_YUNET_BACKEND = OptionalBackend(
+    "YuNet face detector",
+    default_model=DEFAULT_YUNET_MODEL,
+    model_env=YUNET_MODEL_ENV,
+    concurrency="thread_local",
+)
 
 _NEUTRAL_ANCHOR = {"cx": 0.5, "cy": 0.5, "confidence": 0.0, "source": "detail", "path": []}
 
 
 def _resolve_yunet_model_path() -> str:
-    env_path = os.environ.get(YUNET_MODEL_ENV, "").strip()
-    if env_path:
-        # Explicit override is authoritative: if it is missing/broken the
-        # face path is disabled (also serves as a kill switch) rather than
-        # silently falling back to the bundled model.
-        return env_path if os.path.isfile(env_path) else ""
-    return DEFAULT_YUNET_MODEL if os.path.isfile(DEFAULT_YUNET_MODEL) else ""
+    # Explicit override is authoritative: if it is missing/broken the face path
+    # is disabled (also serves as a kill switch) rather than silently falling
+    # back to the bundled model.
+    return _YUNET_BACKEND.resolve_model_path()
 
 
 def _get_yunet_detector():
-    global _yunet_disabled
-    if _yunet_disabled:
-        return None
-    detector = getattr(_yunet_thread_local, "detector", None)
-    if detector is not None:
-        return detector
-    if not hasattr(cv2, "FaceDetectorYN"):  # needs opencv>=4.5.4
-        _yunet_disabled = True
-        return None
-    model_path = _resolve_yunet_model_path()
-    if not model_path:
-        _yunet_disabled = True
-        return None
-    try:
-        detector = cv2.FaceDetectorYN.create(model_path, "", (320, 320), _YUNET_SCORE_THRESHOLD)
-    except Exception:
-        _yunet_disabled = True
-        return None
-    _yunet_thread_local.detector = detector
-    return detector
+    def build():
+        if not hasattr(cv2, "FaceDetectorYN"):  # needs opencv>=4.5.4
+            return None
+        model_path = _YUNET_BACKEND.resolve_model_path()
+        if not model_path:
+            return None
+        try:
+            return cv2.FaceDetectorYN.create(model_path, "", (320, 320), _YUNET_SCORE_THRESHOLD)
+        except Exception:
+            return None
+
+    return _YUNET_BACKEND.get_thread_local(build)
 
 
 def _detect_face_center(frame: np.ndarray):
@@ -1860,7 +1941,7 @@ def _annotate_candidates_with_qwen(
     qwen_model_path: str,
     use_gpu: bool,
     audio_profile: Dict,
-) -> None:
+) -> Dict | None:
     max_windows = int(os.environ.get("BEATSYNC_QWEN_MAX_WINDOWS", "120"))
     max_windows = max(0, max_windows)
     if max_windows == 0:
@@ -1873,12 +1954,11 @@ def _annotate_candidates_with_qwen(
 
     print(f"   Qwen semantic analysis: {len(ai_candidates)} candidate moments")
     response = _run_qwen_worker(
-        video_file=video_file,
-        fps=fps,
-        candidates=ai_candidates,
-        qwen_model_path=qwen_model_path,
-        use_gpu=use_gpu,
-        audio_profile=audio_profile,
+        _qwen_request(
+            qwen_model_path, use_gpu, audio_profile,
+            video_file=video_file, fps=fps, candidates=ai_candidates,
+        ),
+        batch=False,
     )
     semantics = response.get("semantics") if isinstance(response, dict) else {}
     if not semantics:
@@ -1891,13 +1971,7 @@ def _annotate_candidates_with_qwen(
             "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
         }
 
-    semantic_by_id = {str(k): v for k, v in semantics.items()}
-    merged_count = 0
-    for candidate in ai_candidates:
-        semantic = semantic_by_id.get(str(candidate.get("id")))
-        if semantic:
-            _merge_semantic(candidate, semantic)
-            merged_count += 1
+    merged_count = _merge_semantics_by_id(ai_candidates, semantics)
     print(f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)}")
     timing = response.get("timings_by_job", {}).get("single", {}) if isinstance(response, dict) else {}
     return {
@@ -1907,68 +1981,6 @@ def _annotate_candidates_with_qwen(
         "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
         "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
     }
-
-
-def _run_qwen_worker(
-    video_file: str,
-    fps: float,
-    candidates: Sequence[Dict],
-    qwen_model_path: str,
-    use_gpu: bool,
-    audio_profile: Dict,
-) -> Dict:
-    os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
-    token = _hash_text(f"{video_file}|{time.time()}", 12)
-    request_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_request_{token}.json")
-    response_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_response_{token}.json")
-    worker_path = os.path.join(ROOT_DIR, "src", "auto_mode", "stage5_qwen_scene_worker.py")
-    request = {
-        "video_file": video_file,
-        "fps": fps,
-        "qwen_model_path": qwen_model_path,
-        "use_gpu": bool(use_gpu),
-        "audio_profile": audio_profile,
-        "candidates": [
-            {
-                "id": c.get("id"),
-                "start": c.get("start"),
-                "end": c.get("end"),
-            }
-            for c in candidates
-        ],
-    }
-    with open(request_path, "w", encoding="utf-8") as f:
-        json.dump(request, f)
-
-    env = _qwen_worker_environment()
-    timeout = _qwen_worker_timeout(len(candidates))
-    try:
-        result = _run_qwen_worker_process(
-            [sys.executable, worker_path, "--request", request_path, "--response", response_path],
-            env,
-            timeout,
-        )
-        if result.stdout.strip():
-            for line in result.stdout.strip().splitlines():
-                print(f"      {line}")
-        if result.returncode != 0:
-            error_tail = (result.stderr or "").strip()[-1800:]
-            print(f"      Qwen worker failed: {error_tail}")
-            return {}
-        with open(response_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except subprocess.TimeoutExpired:
-        print("      Qwen worker timed out; deterministic visual tags remain active.")
-        return {}
-    except Exception as e:
-        print(f"      Qwen worker error: {e}")
-        return {}
-    finally:
-        # Keep Qwen worker request/response files in video_analysis_cache for
-        # reproducibility and debugging. The user explicitly wants this cache
-        # folder to be preserved.
-        pass
 
 
 def _qwen_worker_environment() -> Dict[str, str]:

@@ -7,6 +7,7 @@ import numpy as np
 
 from . import AutoWaveConfig
 from . import _safe_percentile
+from .contracts import BeatFeatures, Section
 
 # Wave-14: map the structure backend's functional labels onto the internal
 # section vocabulary the rest of the pipeline (stage4 stepping, stage6 planner,
@@ -53,9 +54,9 @@ def _label_for_interval(backend_sections: List[Dict], start: float, end: float) 
 
 
 def analyze_sections(y: np.ndarray, y_harmonic: np.ndarray, y_percussive: np.ndarray,
-                     sr: int, beat_times: np.ndarray, features: Dict,
+                     sr: int, beat_times: np.ndarray, features: BeatFeatures,
                      cfg: AutoWaveConfig,
-                     structure: Optional[Dict] = None) -> List[Dict]:
+                     structure: Optional[Dict] = None) -> List[Section]:
     duration = len(y) / sr
     if duration <= 0 or len(beat_times) == 0:
         return [{"index": 0, "start": 0.0, "end": duration, "duration": duration, "type": "body"}]
@@ -130,7 +131,7 @@ def analyze_sections(y: np.ndarray, y_harmonic: np.ndarray, y_percussive: np.nda
         step = 32.0
         boundaries_arr = np.asarray([0.0] + list(np.arange(step, duration, step)) + [duration], dtype=float)
 
-    sections: List[Dict] = []
+    sections: List[Section] = []
     median_wave = _safe_percentile(features["wave"], 50, 0.5)
     prev_bass_mean: Optional[float] = None
 
@@ -181,7 +182,7 @@ def analyze_sections(y: np.ndarray, y_harmonic: np.ndarray, y_percussive: np.nda
             section_type = classify_section(rel_start, rel_end, section_wave, section_impact, median_wave)
         dominant_pattern = detect_section_pattern(features, beat_idx)
 
-        section = {
+        section: Section = {
             "index": len(sections),
             "start": start,
             "end": end,
@@ -241,7 +242,7 @@ def classify_section(rel_start: float, rel_end: float, wave: float, impact: floa
     return "verse"
 
 
-def detect_section_pattern(features: Dict, beat_indices: np.ndarray) -> str:
+def detect_section_pattern(features: BeatFeatures, beat_indices: np.ndarray) -> str:
     if beat_indices.size == 0:
         return "mixed"
     kick_ratio = float(np.mean(features["is_strong_kick"][beat_indices]))

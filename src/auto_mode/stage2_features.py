@@ -10,6 +10,7 @@ import numpy as np
 from gpu_cpu_utils import GPU_AVAILABLE, cp
 from . import AutoWaveConfig
 from . import _interp_to_beats, _normalize, _safe_percentile, _smooth
+from .contracts import BeatFeatures
 
 def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
                           beat_times: np.ndarray, beat_frames: np.ndarray,
@@ -19,7 +20,7 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
                           audio_file: Optional[str] = None,
                           start_time: float = 0.0,
                           duration: Optional[float] = None,
-                          mel_S: Optional[np.ndarray] = None) -> Dict:
+                          mel_S: Optional[np.ndarray] = None) -> BeatFeatures:
     """Extract beat-synchronous energy/rhythm data with smooth wave behavior."""
     duration = len(y) / sr
 

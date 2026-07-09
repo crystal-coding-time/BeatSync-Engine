@@ -6,8 +6,9 @@ import numpy as np
 
 from . import AutoWaveConfig
 from . import _normalize, _safe_percentile, _unique_sorted
+from .contracts import BeatFeatures, Section
 
-def select_wave_cuts(beat_times: np.ndarray, sections: List[Dict], features: Dict,
+def select_wave_cuts(beat_times: np.ndarray, sections: List[Section], features: BeatFeatures,
                      tempo: float, audio_duration: float,
                      cfg: AutoWaveConfig) -> Tuple[np.ndarray, List[Dict]]:
     selected: List[float] = []
@@ -37,7 +38,7 @@ def select_wave_cuts(beat_times: np.ndarray, sections: List[Dict], features: Dic
 
 
 def select_section_wave_cuts(beat_indices: np.ndarray, beat_times: np.ndarray,
-                             features: Dict, section: Dict,
+                             features: BeatFeatures, section: Section,
                              cfg: AutoWaveConfig) -> List[float]:
     section_type = section.get("type", "verse")
     pattern = section.get("dominant_pattern", "mixed")
@@ -147,7 +148,7 @@ def adaptive_beat_step(wave: float, impact: float, section_type: str, pattern: s
 
 
 def choose_best_nearby(beat_indices: np.ndarray, target_pos: int, radius: int,
-                       scores: Dict[int, float], features: Dict) -> int | None:
+                       scores: Dict[int, float], features: BeatFeatures) -> int | None:
     if beat_indices.size == 0:
         return None
     lo = max(0, target_pos - radius)
@@ -172,7 +173,7 @@ def choose_best_nearby(beat_indices: np.ndarray, target_pos: int, radius: int,
     return int(best)
 
 
-def compute_cut_scores(beat_indices: np.ndarray, features: Dict, section: Dict,
+def compute_cut_scores(beat_indices: np.ndarray, features: BeatFeatures, section: Section,
                        cfg: AutoWaveConfig) -> np.ndarray:
     idx = beat_indices
     impact = features["impact_score"][idx]
@@ -242,7 +243,7 @@ def min_interval_for_wave(wave: float, section_type: str, cfg: AutoWaveConfig) -
     return cfg.low_energy_min_interval
 
 
-def max_hold_for_section(section: Dict, cfg: AutoWaveConfig) -> float:
+def max_hold_for_section(section: Section, cfg: AutoWaveConfig) -> float:
     section_type = section.get("type", "verse")
     energy = float(section.get("energy", 0.5))
     if section_type in {"intro", "outro", "breakdown"}:
@@ -256,7 +257,7 @@ def max_hold_for_section(section: Dict, cfg: AutoWaveConfig) -> float:
     return cfg.low_energy_max_hold
 
 
-def add_rare_micro_cuts(selected: np.ndarray, beat_times: np.ndarray, features: Dict,
+def add_rare_micro_cuts(selected: np.ndarray, beat_times: np.ndarray, features: BeatFeatures,
                         audio_duration: float, cfg: AutoWaveConfig) -> np.ndarray:
     """Add extremely rare half-beat cuts only for huge impacts, not normal density."""
     if not cfg.enable_rare_micro_cuts or len(beat_times) < 3 or selected.size == 0:
@@ -320,7 +321,7 @@ def _nearest_beat_indices(beat_times: np.ndarray, times: np.ndarray) -> np.ndarr
     return np.searchsorted(beat_times, nearest_val, side="left")
 
 
-def final_wave_cleanup(selected: np.ndarray, beat_times: np.ndarray, features: Dict,
+def final_wave_cleanup(selected: np.ndarray, beat_times: np.ndarray, features: BeatFeatures,
                        audio_duration: float, cfg: AutoWaveConfig) -> np.ndarray:
     arr = np.asarray(selected, dtype=float)
     arr = arr[np.isfinite(arr)]

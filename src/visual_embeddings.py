@@ -64,25 +64,160 @@ _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 
 
 _INPUT_SIZE = 224
 
-_session_lock = threading.Lock()
-_session_cache: Dict[str, object] = {}   # model_path -> InferenceSession (or None on failure)
 _sha_cache: Dict[str, str] = {}          # (path:size:mtime) -> sha256 prefix
 _ort_import_failed = False
 
 
+# --- Shared optional-backend + sidecar abstractions ------------------------
+# These two small helpers live here (the lighter of the two modules) and are
+# imported by video_analysis.py, so the YuNet / DINOv2 / video-analysis sidecar
+# logic exists in exactly one place. Qwen deliberately does NOT use
+# OptionalBackend: it resolves a *set* of executables/models (not one model
+# file), keeps no cached session (it shells out per call), and its disable lives
+# upstream (auto_mode reads BEATSYNC_DISABLE_QWEN) — forcing it in would distort
+# behavior, so it keeps its bespoke resolver/availability/signature helpers.
+
+
+class OptionalBackend:
+    """A single optional model backend: env-based disable + kill switch, the
+    exact ``env override → bundled default → disabled`` path-resolution order,
+    and a lazily-built instance whose *concurrency discipline is preserved, not
+    homogenized* (``concurrency='thread_local'`` for YuNet's per-thread
+    non-thread-safe detector; ``'shared'`` for DINOv2's process-wide
+    lock+dict session cache)."""
+
+    def __init__(self, name: str, *, default_model: str, model_env: str | None = None,
+                 disable_env: str | None = None, concurrency: str = "shared"):
+        self.name = name
+        self.default_model = default_model
+        self.model_env = model_env
+        self.disable_env = disable_env
+        self.concurrency = concurrency
+        self._lock = threading.Lock()
+        self._shared_cache: Dict[str, object] = {}   # key -> instance (shared strategy)
+        self._thread_local = threading.local()       # per-thread instance (thread_local)
+        self.disabled_latch = False                  # thread_local: latch off once impossible
+
+    def disabled(self) -> bool:
+        """True when the disable/kill-switch env var is set to a truthy value.
+        Backends without a disable env (YuNet) are never disabled this way."""
+        if not self.disable_env:
+            return False
+        return os.environ.get(self.disable_env, "").strip() not in ("", "0", "false", "False")
+
+    def resolve_model_path(self) -> str:
+        """Explicit env override is authoritative (missing → disabled / kill
+        switch); otherwise fall back to the bundled default, else disabled.
+        This order is preserved verbatim from both former resolvers."""
+        env_path = os.environ.get(self.model_env, "").strip() if self.model_env else ""
+        if env_path:
+            return env_path if os.path.isfile(env_path) else ""
+        return self.default_model if os.path.isfile(self.default_model) else ""
+
+    def get_thread_local(self, build):
+        """YuNet discipline: one instance per worker thread (FaceDetectorYN is
+        not thread-safe), with a process-wide latch that short-circuits once
+        construction is known impossible. ``build()`` returns the instance or
+        None; a None result latches the backend off."""
+        if self.disabled_latch:
+            return None
+        instance = getattr(self._thread_local, "instance", None)
+        if instance is not None:
+            return instance
+        instance = build()
+        if instance is None:
+            self.disabled_latch = True
+            return None
+        self._thread_local.instance = instance
+        return instance
+
+    def get_shared(self, key: str, build):
+        """DINOv2 discipline: a process-wide {key: instance-or-None} cache behind
+        a lock; ``build()`` runs at most once per key and a None result is cached
+        so a failed load is not retried."""
+        with self._lock:
+            if key in self._shared_cache:
+                return self._shared_cache[key]
+            instance = build()
+            self._shared_cache[key] = instance
+            return instance
+
+
+class SidecarCache:
+    """Shared per-source-video JSON sidecar cache. Path layout is exactly what
+    both former copies produced, so existing on-disk caches keep hitting:
+
+        {cache_dir}/{sha1(stem)[:8]}_{signature}{suffix}.json
+
+    Serialization and failure behavior are parameterized to match each site:
+    the video-analysis cache uses ``suffix='' , indent=2`` and *logs* read/write
+    failures; the DINOv2 cache uses ``suffix='_dino'``, compact JSON and *silent*
+    failures."""
+
+    def __init__(self, cache_dir: str, suffix: str, *, indent: int | None = None,
+                 log_label: str | None = None, make_dir_on_path: bool = True):
+        self.cache_dir = cache_dir
+        self.suffix = suffix
+        self.indent = indent
+        self.log_label = log_label
+        self.make_dir_on_path = make_dir_on_path
+
+    def path(self, source_file: str, signature: str) -> str:
+        if self.make_dir_on_path:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(source_file))[0] or "video"
+        prefix = hashlib.sha1(stem.encode("utf-8", errors="ignore")).hexdigest()[:8]
+        return os.path.join(self.cache_dir, f"{prefix}_{signature}{self.suffix}.json")
+
+    def load(self, path: str):
+        """Return the parsed JSON object, or None on miss / unreadable / corrupt.
+        Validation of the payload is the caller's job."""
+        try:
+            if not os.path.exists(path):
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            if self.log_label:
+                print(f"   Warning: could not read {self.log_label}: {e}")
+            return None
+
+    def save(self, path: str, data) -> None:
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=self.indent)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            if self.log_label:
+                print(f"   Warning: could not write {self.log_label}: {e}")
+
+
 # --- Model / runtime resolution -------------------------------------------
 
+_EMBED_BACKEND = OptionalBackend(
+    "DINOv2 embeddings",
+    default_model=DEFAULT_EMBED_MODEL,
+    model_env=EMBED_MODEL_ENV,
+    disable_env=EMBED_DISABLE_ENV,
+    concurrency="shared",
+)
+
+# Same file layout / format as before (compact JSON, silent failures, `_dino`
+# suffix); make_dir_on_path=False mirrors the old _cache_path which never
+# created the directory (only _save_sidecar did).
+_EMBED_SIDECAR = SidecarCache(
+    _CACHE_DIR, "_dino", indent=None, log_label=None, make_dir_on_path=False,
+)
+
+
 def _embed_disabled() -> bool:
-    return os.environ.get(EMBED_DISABLE_ENV, "").strip() not in ("", "0", "false", "False")
+    return _EMBED_BACKEND.disabled()
 
 
 def _resolve_model_path() -> str:
-    """Explicit env override is authoritative (missing → disabled / kill switch);
-    otherwise fall back to the bundled default, else disabled."""
-    env_path = os.environ.get(EMBED_MODEL_ENV, "").strip()
-    if env_path:
-        return env_path if os.path.isfile(env_path) else ""
-    return DEFAULT_EMBED_MODEL if os.path.isfile(DEFAULT_EMBED_MODEL) else ""
+    return _EMBED_BACKEND.resolve_model_path()
 
 
 def _sha256_prefix(path: str, length: int = 12) -> str:
@@ -109,11 +244,11 @@ def _sha256_prefix(path: str, length: int = 12) -> str:
 def _get_session(model_path: str):
     """Return a single-threaded CPU ONNX Runtime session for the model, or None
     if onnxruntime is unavailable or the model cannot be loaded. onnxruntime is
-    imported lazily so the rest of the pipeline runs even when it is absent."""
-    global _ort_import_failed
-    with _session_lock:
-        if model_path in _session_cache:
-            return _session_cache[model_path]
+    imported lazily so the rest of the pipeline runs even when it is absent.
+    Caching keeps DINOv2's original lock+dict discipline (one session per model
+    path, behind the backend lock)."""
+    def build():
+        global _ort_import_failed
         if _ort_import_failed:
             return None
         try:
@@ -126,13 +261,13 @@ def _get_session(model_path: str):
             # Single-threaded CPU execution → deterministic across runs/machines.
             opts.intra_op_num_threads = 1
             opts.inter_op_num_threads = 1
-            session = ort.InferenceSession(
+            return ort.InferenceSession(
                 model_path, opts, providers=["CPUExecutionProvider"]
             )
         except Exception:
-            session = None
-        _session_cache[model_path] = session
-        return session
+            return None
+
+    return _EMBED_BACKEND.get_shared(model_path, build)
 
 
 # --- Preprocessing / inference --------------------------------------------
@@ -194,9 +329,7 @@ def _video_signature(video_file: str, model_sha: str) -> str:
 
 
 def _cache_path(video_file: str, signature: str) -> str:
-    stem = os.path.splitext(os.path.basename(video_file))[0] or "video"
-    short = hashlib.sha1(stem.encode("utf-8", errors="ignore")).hexdigest()[:8]
-    return os.path.join(_CACHE_DIR, f"{short}_{signature}_dino.json")
+    return _EMBED_SIDECAR.path(video_file, signature)
 
 
 def _window_key(start: float, end: float) -> str:
@@ -205,11 +338,8 @@ def _window_key(start: float, end: float) -> str:
 
 def _load_sidecar(path: str, signature: str) -> Dict[str, List[float]]:
     """Return the cached {window_key: vector} map, or empty on miss/corrupt/stale."""
+    data = _EMBED_SIDECAR.load(path)
     try:
-        if not os.path.exists(path):
-            return {}
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
         if not isinstance(data, dict):
             return {}
         if data.get("signature") != signature or data.get("preproc_version") != PREPROC_VERSION:
@@ -223,25 +353,17 @@ def _load_sidecar(path: str, signature: str) -> Dict[str, List[float]]:
                 clean[key] = [float(x) for x in vec]
         return clean
     except Exception:
-        # Corrupt / unreadable cache → recompute silently.
+        # Corrupt cache → recompute silently.
         return {}
 
 
 def _save_sidecar(path: str, signature: str, embeddings: Dict[str, List[float]]) -> None:
-    try:
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        payload = {
-            "signature": signature,
-            "preproc_version": PREPROC_VERSION,
-            "embeddings": embeddings,
-        }
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        os.replace(tmp_path, path)
-    except Exception:
-        # Cache is an optimization; failure to persist must never break analysis.
-        pass
+    payload = {
+        "signature": signature,
+        "preproc_version": PREPROC_VERSION,
+        "embeddings": embeddings,
+    }
+    _EMBED_SIDECAR.save(path, payload)
 
 
 # --- Deterministic online clustering --------------------------------------

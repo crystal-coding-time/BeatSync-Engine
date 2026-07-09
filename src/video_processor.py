@@ -150,8 +150,6 @@ if __name__ == '__main__':
     else:
         print(f"💻 GPU Acceleration: NOT AVAILABLE")
 
-
-if __name__ == '__main__':
     if NVENC_AVAILABLE:
         print(f"🎬 NVIDIA NVENC: AVAILABLE - Hardware video encoding enabled")
     elif VIDEOTOOLBOX_AVAILABLE:
@@ -612,12 +610,12 @@ def _select_crossfade_boundaries(plan: List[Dict], segment_frames, fps: float) -
         if d_frames < 1:
             continue
         # Occasional wipes; fade is the common case. Same rng draw.
-        troll = rng.random()
-        if troll < 0.75:
+        transition_roll = rng.random()
+        if transition_roll < 0.75:
             transition = 'fade'
-        elif troll < 0.83:
+        elif transition_roll < 0.83:
             transition = 'wipeleft'
-        elif troll < 0.91:
+        elif transition_roll < 0.91:
             transition = 'wiperight'
         else:
             transition = 'smoothup'

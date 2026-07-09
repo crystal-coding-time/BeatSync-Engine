@@ -82,7 +82,7 @@ def set_gpu_mode(enabled: bool) -> bool:
     return USE_GPU
 
 
-def get_array_module(use_gpu: bool = None):
+def get_array_module(use_gpu: bool | None = None):
     """Get NumPy or CuPy based on GPU setting."""
     if use_gpu is None:
         use_gpu = USE_GPU
@@ -96,7 +96,7 @@ def to_cpu(array):
     return array
 
 
-def to_gpu(array, use_gpu: bool = None):
+def to_gpu(array, use_gpu: bool | None = None):
     """Convert a NumPy array to a CuPy array if GPU mode is enabled."""
     if use_gpu is None:
         use_gpu = USE_GPU
