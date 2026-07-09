@@ -304,49 +304,72 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
 
         _audio_console_cb = (lambda stage, message:
                              console_logger.stage_line(stage, message) if console_logger else None)
-        if len(local_audio_paths) == 1:
-            # Single song: byte-identical to the pre-multisong path.
-            local_audio_path = local_audio_paths[0]
-            selected_beats, beat_info = analyze_beats_auto(
-                local_audio_path,
-                use_gpu=use_gpu,
-                video_files=local_video_paths,
-                progress_callback=progress_callback,
-                console_callback=_audio_console_cb,
-            )
+        # Stages 1-5 are deterministic and depend only on the media selection,
+        # so reuse them verbatim when the same songs+videos are re-rendered with
+        # different render settings (variety, effects, text…) — the tuning loop.
+        # The full render stays byte-identical: identical selected_beats/beat_info
+        # in → identical plan+encode out; only the minutes of re-analysis are
+        # skipped. Cache is per-Gradio-session and the key invalidates it the
+        # moment the audio or video selection changes.
+        analysis_key = (tuple(local_audio_paths), tuple(local_video_paths), bool(use_gpu))
+        _cached = session_state.get('analysis_cache')
+        if (isinstance(_cached, dict) and _cached.get('key') == analysis_key
+                and _cached.get('local_audio_path')
+                and os.path.exists(_cached['local_audio_path'])):
+            local_audio_path = _cached['local_audio_path']
+            selected_beats = _cached['selected_beats']
+            beat_info = _cached['beat_info']
+            print("♻️  Reusing cached analysis (media unchanged); skipping stages 1-5")
         else:
-            # Multi-song: concatenate the ordered tracks into one continuous
-            # wav and analyze the whole timeline. Lazy import keeps the
-            # single-song path free of any dependency on the module; a missing
-            # module raises a clear, user-facing error only here, where more
-            # than one song was actually requested. The returned trio maps 1:1
-            # onto the single-song values: (concat wav, cut beats, beat_info).
-            try:
-                import multisong
-            except ImportError:
-                return (None,
-                        '❌ Error: Multiple songs selected, but the multi-song '
-                        'module (src/multisong.py) is unavailable. Select a '
-                        'single song, or install/enable multi-song support.',
-                        session_state)
-            # work_dir is the per-session temp dir, NOT the processing dir:
-            # create_music_video clears the processing dir at render start,
-            # which would delete the concat wav before the audio mux reads it.
-            # session_dir lives under GRADIO_TEMP_DIR and is cleaned on app
-            # startup, so the concat wav has the right lifecycle.
-            local_audio_path, selected_beats, beat_info = multisong.analyze_and_concat(
-                local_audio_paths,
-                session_dir,
-                video_files=local_video_paths,
-                use_gpu=use_gpu,
-                enable_qwen_semantics=True,
-                qwen_model_path=None,
-                progress_callback=progress_callback,
-                console_callback=_audio_console_cb,
-            )
-            _total_audio = float(beat_info.get('audio_duration') or 0.0)
-            print(f"🎶 Multi-song: {len(local_audio_paths)} tracks → total "
-                  f"{int(_total_audio) // 60}:{int(_total_audio) % 60:02d}")
+            if len(local_audio_paths) == 1:
+                # Single song: byte-identical to the pre-multisong path.
+                local_audio_path = local_audio_paths[0]
+                selected_beats, beat_info = analyze_beats_auto(
+                    local_audio_path,
+                    use_gpu=use_gpu,
+                    video_files=local_video_paths,
+                    progress_callback=progress_callback,
+                    console_callback=_audio_console_cb,
+                )
+            else:
+                # Multi-song: concatenate the ordered tracks into one continuous
+                # wav and analyze the whole timeline. Lazy import keeps the
+                # single-song path free of any dependency on the module; a missing
+                # module raises a clear, user-facing error only here, where more
+                # than one song was actually requested. The returned trio maps 1:1
+                # onto the single-song values: (concat wav, cut beats, beat_info).
+                try:
+                    import multisong
+                except ImportError:
+                    return (None,
+                            '❌ Error: Multiple songs selected, but the multi-song '
+                            'module (src/multisong.py) is unavailable. Select a '
+                            'single song, or install/enable multi-song support.',
+                            session_state)
+                # work_dir is the per-session temp dir, NOT the processing dir:
+                # create_music_video clears the processing dir at render start,
+                # which would delete the concat wav before the audio mux reads it.
+                # session_dir lives under GRADIO_TEMP_DIR and is cleaned on app
+                # startup, so the concat wav has the right lifecycle.
+                local_audio_path, selected_beats, beat_info = multisong.analyze_and_concat(
+                    local_audio_paths,
+                    session_dir,
+                    video_files=local_video_paths,
+                    use_gpu=use_gpu,
+                    enable_qwen_semantics=True,
+                    qwen_model_path=None,
+                    progress_callback=progress_callback,
+                    console_callback=_audio_console_cb,
+                )
+                _total_audio = float(beat_info.get('audio_duration') or 0.0)
+                print(f"🎶 Multi-song: {len(local_audio_paths)} tracks → total "
+                      f"{int(_total_audio) // 60}:{int(_total_audio) % 60:02d}")
+            session_state['analysis_cache'] = {
+                'key': analysis_key,
+                'local_audio_path': local_audio_path,
+                'selected_beats': selected_beats,
+                'beat_info': beat_info,
+            }
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
 
