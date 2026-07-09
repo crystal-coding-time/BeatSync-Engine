@@ -677,54 +677,72 @@ def _assemble_crossfade_chunks(clip_files: List[str], xfade_boundaries: Dict[int
     return assembly
 
 
-def create_music_video(audio_file: str, video_files: VideoList, beat_times: BeatTimes,
-                      output_file: str = 'output_music_video.mkv',
-                      start_time: float = 0.0, end_time: float = None,
-                      max_workers: int = None,
-                      beat_info: dict = None,
-                      lossless_mode: bool = False, use_gpu: bool = False,
-                      gpu_encoder: str = 'h264_nvenc', fps: float = None,
-                      fit_mode: str = 'crop',
-                      output_format: str = DEFAULT_OUTPUT_FORMAT,
-                      effect_style: str = 'clean',
-                      effect_intensity: float = 0.7,
-                      effect_mode: str = 'curated', effect_palette: List[str] = None,
-                      effect_seed: int = 0, look_cube: str = None,
-                      text_entries: List[str] = None, text_position: str = 'bottom',
-                      text_scale: float = 1.0, variety: float = 0.4,
-                      speed_ramps: bool = False,
-                      split_screen: bool = True,
-                      crossfades: bool = False,
-                      settings: Dict = None) -> str:
-    """
-    Creates a music video with video clips cut to detected beats.
-    
-    **PURE FFMPEG IMPLEMENTATION - FRAME-ACCURATE**
-    
-    ✅ NO BATCH PROCESSING: FFmpeg handles memory independently
-    ✅ FRAME-ACCURATE: Uses exact frame counts for zero drift
-    ✅ NO CUMULATIVE ERROR: Each segment is precisely timed
-    
-    Args:
-        audio_file: Path to audio file
-        video_files: List of video file paths
-        beat_times: Array of beat times (already processed by mode)
-        output_file: Output file path
-        start_time: Audio start time
-        end_time: Audio end time
-        max_workers: Number of parallel workers
-        beat_info: Beat information dictionary
-        lossless_mode: Use ProRes 422 Proxy mode
-        use_gpu: Use GPU acceleration
-        gpu_encoder: GPU encoder to use
-        fps: Output FPS
-    
-    Returns:
-        Path to output video file
-    """
-    if len(beat_times) == 0:
-        raise ValueError("No beats were detected. Cannot create video.")
+@dataclass
+class RenderContext:
+    """Everything the render phases share, resolved once up front.
 
+    Built by _resolve_render_config; planned_clip_sequence is filled in by
+    _plan_visuals. render_info aliases beat_info['render_info'] so stats
+    written here surface in the GUI summary exactly as before.
+    """
+    # Call arguments
+    audio_file: str
+    video_files: VideoList
+    output_file: str
+    start_time: float
+    end_time: Optional[float]
+    beat_info: Optional[dict]
+    lossless_mode: bool
+    gpu_encoder: str
+    # Resolved configuration
+    fps: float
+    session_temp_dir: str
+    use_nvenc: bool
+    max_workers: int
+    render_info: Dict
+    video_creation_started: float
+    # Settings-derived style flags
+    fit_mode: str
+    effect_style: str
+    effect_intensity: float
+    effect_mode: str
+    effect_palette: Optional[List[str]]
+    effect_seed: int
+    look_cube: Optional[str]
+    text_entries: Optional[List[str]]
+    text_position: str
+    text_scale: float
+    variety: float
+    semantic_variety: float
+    speed_ramps: bool
+    split_screen: bool
+    crossfades: bool
+    # Frame-locked cut timeline (the duration authority)
+    selected_beats: List[float]
+    segment_frames: List[int]
+    segment_durations: List[float]
+    total_clips: int
+    target_size: Tuple[int, int]
+    # Filled by _plan_visuals (None = legacy random sampling fallback)
+    planned_clip_sequence: Optional[List[Dict]] = None
+
+
+def _resolve_render_config(audio_file: str, video_files: VideoList,
+                           beat_times: BeatTimes, output_file: str,
+                           start_time: float, end_time: float,
+                           max_workers: int, beat_info: dict,
+                           lossless_mode: bool, use_gpu: bool,
+                           gpu_encoder: str, fps: float, fit_mode: str,
+                           output_format: str, effect_style: str,
+                           effect_intensity: float, effect_mode: str,
+                           effect_palette: List[str], effect_seed: int,
+                           look_cube: str, text_entries: List[str],
+                           text_position: str, text_scale: float,
+                           variety: float, speed_ramps: bool,
+                           split_screen: bool, crossfades: bool,
+                           settings: Dict) -> RenderContext:
+    """Merge settings, detect fps, wipe the temp dir, resolve encoder and
+    workers, init render_info, and build the frame-locked cut timeline."""
     # A settings dict (GUI path) overrides the individual style kwargs — the
     # positional chain grew past the point where order mistakes are survivable.
     if settings:
@@ -855,6 +873,43 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     target_size = resolve_target_resolution(output_format, video_files)
     render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
 
+    return RenderContext(
+        audio_file=audio_file, video_files=video_files,
+        output_file=output_file, start_time=start_time, end_time=end_time,
+        beat_info=beat_info, lossless_mode=lossless_mode,
+        gpu_encoder=gpu_encoder, fps=fps,
+        session_temp_dir=session_temp_dir, use_nvenc=use_nvenc,
+        max_workers=max_workers, render_info=render_info,
+        video_creation_started=video_creation_started,
+        fit_mode=fit_mode, effect_style=effect_style,
+        effect_intensity=effect_intensity, effect_mode=effect_mode,
+        effect_palette=effect_palette, effect_seed=effect_seed,
+        look_cube=look_cube, text_entries=text_entries,
+        text_position=text_position, text_scale=text_scale,
+        variety=variety, semantic_variety=semantic_variety,
+        speed_ramps=speed_ramps, split_screen=split_screen,
+        crossfades=crossfades, selected_beats=selected_beats,
+        segment_frames=segment_frames, segment_durations=segment_durations,
+        total_clips=total_clips, target_size=target_size,
+    )
+
+
+def _plan_visuals(ctx: RenderContext) -> None:
+    """Annotate candidates with visual embeddings (optional backend) and run
+    the stage6 planner; stores the plan on ctx.planned_clip_sequence."""
+    beat_info = ctx.beat_info
+    render_info = ctx.render_info
+    lossless_mode = ctx.lossless_mode
+    semantic_variety = ctx.semantic_variety
+    variety = ctx.variety
+    video_files = ctx.video_files
+    selected_beats = ctx.selected_beats
+    segment_durations = ctx.segment_durations
+    fps = ctx.fps
+    speed_ramps = ctx.speed_ramps
+    split_screen = ctx.split_screen
+    target_size = ctx.target_size
+
     # Visual variety: cluster visually-similar candidates via DINOv2 embeddings
     # so stage6 can avoid back-to-back similar-looking shots. Lazy/guarded
     # import — the pipeline must keep running if the embeddings module or its
@@ -917,446 +972,576 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     else:
         print("🎲 Visual planner fallback: source moments will use legacy random sampling")
 
-    # LOSSLESS MODE - ProRes workflow with FRAME-PERFECT precision
-    if lossless_mode:
-        print(f"\n{'='*60}")
-        print(f"🎯 LOSSLESS MODE: Converting videos to ProRes 422 Proxy")
-        print(f"{'='*60}")
-        
-        # Create ProRes conversion directory
-        prores_dir = os.path.join(session_temp_dir, 'prores')
-        os.makedirs(prores_dir, exist_ok=True)
-        
-        # Use detected FPS for ProRes conversion
-        prores_fps = fps
-        print(f"🎞️ Using FPS: {prores_fps} (for frame-perfect precision)")
+    ctx.planned_clip_sequence = planned_clip_sequence
 
-        # Mixed-resolution sources must not reach concat stream-copy: normalize
-        # every proxy to one target frame (resolved above, before planning) so
-        # all segment streams are identical. Planned clips in this branch only
-        # feed extract_prores_segment_random (source + start): partner dicts
-        # never reach the ProRes path.
 
-        # Convert input videos to ProRes (video only, no audio).
-        #
-        # When a plan exists we only ever look up its DISTINCT sources in
-        # prores_map (line ~782), so converting the whole library would burn
-        # real-time re-encodes on files no segment references (e.g. ~700 dead
-        # conversions for a 300-cut plan over a 1000-file library). Convert
-        # only the referenced subset: each entry's primary video_file plus,
-        # defensively, any duo partner's — the planner excludes duos from
-        # lossless, but we don't lean on that. The map-miss fallback pool
-        # (prores_files) is seeded from this same subset. It preserves the
-        # original video_files order (filtered to the subset) so the fallback
-        # RNG iterates a stable ordering; in a consistent plan-exists run every
-        # planned source is in the subset, so line ~782 always hits the map and
-        # the map-miss branch never fires — output stays byte-identical.
-        #
-        # With NO plan (legacy pure-random path) any source can be sampled, so
-        # convert all of them exactly as before — byte-for-byte identical.
-        if planned_clip_sequence:
-            referenced = set()
-            for entry in planned_clip_sequence:
-                primary = entry.get('video_file')
-                if primary:
-                    referenced.add(os.path.abspath(primary))
-                partner = entry.get('partner')
-                if isinstance(partner, dict):
-                    partner_file = partner.get('video_file')
-                    if partner_file:
-                        referenced.add(os.path.abspath(partner_file))
-            convert_sources = [vf for vf in video_files
-                               if os.path.abspath(vf) in referenced]
-            print(f"🎯 Plan references {len(convert_sources)} of {len(video_files)} "
-                  f"sources; converting only those to ProRes")
-        else:
-            convert_sources = list(video_files)
+def _convert_prores_group(indices: List[int], convert_sources: List[str],
+                          prores_dir: str, prores_fps: float,
+                          target_size: Tuple[int, int],
+                          fit_mode: str) -> List[Tuple[int, str]]:
+    """Convert one basename-sharing group of sources to ProRes, serially in
+    input order (was a closure inside the lossless branch; sources sharing a
+    proxy stem must not run concurrently — last one wins, as the old serial
+    loop guaranteed)."""
+    return [(idx, convert_to_prores_proxy(
+                convert_sources[idx], prores_dir, prores_fps,
+                target_size=target_size, fit_mode=fit_mode))
+            for idx in indices]
 
-        # Proxy conversions are independent whole-source re-encodes, so they
-        # go through the worker pool. One caveat: the proxy filename derives
-        # from the source BASENAME, so two sources sharing a basename share
-        # one output path (the old serial loop simply let the later conversion
-        # overwrite the earlier one). Those must not run concurrently — group
-        # conversions by proxy stem and convert each group serially in input
-        # order inside a single pooled task, preserving the serial
-        # last-one-wins file content. prores_files/prores_map are filled by
-        # original index, so list order (which the seeded fallback choice
-        # depends on) never depends on completion order.
-        prores_files: List[Optional[str]] = [None] * len(convert_sources)
-        prores_map = {}
 
-        conversion_groups: Dict[str, List[int]] = {}
-        for idx, video_file in enumerate(convert_sources):
-            stem = os.path.splitext(os.path.basename(video_file))[0]
-            conversion_groups.setdefault(stem, []).append(idx)
+def _render_lossless(ctx: RenderContext) -> str:
+    """LOSSLESS MODE - ProRes workflow with FRAME-PERFECT precision."""
+    audio_file = ctx.audio_file
+    video_files = ctx.video_files
+    output_file = ctx.output_file
+    start_time = ctx.start_time
+    end_time = ctx.end_time
+    render_info = ctx.render_info
+    fps = ctx.fps
+    session_temp_dir = ctx.session_temp_dir
+    max_workers = ctx.max_workers
+    fit_mode = ctx.fit_mode
+    segment_durations = ctx.segment_durations
+    total_clips = ctx.total_clips
+    target_size = ctx.target_size
+    planned_clip_sequence = ctx.planned_clip_sequence
 
-        def _convert_group(indices: List[int]) -> List[Tuple[int, str]]:
-            return [(idx, convert_to_prores_proxy(
-                        convert_sources[idx], prores_dir, prores_fps,
-                        target_size=target_size, fit_mode=fit_mode))
-                    for idx in indices]
+    print(f"\n{'='*60}")
+    print(f"🎯 LOSSLESS MODE: Converting videos to ProRes 422 Proxy")
+    print(f"{'='*60}")
+    
+    # Create ProRes conversion directory
+    prores_dir = os.path.join(session_temp_dir, 'prores')
+    os.makedirs(prores_dir, exist_ok=True)
+    
+    # Use detected FPS for ProRes conversion
+    prores_fps = fps
+    print(f"🎞️ Using FPS: {prores_fps} (for frame-perfect precision)")
 
-        completed_conversions = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            conversion_futures = [executor.submit(_convert_group, indices)
-                                  for indices in conversion_groups.values()]
-            for future in as_completed(conversion_futures):
-                for idx, prores_file in future.result():
-                    prores_files[idx] = prores_file
-                    prores_map[os.path.abspath(convert_sources[idx])] = prores_file
-                    completed_conversions += 1
-                    print(f"   ✓ Converted {completed_conversions}/{len(convert_sources)}")
+    # Mixed-resolution sources must not reach concat stream-copy: normalize
+    # every proxy to one target frame (resolved above, before planning) so
+    # all segment streams are identical. Planned clips in this branch only
+    # feed extract_prores_segment_random (source + start): partner dicts
+    # never reach the ProRes path.
 
-        print(f"✓ All videos converted to ProRes 422 Proxy (video only)")
-        
-        # Create segments from ProRes files with FRAME-PERFECT precision
-        print(f"\n{'='*60}")
-        print(f"✂️  EXTRACTING SEGMENTS (FRAME-PERFECT PRECISION)")
-        print(f"{'='*60}")
-        print(f"   Mode: Frame-accurate re-encoding")
-        print(f"   Method: Exact frame count calculation")
-        print(f"   Playback: forward")
-        print(f"   Audio: Stripped (will add music at the end)")
-        print(f"   FPS: {prores_fps} (fixed)")
-        
-        segment_files: List[Optional[str]] = [None] * len(segment_durations)
-        segments_dir = os.path.join(session_temp_dir, 'segments')
-        os.makedirs(segments_dir, exist_ok=True)
+    # Convert input videos to ProRes (video only, no audio).
+    #
+    # When a plan exists we only ever look up its DISTINCT sources in
+    # prores_map (line ~782), so converting the whole library would burn
+    # real-time re-encodes on files no segment references (e.g. ~700 dead
+    # conversions for a 300-cut plan over a 1000-file library). Convert
+    # only the referenced subset: each entry's primary video_file plus,
+    # defensively, any duo partner's — the planner excludes duos from
+    # lossless, but we don't lean on that. The map-miss fallback pool
+    # (prores_files) is seeded from this same subset. It preserves the
+    # original video_files order (filtered to the subset) so the fallback
+    # RNG iterates a stable ordering; in a consistent plan-exists run every
+    # planned source is in the subset, so line ~782 always hits the map and
+    # the map-miss branch never fires — output stays byte-identical.
+    #
+    # With NO plan (legacy pure-random path) any source can be sampled, so
+    # convert all of them exactly as before — byte-for-byte identical.
+    if planned_clip_sequence:
+        referenced = set()
+        for entry in planned_clip_sequence:
+            primary = entry.get('video_file')
+            if primary:
+                referenced.add(os.path.abspath(primary))
+            partner = entry.get('partner')
+            if isinstance(partner, dict):
+                partner_file = partner.get('video_file')
+                if partner_file:
+                    referenced.add(os.path.abspath(partner_file))
+        convert_sources = [vf for vf in video_files
+                           if os.path.abspath(vf) in referenced]
+        print(f"🎯 Plan references {len(convert_sources)} of {len(video_files)} "
+              f"sources; converting only those to ProRes")
+    else:
+        convert_sources = list(video_files)
 
-        # Phase 1 (serial): resolve every segment's source and start time in
-        # index order, so all seeded draws happen in exactly the order the old
-        # serial loop made them. Phase 2 then only runs ffmpeg jobs, which
-        # never touch the RNG streams.
-        extraction_jobs: List[Tuple[int, str, float, float]] = []
-        for i, exact_duration in enumerate(segment_durations):
-            # Duration comes from the absolute frame-locked timeline.
-            planned_clip = planned_clip_sequence[i] if planned_clip_sequence else None
+    # Proxy conversions are independent whole-source re-encodes, so they
+    # go through the worker pool. One caveat: the proxy filename derives
+    # from the source BASENAME, so two sources sharing a basename share
+    # one output path (the old serial loop simply let the later conversion
+    # overwrite the earlier one). Those must not run concurrently — group
+    # conversions by proxy stem and convert each group serially in input
+    # order inside a single pooled task, preserving the serial
+    # last-one-wins file content. prores_files/prores_map are filled by
+    # original index, so list order (which the seeded fallback choice
+    # depends on) never depends on completion order.
+    prores_files: List[Optional[str]] = [None] * len(convert_sources)
+    prores_map = {}
 
-            if planned_clip:
-                source_video = os.path.abspath(planned_clip.get('video_file', ''))
-                prores_file = prores_map.get(source_video)
-                if prores_file is None:
-                    # A silent substitute here would mask a path-normalization
-                    # bug between the planner and the proxy map.
-                    print(f"   ⚠️  Planned source missing from ProRes map: {source_video}; "
-                          f"using deterministic fallback source")
-                    prores_file = _stable_rng('prores_fallback', i).choice(prores_files)
-                segment_start = float(planned_clip.get('start_time', 0.0))
-            else:
-                # Seeded ProRes source + start so precise mode renders the same
-                # video for the same inputs even without a visual plan.
+    conversion_groups: Dict[str, List[int]] = {}
+    for idx, video_file in enumerate(convert_sources):
+        stem = os.path.splitext(os.path.basename(video_file))[0]
+        conversion_groups.setdefault(stem, []).append(idx)
+
+    completed_conversions = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        conversion_futures = [
+            executor.submit(_convert_prores_group, indices, convert_sources,
+                            prores_dir, prores_fps, target_size, fit_mode)
+            for indices in conversion_groups.values()]
+        for future in as_completed(conversion_futures):
+            for idx, prores_file in future.result():
+                prores_files[idx] = prores_file
+                prores_map[os.path.abspath(convert_sources[idx])] = prores_file
+                completed_conversions += 1
+                print(f"   ✓ Converted {completed_conversions}/{len(convert_sources)}")
+
+    print(f"✓ All videos converted to ProRes 422 Proxy (video only)")
+    
+    # Create segments from ProRes files with FRAME-PERFECT precision
+    print(f"\n{'='*60}")
+    print(f"✂️  EXTRACTING SEGMENTS (FRAME-PERFECT PRECISION)")
+    print(f"{'='*60}")
+    print(f"   Mode: Frame-accurate re-encoding")
+    print(f"   Method: Exact frame count calculation")
+    print(f"   Playback: forward")
+    print(f"   Audio: Stripped (will add music at the end)")
+    print(f"   FPS: {prores_fps} (fixed)")
+    
+    segment_files: List[Optional[str]] = [None] * len(segment_durations)
+    segments_dir = os.path.join(session_temp_dir, 'segments')
+    os.makedirs(segments_dir, exist_ok=True)
+
+    # Phase 1 (serial): resolve every segment's source and start time in
+    # index order, so all seeded draws happen in exactly the order the old
+    # serial loop made them. Phase 2 then only runs ffmpeg jobs, which
+    # never touch the RNG streams.
+    extraction_jobs: List[Tuple[int, str, float, float]] = []
+    for i, exact_duration in enumerate(segment_durations):
+        # Duration comes from the absolute frame-locked timeline.
+        planned_clip = planned_clip_sequence[i] if planned_clip_sequence else None
+
+        if planned_clip:
+            source_video = os.path.abspath(planned_clip.get('video_file', ''))
+            prores_file = prores_map.get(source_video)
+            if prores_file is None:
+                # A silent substitute here would mask a path-normalization
+                # bug between the planner and the proxy map.
+                print(f"   ⚠️  Planned source missing from ProRes map: {source_video}; "
+                      f"using deterministic fallback source")
                 prores_file = _stable_rng('prores_fallback', i).choice(prores_files)
-                prores_duration = get_cached_video_duration(prores_file)
-                max_start = max(0.0, prores_duration - float(exact_duration))
-                segment_start = _stable_rng('prores_start', i, prores_file).uniform(0.0, max_start)
+            segment_start = float(planned_clip.get('start_time', 0.0))
+        else:
+            # Seeded ProRes source + start so precise mode renders the same
+            # video for the same inputs even without a visual plan.
+            prores_file = _stable_rng('prores_fallback', i).choice(prores_files)
+            prores_duration = get_cached_video_duration(prores_file)
+            max_start = max(0.0, prores_duration - float(exact_duration))
+            segment_start = _stable_rng('prores_start', i, prores_file).uniform(0.0, max_start)
 
-            extraction_jobs.append((i, prores_file, exact_duration, segment_start))
+        extraction_jobs.append((i, prores_file, exact_duration, segment_start))
 
-        # Phase 2 (pooled): each extraction is an independent ffmpeg run
-        # writing its own segment_<index>.mov; results are collected by index
-        # so completion order can never reorder the timeline.
-        completed_segments = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {
-                executor.submit(
-                    extract_prores_segment_random, prores_file, exact_duration,
-                    prores_fps, segments_dir, i, start_time=segment_start): i
-                for i, prores_file, exact_duration, segment_start in extraction_jobs
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    segment_files[idx] = future.result()
-                except Exception as e:
-                    # The serial loop let extraction errors propagate; keep
-                    # that contract (a missing segment would silently drift
-                    # every later cut against the audio).
-                    raise RuntimeError(
-                        f"ProRes segment {idx + 1}/{total_clips} extraction failed: {e}"
-                    ) from e
-                completed_segments += 1
-                if completed_segments % 10 == 0:
-                    print(f"   ✓ Extracted {completed_segments}/{total_clips} segments (frame-perfect)")
-        
-        print(f"✓ Extracted all {len(segment_files)} segments (frame-perfect, video only)")
-        
-        # Concatenate and add audio
-        print(f"\n{'='*60}")
-        print(f"🔗 LOSSLESS CONCATENATION + MUSIC")
-        print(f"{'='*60}")
-        
-        concatenate_videos_ffmpeg(
-            video_files=segment_files,
-            output_file=output_file,
-            audio_file=audio_file,
-            start_time=start_time,
-            end_time=end_time,
-            use_nvenc=False,  # ProRes uses stream copy
-            fps=prores_fps,
-            temp_dir=session_temp_dir,
-            total_frames=int(render_info.get("timeline_frames") or 0)
-        )
-        _assert_output_frames(output_file, render_info)
-
-        print(f"\n{'='*60}")
-        print(f"✅ LOSSLESS VIDEO CREATION COMPLETE!")
-        print(f"   Output: {output_file}")
-        print(f"   Method: Frame-perfect re-encoding + lossless concatenation")
-        print(f"   Quality: ProRes 422 Proxy (lossless)")
-        print(f"   Audio: Music track from input file")
-        print(f"   FPS: {prores_fps} (fixed)")
-        print(f"   Total Segments: {len(segment_files)}")
-        print(f"   Timing Precision: Frame-perfect (zero drift)")
-        print(f"{'='*60}\n")
-        
-        # Cleanup
-        print(f"🧹 Cleaning up temporary files...")
-        if os.name == 'nt':
-            # Windows can hold file handles briefly after ffmpeg exits; give
-            # the OS a beat before deleting. POSIX has no such lag.
-            time.sleep(1.0)
-        gc.collect()
-        
-        for segment_file in segment_files:
+    # Phase 2 (pooled): each extraction is an independent ffmpeg run
+    # writing its own segment_<index>.mov; results are collected by index
+    # so completion order can never reorder the timeline.
+    completed_segments = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(
+                extract_prores_segment_random, prores_file, exact_duration,
+                prores_fps, segments_dir, i, start_time=segment_start): i
+            for i, prores_file, exact_duration, segment_start in extraction_jobs
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
             try:
-                if os.path.exists(segment_file):
-                    os.remove(segment_file)
-            except Exception:
-                pass
-        
-        for prores_file in prores_files:
-            try:
-                if os.path.exists(prores_file):
-                    os.remove(prores_file)
-            except Exception:
-                pass
-        
+                segment_files[idx] = future.result()
+            except Exception as e:
+                # The serial loop let extraction errors propagate; keep
+                # that contract (a missing segment would silently drift
+                # every later cut against the audio).
+                raise RuntimeError(
+                    f"ProRes segment {idx + 1}/{total_clips} extraction failed: {e}"
+                ) from e
+            completed_segments += 1
+            if completed_segments % 10 == 0:
+                print(f"   ✓ Extracted {completed_segments}/{total_clips} segments (frame-perfect)")
+    
+    print(f"✓ Extracted all {len(segment_files)} segments (frame-perfect, video only)")
+    
+    # Concatenate and add audio
+    print(f"\n{'='*60}")
+    print(f"🔗 LOSSLESS CONCATENATION + MUSIC")
+    print(f"{'='*60}")
+    
+    concatenate_videos_ffmpeg(
+        video_files=segment_files,
+        output_file=output_file,
+        audio_file=audio_file,
+        start_time=start_time,
+        end_time=end_time,
+        use_nvenc=False,  # ProRes uses stream copy
+        fps=prores_fps,
+        temp_dir=session_temp_dir,
+        total_frames=int(render_info.get("timeline_frames") or 0)
+    )
+    _assert_output_frames(output_file, render_info)
+
+    print(f"\n{'='*60}")
+    print(f"✅ LOSSLESS VIDEO CREATION COMPLETE!")
+    print(f"   Output: {output_file}")
+    print(f"   Method: Frame-perfect re-encoding + lossless concatenation")
+    print(f"   Quality: ProRes 422 Proxy (lossless)")
+    print(f"   Audio: Music track from input file")
+    print(f"   FPS: {prores_fps} (fixed)")
+    print(f"   Total Segments: {len(segment_files)}")
+    print(f"   Timing Precision: Frame-perfect (zero drift)")
+    print(f"{'='*60}\n")
+    
+    # Cleanup
+    print(f"🧹 Cleaning up temporary files...")
+    if os.name == 'nt':
+        # Windows can hold file handles briefly after ffmpeg exits; give
+        # the OS a beat before deleting. POSIX has no such lag.
+        time.sleep(1.0)
+    gc.collect()
+    
+    for segment_file in segment_files:
         try:
-            if os.path.exists(segments_dir):
-                shutil.rmtree(segments_dir, ignore_errors=True)
-            if os.path.exists(prores_dir):
-                shutil.rmtree(prores_dir, ignore_errors=True)
+            if os.path.exists(segment_file):
+                os.remove(segment_file)
         except Exception:
             pass
-        
-        print(f"✓ Cleanup complete")
-        
-        return output_file
     
-    # STANDARD MODE - Direct parallel processing (NO BATCHES)
-    else:
-        # Output canvas (target_size) was resolved above, before planning.
-        print(f"\n{'='*60}")
-        print(f"🎬 PROCESSING ALL CLIPS (No batch processing with FFmpeg)")
-        print(f"   Total clips: {total_clips}")
-        print(f"   Parallel workers: {max_workers}")
-        print(f"   Frame-accurate: ENABLED")
-        if use_nvenc:
-            vendor = 'Apple' if 'videotoolbox' in gpu_encoder else 'NVIDIA'
-            print(f"   Encoder: ⚡ {vendor} {gpu_encoder.upper()} (GPU-accelerated)")
-        else:
-            print(f"   Encoder: 💻 libx264 (CPU)")
-        print(f"{'='*60}\n")
-        
-        text_plan = {}
-        if text_entries:
-            entries = parse_text_entries(text_entries)
-            seg_map, schedule = plan_text_windows(
-                entries, selected_beats,
-                beat_times=(beat_info or {}).get('times'),
-                planned_clip_sequence=planned_clip_sequence,
-            )
-            png_cache = {}
-            for seg_idx, (text, fade_in_start, fade_in_duration, fade_out_start) in seg_map.items():
-                png = png_cache.get(text)
-                if png is None:
-                    png_path = os.path.join(session_temp_dir, f"text_{len(png_cache):03d}.png")
-                    png = render_text_png(text, target_size, png_path,
-                                          position=text_position, scale=text_scale)
-                    png_cache[text] = png
-                if png:
-                    text_plan[seg_idx] = (png, fade_in_start, fade_in_duration, fade_out_start)
-            for text, ws, we in schedule:
-                print(f"   Text overlay: 📝 {ws:6.2f}s–{we:6.2f}s  {text[:60]!r}")
-
-        # Interior beat offsets per segment (in each segment's local clock) so
-        # beat-locked effects fire on real beats, not a tempo approximation.
-        segment_beats: Dict[int, List[float]] = {}
-        beat_grid = np.asarray((beat_info or {}).get('times', []), dtype=float)
-        beat_grid = beat_grid[np.isfinite(beat_grid)]
-        if beat_grid.size:
-            for i in range(total_clips):
-                seg_start, seg_end = selected_beats[i], selected_beats[i + 1]
-                local = beat_grid[(beat_grid >= seg_start - 1e-6) & (beat_grid < seg_end - 1e-6)] - seg_start
-                if local.size:
-                    segment_beats[i] = [round(float(b), 4) for b in local[:8]]
-
-        render_opts = {
-            'fit_mode': fit_mode,
-            'effect_style': effect_style,
-            'effect_intensity': effect_intensity,
-            'effect_mode': effect_mode,
-            'effect_palette': effect_palette,
-            'effect_seed': effect_seed,
-            'look_cube': look_cube,
-            'tempo': (beat_info or {}).get('tempo'),
-            'text_plan': text_plan,
-            'segment_beats': segment_beats,
-            # Split transitions ride the effects engine, so they follow the
-            # style: any non-clean style gets them.
-            'transitions': bool(effect_style and effect_style != 'clean'),
-        }
-        if effect_style and effect_style != 'clean':
-            print(f"   Effects: 🎨 {effect_style} (intensity {effect_intensity:.2f}) | Frame fit: {fit_mode}")
-        else:
-            print(f"   Frame fit: {fit_mode}")
-
-        # Opt-in crossfades on calm boundaries (never in ProRes precise mode —
-        # this whole branch is the standard path). Selection is deterministic
-        # over the finished plan; the A side of each chosen boundary renders D
-        # extra tail frames, which the boundary-chunk re-encode dissolves into
-        # B during assembly. crossfades off (default) → xfade_boundaries empty
-        # → every ClipJob carries extend 0 and the assembly is untouched.
-        xfade_boundaries: Dict[int, Dict] = {}
-        if crossfades and planned_clip_sequence:
-            xfade_boundaries = _select_crossfade_boundaries(
-                planned_clip_sequence, segment_frames, fps)
-            if xfade_boundaries:
-                print(f"   🎞 Crossfades: {len(xfade_boundaries)} calm boundary/boundaries "
-                      f"selected to dissolve")
-
-        clip_args = []
-        for i, final_duration in enumerate(segment_durations):
-            # Duration comes from the absolute frame-locked cut timeline.
-            planned_clip = planned_clip_sequence[i] if planned_clip_sequence else None
-            video_file = (planned_clip.get('video_file') if planned_clip
-                          else _stable_rng('source_fallback', i).choice(video_files))
-            xfade_extend = int(xfade_boundaries.get(i, {}).get('frames', 0))
-            clip_args.append(ClipJob(
-                index=i, video_file=video_file, final_duration=final_duration,
-                target_size=target_size, use_nvenc=use_nvenc, gpu_encoder=gpu_encoder,
-                temp_dir=session_temp_dir, fps=fps,
-                planned_clip=planned_clip, render_opts=render_opts,
-                xfade_extend_frames=xfade_extend))
-        
-        clip_files = [None] * len(clip_args)
-        clip_timings: List[float] = []
-        clip_stage_started = time.perf_counter()
-        
-        # Process all clips in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {
-                executor.submit(create_clip_parallel, args): idx 
-                for idx, args in enumerate(clip_args)
-            }
-            
-            completed = 0
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    i, clip_path, new_target_size, temp_path, error, clip_elapsed = future.result()
-
-                    if clip_elapsed:
-                        clip_timings.append(float(clip_elapsed))
-                    
-                    if error:
-                        print(f"⚠️  Warning: Clip {i+1} failed after {_fmt_seconds(clip_elapsed)}: {error}")
-                        continue
-                    
-                    if clip_path is not None:
-                        clip_files[idx] = clip_path
-                        
-                        completed += 1
-                        if completed % 10 == 0 or completed == len(clip_args):
-                            progress = (completed / len(clip_args)) * 100
-                            elapsed = time.perf_counter() - clip_stage_started
-                            rate = completed / max(0.001, elapsed)
-                            print(
-                                f"   ⚡ Progress: {completed}/{len(clip_args)} clips ({progress:.1f}%) "
-                                f"[{_fmt_seconds(elapsed)}, {rate:.2f} clips/s]"
-                            )
-                    
-                except Exception as e:
-                    print(f"⚠️  Warning: Error processing clip: {str(e)}")
-                    continue
-        
-        clip_stage_seconds = time.perf_counter() - clip_stage_started
-        _summarize_clip_timings(clip_timings, clip_stage_seconds)
-
-        # Do not silently drop failed clips. Dropping one segment compresses the
-        # output timeline and makes every later cut drift against the audio.
-        failed_count = sum(1 for f in clip_files if f is None)
-        if failed_count:
-            raise RuntimeError(
-                f"{failed_count} clip(s) failed; refusing to concatenate an incomplete timeline."
-            )
-
-        if not clip_files:
-            raise ValueError('No valid video clips could be created')
-
-        # Fold chosen calm boundaries into crossfade chunks (one boundary-chunk
-        # re-encode each; every other segment still stream-copies). The
-        # combined chunk holds len_a + len_b frames, so the concat list just
-        # has fewer, longer entries — the total-frames bound is unchanged.
-        assembly_files = clip_files
-        if xfade_boundaries:
-            assembly_files = _assemble_crossfade_chunks(
-                clip_files, xfade_boundaries, segment_frames, fps,
-                session_temp_dir, use_nvenc, gpu_encoder)
-
-        print(f"\n{'='*60}")
-        print(f"🎬 FINAL ASSEMBLY: Concatenating {len(assembly_files)} clips")
-        print(f"{'='*60}\n")
-
-        # Concatenate all clips and add audio
-        assembly_started = time.perf_counter()
-        concatenate_videos_ffmpeg(
-            video_files=assembly_files,
-            output_file=output_file,
-            audio_file=audio_file,
-            start_time=start_time,
-            end_time=end_time,
-            use_nvenc=use_nvenc,
-            gpu_encoder=gpu_encoder,
-            fps=fps,
-            temp_dir=session_temp_dir,
-            total_frames=int(render_info.get("timeline_frames") or 0)
-        )
-        assembly_seconds = time.perf_counter() - assembly_started
-        render_info["final_assembly_seconds"] = float(assembly_seconds)
-        print(f"   ⏱ Final assembly total: {_fmt_seconds(assembly_seconds)}")
-        _assert_output_frames(output_file, render_info)
- 
-        print(f"\n🧹 Cleaning up resources...")
-        
-        # Cleanup clip files
-        for clip_file in clip_files:
-            try:
-                if os.path.exists(clip_file):
-                    os.remove(clip_file)
-            except Exception as e:
-                print(f"⚠️  Warning: Could not delete clip file: {e}")
-        
-        # Clean up processing directory
+    for prores_file in prores_files:
         try:
-            if os.path.exists(session_temp_dir):
-                shutil.rmtree(session_temp_dir, ignore_errors=True)
-                print(f"✓ Cleaned up processing directory")
-        except Exception as e:
-            print(f"⚠️  Warning: Could not delete processing directory: {e}")
+            if os.path.exists(prores_file):
+                os.remove(prores_file)
+        except Exception:
+            pass
+    
+    try:
+        if os.path.exists(segments_dir):
+            shutil.rmtree(segments_dir, ignore_errors=True)
+        if os.path.exists(prores_dir):
+            shutil.rmtree(prores_dir, ignore_errors=True)
+    except Exception:
+        pass
+    
+    print(f"✓ Cleanup complete")
+    
+    return output_file
+
+
+def _render_standard(ctx: RenderContext) -> str:
+    """STANDARD MODE - Direct parallel processing (NO BATCHES)."""
+    audio_file = ctx.audio_file
+    video_files = ctx.video_files
+    output_file = ctx.output_file
+    start_time = ctx.start_time
+    end_time = ctx.end_time
+    beat_info = ctx.beat_info
+    render_info = ctx.render_info
+    fps = ctx.fps
+    session_temp_dir = ctx.session_temp_dir
+    use_nvenc = ctx.use_nvenc
+    gpu_encoder = ctx.gpu_encoder
+    max_workers = ctx.max_workers
+    video_creation_started = ctx.video_creation_started
+    fit_mode = ctx.fit_mode
+    effect_style = ctx.effect_style
+    effect_intensity = ctx.effect_intensity
+    effect_mode = ctx.effect_mode
+    effect_palette = ctx.effect_palette
+    effect_seed = ctx.effect_seed
+    look_cube = ctx.look_cube
+    text_entries = ctx.text_entries
+    text_position = ctx.text_position
+    text_scale = ctx.text_scale
+    crossfades = ctx.crossfades
+    selected_beats = ctx.selected_beats
+    segment_frames = ctx.segment_frames
+    segment_durations = ctx.segment_durations
+    total_clips = ctx.total_clips
+    target_size = ctx.target_size
+    planned_clip_sequence = ctx.planned_clip_sequence
+
+    # Output canvas (target_size) was resolved in _resolve_render_config,
+    # before planning.
+    print(f"\n{'='*60}")
+    print(f"🎬 PROCESSING ALL CLIPS (No batch processing with FFmpeg)")
+    print(f"   Total clips: {total_clips}")
+    print(f"   Parallel workers: {max_workers}")
+    print(f"   Frame-accurate: ENABLED")
+    if use_nvenc:
+        vendor = 'Apple' if 'videotoolbox' in gpu_encoder else 'NVIDIA'
+        print(f"   Encoder: ⚡ {vendor} {gpu_encoder.upper()} (GPU-accelerated)")
+    else:
+        print(f"   Encoder: 💻 libx264 (CPU)")
+    print(f"{'='*60}\n")
+    
+    text_plan = {}
+    if text_entries:
+        entries = parse_text_entries(text_entries)
+        seg_map, schedule = plan_text_windows(
+            entries, selected_beats,
+            beat_times=(beat_info or {}).get('times'),
+            planned_clip_sequence=planned_clip_sequence,
+        )
+        png_cache = {}
+        for seg_idx, (text, fade_in_start, fade_in_duration, fade_out_start) in seg_map.items():
+            png = png_cache.get(text)
+            if png is None:
+                png_path = os.path.join(session_temp_dir, f"text_{len(png_cache):03d}.png")
+                png = render_text_png(text, target_size, png_path,
+                                      position=text_position, scale=text_scale)
+                png_cache[text] = png
+            if png:
+                text_plan[seg_idx] = (png, fade_in_start, fade_in_duration, fade_out_start)
+        for text, ws, we in schedule:
+            print(f"   Text overlay: 📝 {ws:6.2f}s–{we:6.2f}s  {text[:60]!r}")
+
+    # Interior beat offsets per segment (in each segment's local clock) so
+    # beat-locked effects fire on real beats, not a tempo approximation.
+    segment_beats: Dict[int, List[float]] = {}
+    beat_grid = np.asarray((beat_info or {}).get('times', []), dtype=float)
+    beat_grid = beat_grid[np.isfinite(beat_grid)]
+    if beat_grid.size:
+        for i in range(total_clips):
+            seg_start, seg_end = selected_beats[i], selected_beats[i + 1]
+            local = beat_grid[(beat_grid >= seg_start - 1e-6) & (beat_grid < seg_end - 1e-6)] - seg_start
+            if local.size:
+                segment_beats[i] = [round(float(b), 4) for b in local[:8]]
+
+    render_opts = {
+        'fit_mode': fit_mode,
+        'effect_style': effect_style,
+        'effect_intensity': effect_intensity,
+        'effect_mode': effect_mode,
+        'effect_palette': effect_palette,
+        'effect_seed': effect_seed,
+        'look_cube': look_cube,
+        'tempo': (beat_info or {}).get('tempo'),
+        'text_plan': text_plan,
+        'segment_beats': segment_beats,
+        # Split transitions ride the effects engine, so they follow the
+        # style: any non-clean style gets them.
+        'transitions': bool(effect_style and effect_style != 'clean'),
+    }
+    if effect_style and effect_style != 'clean':
+        print(f"   Effects: 🎨 {effect_style} (intensity {effect_intensity:.2f}) | Frame fit: {fit_mode}")
+    else:
+        print(f"   Frame fit: {fit_mode}")
+
+    # Opt-in crossfades on calm boundaries (never in ProRes precise mode —
+    # this whole branch is the standard path). Selection is deterministic
+    # over the finished plan; the A side of each chosen boundary renders D
+    # extra tail frames, which the boundary-chunk re-encode dissolves into
+    # B during assembly. crossfades off (default) → xfade_boundaries empty
+    # → every ClipJob carries extend 0 and the assembly is untouched.
+    xfade_boundaries: Dict[int, Dict] = {}
+    if crossfades and planned_clip_sequence:
+        xfade_boundaries = _select_crossfade_boundaries(
+            planned_clip_sequence, segment_frames, fps)
+        if xfade_boundaries:
+            print(f"   🎞 Crossfades: {len(xfade_boundaries)} calm boundary/boundaries "
+                  f"selected to dissolve")
+
+    clip_args = []
+    for i, final_duration in enumerate(segment_durations):
+        # Duration comes from the absolute frame-locked cut timeline.
+        planned_clip = planned_clip_sequence[i] if planned_clip_sequence else None
+        video_file = (planned_clip.get('video_file') if planned_clip
+                      else _stable_rng('source_fallback', i).choice(video_files))
+        xfade_extend = int(xfade_boundaries.get(i, {}).get('frames', 0))
+        clip_args.append(ClipJob(
+            index=i, video_file=video_file, final_duration=final_duration,
+            target_size=target_size, use_nvenc=use_nvenc, gpu_encoder=gpu_encoder,
+            temp_dir=session_temp_dir, fps=fps,
+            planned_clip=planned_clip, render_opts=render_opts,
+            xfade_extend_frames=xfade_extend))
+    
+    clip_files = [None] * len(clip_args)
+    clip_timings: List[float] = []
+    clip_stage_started = time.perf_counter()
+    
+    # Process all clips in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(create_clip_parallel, args): idx 
+            for idx, args in enumerate(clip_args)
+        }
         
-        gc.collect()
+        completed = 0
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                i, clip_path, new_target_size, temp_path, error, clip_elapsed = future.result()
+
+                if clip_elapsed:
+                    clip_timings.append(float(clip_elapsed))
+                
+                if error:
+                    print(f"⚠️  Warning: Clip {i+1} failed after {_fmt_seconds(clip_elapsed)}: {error}")
+                    continue
+                
+                if clip_path is not None:
+                    clip_files[idx] = clip_path
+                    
+                    completed += 1
+                    if completed % 10 == 0 or completed == len(clip_args):
+                        progress = (completed / len(clip_args)) * 100
+                        elapsed = time.perf_counter() - clip_stage_started
+                        rate = completed / max(0.001, elapsed)
+                        print(
+                            f"   ⚡ Progress: {completed}/{len(clip_args)} clips ({progress:.1f}%) "
+                            f"[{_fmt_seconds(elapsed)}, {rate:.2f} clips/s]"
+                        )
+                
+            except Exception as e:
+                print(f"⚠️  Warning: Error processing clip: {str(e)}")
+                continue
+    
+    clip_stage_seconds = time.perf_counter() - clip_stage_started
+    _summarize_clip_timings(clip_timings, clip_stage_seconds)
+
+    # Do not silently drop failed clips. Dropping one segment compresses the
+    # output timeline and makes every later cut drift against the audio.
+    failed_count = sum(1 for f in clip_files if f is None)
+    if failed_count:
+        raise RuntimeError(
+            f"{failed_count} clip(s) failed; refusing to concatenate an incomplete timeline."
+        )
+
+    if not clip_files:
+        raise ValueError('No valid video clips could be created')
+
+    # Fold chosen calm boundaries into crossfade chunks (one boundary-chunk
+    # re-encode each; every other segment still stream-copies). The
+    # combined chunk holds len_a + len_b frames, so the concat list just
+    # has fewer, longer entries — the total-frames bound is unchanged.
+    assembly_files = clip_files
+    if xfade_boundaries:
+        assembly_files = _assemble_crossfade_chunks(
+            clip_files, xfade_boundaries, segment_frames, fps,
+            session_temp_dir, use_nvenc, gpu_encoder)
+
+    print(f"\n{'='*60}")
+    print(f"🎬 FINAL ASSEMBLY: Concatenating {len(assembly_files)} clips")
+    print(f"{'='*60}\n")
+
+    # Concatenate all clips and add audio
+    assembly_started = time.perf_counter()
+    concatenate_videos_ffmpeg(
+        video_files=assembly_files,
+        output_file=output_file,
+        audio_file=audio_file,
+        start_time=start_time,
+        end_time=end_time,
+        use_nvenc=use_nvenc,
+        gpu_encoder=gpu_encoder,
+        fps=fps,
+        temp_dir=session_temp_dir,
+        total_frames=int(render_info.get("timeline_frames") or 0)
+    )
+    assembly_seconds = time.perf_counter() - assembly_started
+    render_info["final_assembly_seconds"] = float(assembly_seconds)
+    print(f"   ⏱ Final assembly total: {_fmt_seconds(assembly_seconds)}")
+    _assert_output_frames(output_file, render_info)
  
-        print(f"\n{'='*60}")
-        print(f"✅ VIDEO CREATION COMPLETE!")
-        print(f"   Output: {output_file}")
-        print(f"   FPS: {fps} (frame-accurate)")
-        print(f"   Total Cuts: {total_clips}")
-        print(f"   Zero Drift: Absolute frame-locked cut timeline")
-        print(f"   Total video creation time: {_fmt_seconds(time.perf_counter() - video_creation_started)}")
-        print(f"{'='*60}\n")
-        
-        return output_file
+    print(f"\n🧹 Cleaning up resources...")
+    
+    # Cleanup clip files
+    for clip_file in clip_files:
+        try:
+            if os.path.exists(clip_file):
+                os.remove(clip_file)
+        except Exception as e:
+            print(f"⚠️  Warning: Could not delete clip file: {e}")
+    
+    # Clean up processing directory
+    try:
+        if os.path.exists(session_temp_dir):
+            shutil.rmtree(session_temp_dir, ignore_errors=True)
+            print(f"✓ Cleaned up processing directory")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not delete processing directory: {e}")
+    
+    gc.collect()
+ 
+    print(f"\n{'='*60}")
+    print(f"✅ VIDEO CREATION COMPLETE!")
+    print(f"   Output: {output_file}")
+    print(f"   FPS: {fps} (frame-accurate)")
+    print(f"   Total Cuts: {total_clips}")
+    print(f"   Zero Drift: Absolute frame-locked cut timeline")
+    print(f"   Total video creation time: {_fmt_seconds(time.perf_counter() - video_creation_started)}")
+    print(f"{'='*60}\n")
+    
+    return output_file
+
+
+def create_music_video(audio_file: str, video_files: VideoList, beat_times: BeatTimes,
+                      output_file: str = 'output_music_video.mkv',
+                      start_time: float = 0.0, end_time: float = None,
+                      max_workers: int = None,
+                      beat_info: dict = None,
+                      lossless_mode: bool = False, use_gpu: bool = False,
+                      gpu_encoder: str = 'h264_nvenc', fps: float = None,
+                      fit_mode: str = 'crop',
+                      output_format: str = DEFAULT_OUTPUT_FORMAT,
+                      effect_style: str = 'clean',
+                      effect_intensity: float = 0.7,
+                      effect_mode: str = 'curated', effect_palette: List[str] = None,
+                      effect_seed: int = 0, look_cube: str = None,
+                      text_entries: List[str] = None, text_position: str = 'bottom',
+                      text_scale: float = 1.0, variety: float = 0.4,
+                      speed_ramps: bool = False,
+                      split_screen: bool = True,
+                      crossfades: bool = False,
+                      settings: Dict = None) -> str:
+    """
+    Creates a music video with video clips cut to detected beats.
+    
+    **PURE FFMPEG IMPLEMENTATION - FRAME-ACCURATE**
+    
+    ✅ NO BATCH PROCESSING: FFmpeg handles memory independently
+    ✅ FRAME-ACCURATE: Uses exact frame counts for zero drift
+    ✅ NO CUMULATIVE ERROR: Each segment is precisely timed
+    
+    Args:
+        audio_file: Path to audio file
+        video_files: List of video file paths
+        beat_times: Array of beat times (already processed by mode)
+        output_file: Output file path
+        start_time: Audio start time
+        end_time: Audio end time
+        max_workers: Number of parallel workers
+        beat_info: Beat information dictionary
+        lossless_mode: Use ProRes 422 Proxy mode
+        use_gpu: Use GPU acceleration
+        gpu_encoder: GPU encoder to use
+        fps: Output FPS
+    
+    Returns:
+        Path to output video file
+    """
+    if len(beat_times) == 0:
+        raise ValueError("No beats were detected. Cannot create video.")
+
+    ctx = _resolve_render_config(
+        audio_file=audio_file, video_files=video_files, beat_times=beat_times,
+        output_file=output_file, start_time=start_time, end_time=end_time,
+        max_workers=max_workers, beat_info=beat_info,
+        lossless_mode=lossless_mode, use_gpu=use_gpu,
+        gpu_encoder=gpu_encoder, fps=fps, fit_mode=fit_mode,
+        output_format=output_format, effect_style=effect_style,
+        effect_intensity=effect_intensity, effect_mode=effect_mode,
+        effect_palette=effect_palette, effect_seed=effect_seed,
+        look_cube=look_cube, text_entries=text_entries,
+        text_position=text_position, text_scale=text_scale, variety=variety,
+        speed_ramps=speed_ramps, split_screen=split_screen,
+        crossfades=crossfades, settings=settings)
+
+    _plan_visuals(ctx)
+
+    if ctx.lossless_mode:
+        return _render_lossless(ctx)
+    return _render_standard(ctx)
  
  
 def main() -> None:

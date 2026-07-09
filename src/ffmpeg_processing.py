@@ -1733,6 +1733,260 @@ def _run_and_verify_segment(cmd: List[str], output_file: str,
     return True, ""
 
 
+@dataclass(frozen=True)
+class SegmentRenderPlan:
+    """One fully-planned segment render, ready for _execute_segment_plan.
+
+    input_args is the complete input block of the argv — loop/seek/image
+    variants, the duo's second input, and the looped text PNG when present —
+    everything between the hwaccel args and the filter payload. Exactly one
+    of graph/vf is set: graph renders via -filter_complex + -map [outv],
+    vf via a plain -vf chain. The remaining fields feed the shared encode
+    tail (_segment_encode_tail) and the output verification."""
+    input_args: Tuple[str, ...]
+    graph: str | None
+    vf: str | None
+    output_frame_count: int
+    fps: float
+    use_nvenc: bool
+    gpu_encoder: str
+    output_file: str
+
+
+def _plan_duo_segment(video_file: str, start_time: float, anchor: dict,
+                      partner: dict, image_source: bool, retime: dict,
+                      exact_output_duration: float, fps: float,
+                      target_size: Tuple[int, int], post_filters: List[str],
+                      text_overlay: Tuple[str, float, float, float],
+                      output_frame_count: int, use_nvenc: bool,
+                      gpu_encoder: str,
+                      output_file: str) -> "SegmentRenderPlan | None":
+    """Plan the split-screen duo render, or None to render the primary solo.
+
+    Pure planning: probes only (via _plan_duo_render), no rng, no writes.
+    None means the partner was dropped — a warning has already been printed
+    where needed — and the caller falls through to the solo plan.
+    """
+    # Split-screen duo guards — the planner already enforces all of
+    # these; the strips below are belt-and-braces for external callers,
+    # mirroring the retime strips. A dropped partner NEVER fails the
+    # segment: the primary just renders solo through the normal ladder.
+    if partner is not None and (not isinstance(partner, dict)
+                                or not partner.get('video_file')
+                                or not target_size):
+        print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: invalid partner spec")
+        partner = None
+    if partner is not None and retime:
+        # A warped clock breaks the per-pane tracked pan and doubles the
+        # runway math; duos live on hard cuts at natural speed.
+        print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: retime and split-screen never combine")
+        partner = None
+    if partner is not None and (image_source
+                                or is_image_source(partner['video_file'])):
+        print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: still images render solo")
+        partner = None
+    if partner is None:
+        return None
+
+    duo_plan = _plan_duo_render(video_file, start_time, anchor,
+                                partner, exact_output_duration, fps,
+                                target_size)
+    if duo_plan is None:
+        return None  # warning printed inside; render solo
+    duo_inputs, duo_branches, duo_stack = duo_plan
+    base_label = 'basev' if text_overlay else 'outv'
+    post = ("," + ",".join(post_filters)) if post_filters else ""
+    filter_graph = (
+        f"[0:v]{duo_branches[0]}[pane0];"
+        f"[1:v]{duo_branches[1]}[pane1];"
+        f"[pane0][pane1]{duo_stack},setsar=1{post}[{base_label}]"
+    )
+    if text_overlay:
+        _, fade_in_start, fade_in_duration, fade_out_start = text_overlay
+        filter_graph = build_text_overlay_graph(
+            filter_graph, fade_in_start, fade_in_duration,
+            fade_out_start, text_input_index=2)
+    input_args = list(duo_inputs[0])
+    input_args.extend(duo_inputs[1])
+    if text_overlay:
+        input_args.extend(['-loop', '1', '-i', text_overlay[0]])
+    # -vframes caps the COMPOSED stream; hstack/vstack pad a
+    # briefly-short branch by repeating its last frame
+    # (framesync default), so the cap — not the shortest branch —
+    # stays the frame-count authority.
+    return SegmentRenderPlan(
+        input_args=tuple(input_args), graph=filter_graph, vf=None,
+        output_frame_count=output_frame_count, fps=fps, use_nvenc=use_nvenc,
+        gpu_encoder=gpu_encoder, output_file=output_file)
+
+
+def _plan_solo_segment(video_file: str, start_time: float,
+                       exact_source_duration: float,
+                       exact_output_duration: float,
+                       segment_source_fps: "float | None", retime: dict,
+                       image_source: bool, fps: float,
+                       target_size: Tuple[int, int], fit_mode: str,
+                       anchor: dict, post_filters: List[str],
+                       text_overlay: Tuple[str, float, float, float],
+                       local_beats: List[float], output_frame_count: int,
+                       use_nvenc: bool, gpu_encoder: str,
+                       output_file: str) -> SegmentRenderPlan:
+    """Plan the single-input segment render (the normal ladder).
+
+    Pure planning: probes only (loop/seek strategy, fit-plan dispatch), no
+    rng beyond the seeded streams the moved helpers already use, no writes.
+    """
+    # Loop sources shorter than the segment (GIFs, short clips) so the
+    # frame count stays exact instead of drifting. ffmpeg gotcha: with
+    # -stream_loop, an input-side -ss re-seeks to the offset on EVERY loop
+    # iteration (each pass yields only [start, EOF] instead of wrapping),
+    # so looped seeks happen in the filter chain via trim=start= instead.
+    if image_source:
+        loop_args, start_time = [], 0.0
+    else:
+        loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
+    if retime and loop_args:
+        # Ramps never loop: a loop seam mid-retime is jarring, and the
+        # planner already gates on runway — this is the deterministic
+        # belt-and-braces strip for anything that slipped through.
+        print(f"   ⚠️  Retime dropped for {os.path.basename(video_file)}: window would need looping")
+        retime = None
+        exact_source_duration = exact_output_duration
+        loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
+    filter_seek = bool(loop_args) and start_time > 0
+
+    pre_filters = build_segment_pre_filters(
+        exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0,
+        retime=retime, output_duration=exact_output_duration,
+        source_fps=segment_source_fps)
+
+    # Per-source fit decisions: SAR normalization for anamorphic inputs,
+    # the limited-crop hybrid when plain Smart crop would discard more
+    # than MAX_CROP_PER_AXIS of the source, and the scan-fit sweep beyond
+    # SCAN_CROP_LOSS (the segment duration drives the sweep and the echo
+    # background drift; an anchor offsets every crop window).
+    sar_fix, fit_plan = plan_source_fit(video_file, target_size, fit_mode,
+                                        anchor=anchor,
+                                        duration=exact_output_duration)
+    scan_plan = fit_plan if isinstance(fit_plan, dict) else None
+    hybrid_fg = fit_plan if fit_plan is not None and scan_plan is None else None
+    pre_filters.extend(sar_fix)
+
+    # text_overlay: (png_path, fade_in_start, fade_in_duration,
+    # fade_out_start) in this segment's local clock — see
+    # text_overlay.plan_text_windows.
+    use_blur_graph = bool(target_size) and (fit_mode == 'blur' or hybrid_fg is not None)
+    use_graph = use_blur_graph or bool(text_overlay)
+    filter_graph = None
+    filter_complex = None
+    base_label = 'basev' if text_overlay else 'outv'
+    # Tracked pan clock guard: the crop expressions run on the OUTPUT
+    # clock (after setpts/fps), which only matches the rebased path's
+    # source-local clock when the segment is not retimed. The planner
+    # already drops the path from retimed clips; this belt-and-braces
+    # covers retimes attached by external callers.
+    pan_duration = None if retime else exact_output_duration
+    # Foreground push-in clock guard: same retime reasoning as the pan
+    # (zoompan's counter runs on the retimed clock), plus still images
+    # already get Ken Burns motion downstream — don't compound two zooms.
+    fg_zoom_duration = None if (retime or image_source) else exact_output_duration
+    if use_blur_graph:
+        if hybrid_fg:
+            fg_filters = _hybrid_fg_filters(hybrid_fg, anchor,
+                                            duration=pan_duration,
+                                            fps=fps if fg_zoom_duration else None)
+        else:
+            fg_filters = _blur_mode_fg_filters(video_file, target_size,
+                                               duration=fg_zoom_duration,
+                                               fps=fps)
+        filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters,
+                                            out_label=base_label, fg_filters=fg_filters,
+                                            duration=exact_output_duration,
+                                            source_key=video_file,
+                                            local_beats=local_beats)
+    else:
+        filters = list(pre_filters)
+        if scan_plan:
+            filters.extend(scan_plan['filters'])
+        elif target_size:
+            filters.extend(_fit_filters_with_pan(video_file, target_size,
+                                                 fit_mode, anchor,
+                                                 pan_duration))
+        filters.extend(post_filters)
+        filter_complex = ",".join(filters)
+        if use_graph:
+            filter_graph = f"[0:v]{filter_complex}[{base_label}]"
+    if text_overlay:
+        _, fade_in_start, fade_in_duration, fade_out_start = text_overlay
+        filter_graph = build_text_overlay_graph(filter_graph, fade_in_start,
+                                                fade_in_duration, fade_out_start)
+
+    input_args: List[str] = list(loop_args)
+
+    if image_source:
+        # Still images have no timeline: -loop 1 serves the single frame
+        # for exactly the segment window (see the retime strip upstream).
+        input_args.extend([
+            '-loop', '1',
+            '-framerate', str(fps),
+            '-t', str(exact_source_duration),
+            '-i', video_file,
+        ])
+    elif filter_seek:
+        # Looped seek: no input-side -ss/-t (see gotcha above); trim=start=
+        # in the filter chain positions the window and -vframes caps output.
+        # Looped sources are short by definition, so the extra decode from
+        # 0 to start is negligible.
+        input_args.extend(['-i', video_file])
+    else:
+        # ✅ FRAME-ACCURATE INPUT SEEKING (input -ss decodes forward from
+        # the preceding keyframe and discards, so it stays frame-accurate)
+        input_args.extend([
+            '-ss', str(start_time),
+            '-t', str(exact_source_duration),
+            '-i', video_file
+        ])
+
+    if text_overlay:
+        input_args.extend(['-loop', '1', '-i', text_overlay[0]])
+
+    return SegmentRenderPlan(
+        input_args=tuple(input_args),
+        graph=filter_graph if use_graph else None,
+        vf=None if use_graph else filter_complex,
+        output_frame_count=output_frame_count, fps=fps, use_nvenc=use_nvenc,
+        gpu_encoder=gpu_encoder, output_file=output_file)
+
+
+def _execute_segment_plan(plan: SegmentRenderPlan) -> Tuple[bool, str]:
+    """Assemble the argv for a SegmentRenderPlan and run it through the
+    standard verify. Returns _run_and_verify_segment's (ok, failure_detail)
+    — the callers' failure prints differ (duo always logs the detail, solo
+    only logs encoder-level errors), so the detail rides along."""
+    # Build FFmpeg command
+    cmd = [FFMPEG_PATH]
+
+    # Hardware acceleration
+    cmd.extend(get_hwaccel_args(plan.use_nvenc, plan.gpu_encoder))
+
+    cmd.extend(plan.input_args)
+
+    # Video filters
+    if plan.graph is not None:
+        cmd.extend(['-filter_complex', plan.graph, '-map', '[outv]'])
+    else:
+        cmd.extend(['-vf', plan.vf])
+
+    # ✅ FRAME-ACCURATE DURATION: -vframes (not -t) caps the output; the
+    # shared tail carries the encoder + no-audio CFR mux flags.
+    cmd.extend(_segment_encode_tail(plan.output_frame_count, plan.fps,
+                                    plan.use_nvenc, plan.gpu_encoder,
+                                    plan.output_file))
+
+    return _run_and_verify_segment(cmd, plan.output_file,
+                                   plan.output_frame_count)
+
+
 def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: float,
                                 output_file: str, fps: float, target_size: Tuple[int, int],
                                 use_nvenc: bool,
@@ -1836,196 +2090,32 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
             # text keeps reading white on a day-for-night grade).
             post_filters.append(_lut3d_filter(look_cube))
 
-        # Split-screen duo guards — the planner already enforces all of
-        # these; the strips below are belt-and-braces for external callers,
-        # mirroring the retime strips. A dropped partner NEVER fails the
-        # segment: the primary just renders solo through the normal ladder.
-        if partner is not None and (not isinstance(partner, dict)
-                                    or not partner.get('video_file')
-                                    or not target_size):
-            print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: invalid partner spec")
-            partner = None
-        if partner is not None and retime:
-            # A warped clock breaks the per-pane tracked pan and doubles the
-            # runway math; duos live on hard cuts at natural speed.
-            print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: retime and split-screen never combine")
-            partner = None
-        if partner is not None and (image_source
-                                    or is_image_source(partner['video_file'])):
-            print(f"   ⚠️  Partner dropped for {os.path.basename(video_file)}: still images render solo")
-            partner = None
-
+        # Duo first: a planned partner tries the split-screen render, and ANY
+        # duo failure (strip, plan, or encode) falls through to the solo
+        # ladder — a partner can never fail a segment.
         if partner is not None:
-            duo_plan = _plan_duo_render(video_file, start_time, anchor,
-                                        partner, exact_output_duration, fps,
-                                        target_size)
-            if duo_plan is None:
-                partner = None  # warning printed inside; render solo below
-            else:
-                duo_inputs, duo_branches, duo_stack = duo_plan
-                base_label = 'basev' if text_overlay else 'outv'
-                post = ("," + ",".join(post_filters)) if post_filters else ""
-                filter_graph = (
-                    f"[0:v]{duo_branches[0]}[pane0];"
-                    f"[1:v]{duo_branches[1]}[pane1];"
-                    f"[pane0][pane1]{duo_stack},setsar=1{post}[{base_label}]"
-                )
-                if text_overlay:
-                    _, fade_in_start, fade_in_duration, fade_out_start = text_overlay
-                    filter_graph = build_text_overlay_graph(
-                        filter_graph, fade_in_start, fade_in_duration,
-                        fade_out_start, text_input_index=2)
-                cmd = [FFMPEG_PATH]
-                cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
-                cmd.extend(duo_inputs[0])
-                cmd.extend(duo_inputs[1])
-                if text_overlay:
-                    cmd.extend(['-loop', '1', '-i', text_overlay[0]])
-                cmd.extend(['-filter_complex', filter_graph, '-map', '[outv]'])
-                # -vframes caps the COMPOSED stream; hstack/vstack pad a
-                # briefly-short branch by repeating its last frame
-                # (framesync default), so the cap — not the shortest branch —
-                # stays the frame-count authority.
-                cmd.extend(_segment_encode_tail(output_frame_count, fps,
-                                                use_nvenc, gpu_encoder,
-                                                output_file))
-                ok, detail = _run_and_verify_segment(cmd, output_file,
-                                                     output_frame_count)
+            duo_plan = _plan_duo_segment(video_file, start_time, anchor,
+                                         partner, image_source, retime,
+                                         exact_output_duration, fps,
+                                         target_size, post_filters,
+                                         text_overlay, output_frame_count,
+                                         use_nvenc, gpu_encoder, output_file)
+            if duo_plan is not None:
+                ok, detail = _execute_segment_plan(duo_plan)
                 if ok:
                     return True
                 print(f"   ⚠️  Duo render failed for {os.path.basename(output_file)} ({detail}) — retrying solo")
-                partner = None
 
-        # Loop sources shorter than the segment (GIFs, short clips) so the
-        # frame count stays exact instead of drifting. ffmpeg gotcha: with
-        # -stream_loop, an input-side -ss re-seeks to the offset on EVERY loop
-        # iteration (each pass yields only [start, EOF] instead of wrapping),
-        # so looped seeks happen in the filter chain via trim=start= instead.
-        if image_source:
-            loop_args, start_time = [], 0.0
-        else:
-            loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
-        if retime and loop_args:
-            # Ramps never loop: a loop seam mid-retime is jarring, and the
-            # planner already gates on runway — this is the deterministic
-            # belt-and-braces strip for anything that slipped through.
-            print(f"   ⚠️  Retime dropped for {os.path.basename(video_file)}: window would need looping")
-            retime = None
-            exact_source_duration = exact_output_duration
-            loop_args, start_time = get_loop_input_args(video_file, start_time, exact_source_duration)
-        filter_seek = bool(loop_args) and start_time > 0
-
-        pre_filters = build_segment_pre_filters(
-            exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0,
-            retime=retime, output_duration=exact_output_duration,
-            source_fps=segment_source_fps)
-
-        # Per-source fit decisions: SAR normalization for anamorphic inputs,
-        # the limited-crop hybrid when plain Smart crop would discard more
-        # than MAX_CROP_PER_AXIS of the source, and the scan-fit sweep beyond
-        # SCAN_CROP_LOSS (the segment duration drives the sweep and the echo
-        # background drift; an anchor offsets every crop window).
-        sar_fix, fit_plan = plan_source_fit(video_file, target_size, fit_mode,
-                                            anchor=anchor,
-                                            duration=exact_output_duration)
-        scan_plan = fit_plan if isinstance(fit_plan, dict) else None
-        hybrid_fg = fit_plan if fit_plan is not None and scan_plan is None else None
-        pre_filters.extend(sar_fix)
-
-        # text_overlay: (png_path, fade_in_start, fade_in_duration,
-        # fade_out_start) in this segment's local clock — see
-        # text_overlay.plan_text_windows.
-        use_blur_graph = bool(target_size) and (fit_mode == 'blur' or hybrid_fg is not None)
-        use_graph = use_blur_graph or bool(text_overlay)
-        filter_graph = None
-        filter_complex = None
-        base_label = 'basev' if text_overlay else 'outv'
-        # Tracked pan clock guard: the crop expressions run on the OUTPUT
-        # clock (after setpts/fps), which only matches the rebased path's
-        # source-local clock when the segment is not retimed. The planner
-        # already drops the path from retimed clips; this belt-and-braces
-        # covers retimes attached by external callers.
-        pan_duration = None if retime else exact_output_duration
-        # Foreground push-in clock guard: same retime reasoning as the pan
-        # (zoompan's counter runs on the retimed clock), plus still images
-        # already get Ken Burns motion downstream — don't compound two zooms.
-        fg_zoom_duration = None if (retime or image_source) else exact_output_duration
-        if use_blur_graph:
-            if hybrid_fg:
-                fg_filters = _hybrid_fg_filters(hybrid_fg, anchor,
-                                                duration=pan_duration,
-                                                fps=fps if fg_zoom_duration else None)
-            else:
-                fg_filters = _blur_mode_fg_filters(video_file, target_size,
-                                                   duration=fg_zoom_duration,
-                                                   fps=fps)
-            filter_graph = build_blur_fit_graph(pre_filters, target_size, post_filters,
-                                                out_label=base_label, fg_filters=fg_filters,
-                                                duration=exact_output_duration,
-                                                source_key=video_file,
-                                                local_beats=local_beats)
-        else:
-            filters = list(pre_filters)
-            if scan_plan:
-                filters.extend(scan_plan['filters'])
-            elif target_size:
-                filters.extend(_fit_filters_with_pan(video_file, target_size,
-                                                     fit_mode, anchor,
-                                                     pan_duration))
-            filters.extend(post_filters)
-            filter_complex = ",".join(filters)
-            if use_graph:
-                filter_graph = f"[0:v]{filter_complex}[{base_label}]"
-        if text_overlay:
-            _, fade_in_start, fade_in_duration, fade_out_start = text_overlay
-            filter_graph = build_text_overlay_graph(filter_graph, fade_in_start,
-                                                    fade_in_duration, fade_out_start)
-        
-        # Build FFmpeg command
-        cmd = [FFMPEG_PATH]
-        
-        # Hardware acceleration
-        cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
-
-        cmd.extend(loop_args)
-
-        if image_source:
-            cmd.extend([
-                '-loop', '1',
-                '-framerate', str(fps),
-                '-t', str(exact_source_duration),
-                '-i', video_file,
-            ])
-        elif filter_seek:
-            # Looped seek: no input-side -ss/-t (see gotcha above); trim=start=
-            # in the filter chain positions the window and -vframes caps output.
-            # Looped sources are short by definition, so the extra decode from
-            # 0 to start is negligible.
-            cmd.extend(['-i', video_file])
-        else:
-            # ✅ FRAME-ACCURATE INPUT SEEKING (input -ss decodes forward from
-            # the preceding keyframe and discards, so it stays frame-accurate)
-            cmd.extend([
-                '-ss', str(start_time),
-                '-t', str(exact_source_duration),
-                '-i', video_file
-            ])
-
-        if text_overlay:
-            cmd.extend(['-loop', '1', '-i', text_overlay[0]])
-
-        # Video filters
-        if use_graph:
-            cmd.extend(['-filter_complex', filter_graph, '-map', '[outv]'])
-        else:
-            cmd.extend(['-vf', filter_complex])
-
-        # ✅ FRAME-ACCURATE DURATION: -vframes (not -t) caps the output; the
-        # shared tail carries the encoder + no-audio CFR mux flags.
-        cmd.extend(_segment_encode_tail(output_frame_count, fps, use_nvenc,
-                                        gpu_encoder, output_file))
-
-        ok, detail = _run_and_verify_segment(cmd, output_file, output_frame_count)
+        solo_plan = _plan_solo_segment(video_file, start_time,
+                                       exact_source_duration,
+                                       exact_output_duration,
+                                       segment_source_fps, retime,
+                                       image_source, fps, target_size,
+                                       fit_mode, anchor, post_filters,
+                                       text_overlay, local_beats,
+                                       output_frame_count, use_nvenc,
+                                       gpu_encoder, output_file)
+        ok, detail = _execute_segment_plan(solo_plan)
         if not ok:
             if detail != _VERIFY_FAILED_DETAIL:
                 print(f"   ⚠️  FFmpeg error: {detail}")

@@ -33,18 +33,22 @@ rounded beat grid, so re-running with a different beat plan recomputes.
 
 WAV-decode decision: All-In-One recommends WAV input because MP3 decoder
 priming/offset shifts the beat/downbeat grid. Demucs likewise wants a clean
-stereo waveform. So both entry points decode the source once with librosa (the
+stereo waveform. So the source is decoded once per song with librosa (the
 same decoder the rest of the pipeline uses in ``auto_mode``) to a temporary
 stereo WAV before handing a *path* to the MLX backends. This removes MP3 offset
 nondeterminism and keeps stem onsets aligned with the pipeline's beat grid.
+Both entry points share that one decode via a run-scoped cache; stage-3
+orchestration calls ``release_decoded_audio(audio_file)`` after both have run.
 """
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import time
 from typing import Dict, List, Sequence
@@ -256,6 +260,20 @@ def _save_cache(path: str, signature: str, payload: Dict) -> None:
 
 # --- Shared decode ---------------------------------------------------------
 
+# Run-scoped cache of decoded temp WAVs: analyze_structure and get_stem_signals
+# run back-to-back on the same song from stage 3, so the second caller reuses
+# the first caller's decode instead of decoding the full song again. Keyed on
+# (abspath, size, mtime) — same identity the sidecar signature uses — and
+# emptied per song via release_decoded_audio(), so multisong runs never hold
+# more than one full-song WAV on disk.
+_DECODED_WAV_CACHE: Dict[tuple, tuple[str, str]] = {}  # key -> (tmp_dir, wav_path)
+
+
+def _decoded_wav_key(audio_file: str) -> tuple:
+    size, mtime = _file_stat_tuple(audio_file)
+    return (os.path.abspath(audio_file), size, mtime)
+
+
 @contextlib.contextmanager
 def _decoded_wav(audio_file: str):
     """Yield a path to a temporary stereo WAV decoded from ``audio_file``.
@@ -263,7 +281,16 @@ def _decoded_wav(audio_file: str):
     Decoding via librosa (the pipeline's decoder) to WAV removes MP3
     decoder-offset nondeterminism before the audio reaches the MLX backends, and
     keeps stem onsets aligned with the librosa-derived beat grid.
+
+    The decode is cached run-scoped (see ``_DECODED_WAV_CACHE``); the file is
+    deleted by ``release_decoded_audio()``, not on context exit.
     """
+    key = _decoded_wav_key(audio_file)
+    cached = _DECODED_WAV_CACHE.get(key)
+    if cached is not None and os.path.isfile(cached[1]):
+        yield cached[1]
+        return
+
     import librosa
     import soundfile as sf
 
@@ -277,16 +304,33 @@ def _decoded_wav(audio_file: str):
     wav_path = os.path.join(tmp_dir, "decoded.wav")
     try:
         sf.write(wav_path, data, int(sr))
-        yield wav_path
-    finally:
-        for p in (wav_path, tmp_dir):
-            try:
-                if os.path.isfile(p):
-                    os.remove(p)
-                elif os.path.isdir(p):
-                    os.rmdir(p)
-            except OSError:
-                pass
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    _DECODED_WAV_CACHE[key] = (tmp_dir, wav_path)
+    yield wav_path
+
+
+def release_decoded_audio(audio_file: str | None = None) -> None:
+    """Delete the cached decoded WAV for ``audio_file`` (all of them if None).
+
+    Called from stage-3 orchestration once both backends have run for a song.
+    A cache-hit/disabled/failed run has nothing cached — then this is a no-op.
+    Never raises.
+    """
+    try:
+        target = os.path.abspath(audio_file) if audio_file else None
+        for key in list(_DECODED_WAV_CACHE):
+            if target is None or key[0] == target:
+                tmp_dir, _wav_path = _DECODED_WAV_CACHE.pop(key)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# Safety net for standalone callers that never release: clean up at exit so a
+# skipped release cannot leak full-song WAVs past process lifetime.
+atexit.register(release_decoded_audio, None)
 
 
 @contextlib.contextmanager
@@ -600,4 +644,4 @@ def _stem_mono(stem) -> np.ndarray | None:
     return np.ascontiguousarray(arr.reshape(-1))
 
 
-__all__ = ["analyze_structure", "get_stem_signals"]
+__all__ = ["analyze_structure", "get_stem_signals", "release_decoded_audio"]

@@ -347,10 +347,11 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     # guard around the calls) protect the hard fallback invariant regardless.
     structure = None
     try:
-        from structure_stems import analyze_structure, get_stem_signals
+        from structure_stems import analyze_structure, get_stem_signals, release_decoded_audio
     except ImportError:
         analyze_structure = None
         get_stem_signals = None
+        release_decoded_audio = None
 
     if analyze_structure is not None:
         try:
@@ -380,6 +381,12 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                 _sig = _stems.get(_stem_key)
                 if _sig is not None and len(_sig) == len(beat_times):
                     features[_feat_key] = np.asarray(_sig, dtype=float)
+
+    if release_decoded_audio is not None:
+        # Both backends have run for this song: drop their shared decoded temp
+        # WAV now (per-song, so multisong runs never accumulate full-song WAVs).
+        # No-op on warm-cache/disabled/unavailable paths; never raises.
+        release_decoded_audio(audio_file)
 
     if structure is not None:
         _labels = [str(s.get("label", "")) for s in structure.get("sections", [])]

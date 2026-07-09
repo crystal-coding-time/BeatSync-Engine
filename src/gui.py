@@ -80,6 +80,7 @@ import subprocess
 import threading
 import time
 import socket
+from dataclasses import dataclass, fields as dataclass_fields, replace as dataclass_replace
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
 
 # Import FFmpeg processing module
@@ -395,24 +396,103 @@ def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
     return [path for path in (_as_existing_source_path(p) for p in file_paths) if path]
 
 
+@dataclass(frozen=True)
+class RenderSettings:
+    """Single source of truth for the 16 per-render settings.
+
+    Field order and defaults are canonical: the headless kwargs of
+    `_process_video_impl`, the GUI settings dict, and the Gradio positional
+    boundary (`SETTINGS_KEYS` / `settings_components`) all derive from here.
+    """
+
+    fit_mode: str = 'crop'
+    output_format: str = DEFAULT_OUTPUT_FORMAT
+    effect_style: str = 'clean'
+    effect_intensity: float = 0.7
+    effect_mode: str = 'curated'
+    effect_palette: List[str] | None = None
+    effect_seed: float = 0
+    look_cube: str = ''
+    variety: float = 0.4
+    semantic_variety: float = 0.4
+    speed_ramps: bool = False
+    split_screen: bool = True
+    crossfades: bool = False
+    text_entries: str = ''
+    text_position: str = 'bottom'
+    text_scale: float = 1.0
+
+    @classmethod
+    def from_dict(cls, d: dict | None, base: 'RenderSettings | None' = None) -> 'RenderSettings':
+        """Overlay dict values on `base` (or the defaults).
+
+        A key present in the dict wins — even with an explicitly falsy/None
+        value — and unknown keys are ignored, exactly matching the old
+        per-key `settings.get(key, kwarg)` override block.
+        """
+        base = base if base is not None else cls()
+        if not d:
+            return base
+        known = {f.name for f in dataclass_fields(cls)}
+        overrides = {k: v for k, v in d.items() if k in known}
+        return dataclass_replace(base, **overrides) if overrides else base
+
+    def to_settings_dict(self, *, is_prores: bool,
+                         palette_ids, resolved_seed) -> dict:
+        """Produce the resolved settings dict `create_music_video` consumes.
+
+        Carries the per-render transforms the old inline repack applied:
+        the resolved palette/seed from `resolve_effect_palette`, the ProRes
+        look gate (ProRes stays ungraded), and text entries split into
+        stripped non-empty lines.
+        """
+        return {
+            'fit_mode': self.fit_mode,
+            'output_format': self.output_format,
+            'effect_style': self.effect_style,
+            'effect_intensity': self.effect_intensity,
+            'effect_mode': self.effect_mode,
+            'effect_palette': palette_ids,
+            'effect_seed': resolved_seed,
+            'look_cube': (None if is_prores else (self.look_cube or None)),
+            'variety': self.variety,
+            'semantic_variety': self.semantic_variety,
+            'speed_ramps': bool(self.speed_ramps),
+            'split_screen': bool(self.split_screen),
+            'crossfades': bool(self.crossfades),
+            'text_entries': [line.strip() for line in (self.text_entries or '').splitlines() if line.strip()],
+            'text_position': self.text_position,
+            'text_scale': self.text_scale,
+        }
+
+
+# Canonical key order for the Gradio boundary: process_video's positional
+# settings parameters and create_ui's settings_components list both follow
+# RenderSettings field order, and dict(zip(...)) marries them.
+SETTINGS_KEYS: tuple[str, ...] = tuple(f.name for f in dataclass_fields(RenderSettings))
+
+_RS_DEFAULTS = RenderSettings()
+
+
 def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
                        custom_fps: float, session_state: dict,
-                       fit_mode: str = 'crop',
-                       output_format: str = DEFAULT_OUTPUT_FORMAT,
-                       effect_style: str = 'clean',
-                       effect_intensity: float = 0.7,
-                       effect_mode: str = 'curated',
-                       effect_palette: List[str] | None = None,
-                       effect_seed: float = 0,
-                       look_cube: str = '',
-                       variety: float = 0.4,
-                       semantic_variety: float = 0.4,
-                       speed_ramps: bool = False,
-                       split_screen: bool = True,
-                       crossfades: bool = False,
-                       text_entries: str = '', text_position: str = 'bottom',
-                       text_scale: float = 1.0,
+                       fit_mode: str = _RS_DEFAULTS.fit_mode,
+                       output_format: str = _RS_DEFAULTS.output_format,
+                       effect_style: str = _RS_DEFAULTS.effect_style,
+                       effect_intensity: float = _RS_DEFAULTS.effect_intensity,
+                       effect_mode: str = _RS_DEFAULTS.effect_mode,
+                       effect_palette: List[str] | None = _RS_DEFAULTS.effect_palette,
+                       effect_seed: float = _RS_DEFAULTS.effect_seed,
+                       look_cube: str = _RS_DEFAULTS.look_cube,
+                       variety: float = _RS_DEFAULTS.variety,
+                       semantic_variety: float = _RS_DEFAULTS.semantic_variety,
+                       speed_ramps: bool = _RS_DEFAULTS.speed_ramps,
+                       split_screen: bool = _RS_DEFAULTS.split_screen,
+                       crossfades: bool = _RS_DEFAULTS.crossfades,
+                       text_entries: str = _RS_DEFAULTS.text_entries,
+                       text_position: str = _RS_DEFAULTS.text_position,
+                       text_scale: float = _RS_DEFAULTS.text_scale,
                        settings: dict | None = None,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None) -> StatusResult:
@@ -420,23 +500,17 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
     try:
         # The GUI passes one settings dict; the individual kwargs remain for
         # the headless/smoke-test entry point. The dict wins where present.
-        if settings:
-            fit_mode = settings.get('fit_mode', fit_mode)
-            output_format = settings.get('output_format', output_format)
-            effect_style = settings.get('effect_style', effect_style)
-            effect_intensity = settings.get('effect_intensity', effect_intensity)
-            effect_mode = settings.get('effect_mode', effect_mode)
-            effect_palette = settings.get('effect_palette', effect_palette)
-            effect_seed = settings.get('effect_seed', effect_seed)
-            look_cube = settings.get('look_cube', look_cube)
-            variety = settings.get('variety', variety)
-            semantic_variety = settings.get('semantic_variety', semantic_variety)
-            speed_ramps = settings.get('speed_ramps', speed_ramps)
-            split_screen = settings.get('split_screen', split_screen)
-            crossfades = settings.get('crossfades', crossfades)
-            text_entries = settings.get('text_entries', text_entries)
-            text_position = settings.get('text_position', text_position)
-            text_scale = settings.get('text_scale', text_scale)
+        rs = RenderSettings(
+            fit_mode=fit_mode, output_format=output_format,
+            effect_style=effect_style, effect_intensity=effect_intensity,
+            effect_mode=effect_mode, effect_palette=effect_palette,
+            effect_seed=effect_seed, look_cube=look_cube,
+            variety=variety, semantic_variety=semantic_variety,
+            speed_ramps=speed_ramps, split_screen=split_screen,
+            crossfades=crossfades, text_entries=text_entries,
+            text_position=text_position, text_scale=text_scale,
+        )
+        rs = RenderSettings.from_dict(settings, base=rs)
         parallel_workers = PARALLEL_WORKERS
 
         # Initialize session state if needed
@@ -598,31 +672,16 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
         # equals local_audio_path in the single-song case, so single-song
         # renders are byte-identical.
         palette_ids, resolved_seed, recipe_line = resolve_effect_palette(
-            effect_mode, effect_palette, effect_seed, local_audio_paths[0])
-        if effect_style and effect_style != 'clean':
+            rs.effect_mode, rs.effect_palette, rs.effect_seed, local_audio_paths[0])
+        if rs.effect_style and rs.effect_style != 'clean':
             print(f"   🎛 {recipe_line}")
 
         # Create video. One resolved-settings dict; looks grade H.264/HEVC
         # renders only — ProRes stays pristine for external editing, matching
         # effects and text.
-        resolved_settings = {
-            'fit_mode': fit_mode,
-            'output_format': output_format,
-            'effect_style': effect_style,
-            'effect_intensity': effect_intensity,
-            'effect_mode': effect_mode,
-            'effect_palette': palette_ids,
-            'effect_seed': resolved_seed,
-            'look_cube': (None if is_prores else (look_cube or None)),
-            'variety': variety,
-            'semantic_variety': semantic_variety,
-            'speed_ramps': bool(speed_ramps),
-            'split_screen': bool(split_screen),
-            'crossfades': bool(crossfades),
-            'text_entries': [line.strip() for line in (text_entries or '').splitlines() if line.strip()],
-            'text_position': text_position,
-            'text_scale': text_scale,
-        }
+        resolved_settings = rs.to_settings_dict(
+            is_prores=is_prores, palette_ids=palette_ids,
+            resolved_seed=resolved_seed)
         result_path = create_music_video(
             local_audio_path, local_video_paths, selected_beats,
             output_file=temp_output, max_workers=parallel_workers,
@@ -716,25 +775,16 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
     render_console = RenderLogConsole(get_output_dir())
 
     # Single settings dict from here down: the style/effect/text parameter
-    # chain is order-coupled positional at the Gradio boundary only.
-    render_settings = {
-        'fit_mode': fit_mode,
-        'output_format': output_format,
-        'effect_style': effect_style,
-        'effect_intensity': effect_intensity,
-        'effect_mode': effect_mode,
-        'effect_palette': effect_palette,
-        'effect_seed': effect_seed,
-        'look_cube': look_cube,
-        'variety': variety,
-        'semantic_variety': semantic_variety,
-        'speed_ramps': bool(speed_ramps),
-        'split_screen': bool(split_screen),
-        'crossfades': bool(crossfades),
-        'text_entries': text_entries,
-        'text_position': text_position,
-        'text_scale': text_scale,
-    }
+    # chain is order-coupled positional at the Gradio boundary only, and
+    # SETTINGS_KEYS (RenderSettings field order) is the one place that
+    # defines that order. RenderSettings.to_settings_dict() bool()-coerces
+    # the checkbox values downstream, so raw values pass through here.
+    render_settings = dict(zip(SETTINGS_KEYS, (
+        fit_mode, output_format, effect_style, effect_intensity,
+        effect_mode, effect_palette, effect_seed, look_cube,
+        variety, semantic_variety, speed_ramps, split_screen, crossfades,
+        text_entries, text_position, text_scale,
+    ), strict=True))
 
     def progress_callback(message: str) -> None:
         status_queue.put(message)
@@ -1054,6 +1104,19 @@ def create_ui() -> gr.Blocks:
                 status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
                 video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
                 
+        # One component per RenderSettings field, in SETTINGS_KEYS order —
+        # Gradio hands these to process_video positionally, so this list is
+        # the only place the component-to-field pairing is spelled out.
+        settings_components = [
+            fit_mode_input, output_format_input,
+            effect_style_input, effect_intensity_input,
+            effect_mode_input, effect_palette_input, effect_seed_input,
+            look_input, variety_input, semantic_variety_input,
+            speed_ramps_input, split_screen_input, crossfades_input,
+            text_entries_input, text_position_input, text_scale_input,
+        ]
+        assert len(SETTINGS_KEYS) == len(settings_components)
+
         # The button is disabled for the whole render and re-enabled by a
         # final .then() step, which Gradio runs on success AND on error — a
         # second click mid-render would clear the processing directory out
@@ -1067,12 +1130,7 @@ def create_ui() -> gr.Blocks:
             inputs=[
                 audio_state, video_state,
                 output_filename, processing_mode, custom_fps,
-                fit_mode_input, output_format_input,
-                effect_style_input, effect_intensity_input,
-                effect_mode_input, effect_palette_input, effect_seed_input,
-                look_input, variety_input, semantic_variety_input, speed_ramps_input,
-                split_screen_input, crossfades_input,
-                text_entries_input, text_position_input, text_scale_input,
+                *settings_components,
                 session_state
             ],
             outputs=[video_output, status_output, session_state],

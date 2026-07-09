@@ -23,6 +23,13 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
     """Extract beat-synchronous energy/rhythm data with smooth wave behavior."""
     duration = len(y) / sr
 
+    # W2-5: the EBU R128 loudness pass is a full-song ffmpeg decode that shares
+    # no state with the librosa work below, so start it now and let it run in
+    # the background; compute_loudness() joins and parses it at the point the
+    # result is first needed. Command, parse, and failure behavior (zeros + one
+    # ⚠️ at that point) are identical to the old blocking call.
+    loudness_probe = _start_loudness_probe(audio_file, start_time, duration)
+
     # One shared full-mix STFT: spectral_centroid's y= path is literally
     # np.abs(stft(y, same n_fft/hop/window))**1, and analyze_rhythm_bands runs
     # the identical stft call, so both can reuse this one (bit-identical).
@@ -119,7 +126,8 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
     )
 
     # EBU R128 momentary loudness at each beat (deterministic ffmpeg parse).
-    loudness = compute_loudness(audio_file, start_time, duration, beat_times)
+    loudness = compute_loudness(audio_file, start_time, duration, beat_times,
+                                probe=loudness_probe)
 
     return {
         "kick": kick,
@@ -180,20 +188,18 @@ def compute_harmonic_change(y_harmonic: np.ndarray, sr: int, beat_times: np.ndar
         return np.zeros(len(beat_times), dtype=float)
 
 
-def compute_loudness(audio_file: Optional[str], start_time: float,
-                     duration: Optional[float], beat_times: np.ndarray) -> np.ndarray:
-    """EBU R128 momentary loudness sampled at each beat.
+def _start_loudness_probe(audio_file: Optional[str], start_time: float,
+                          duration: Optional[float]):
+    """Spawn the ebur128 ffmpeg pass in the background (W2-5 overlap).
 
-    Runs ffmpeg's ebur128 filter once and parses the deterministic ``t:``/``M:``
-    stderr trace (one sample per 100 ms). Momentary values are clamped at -60
-    LUFS (silence reports ~-120) and mapped to 0..1 with a robust 5th->95th
-    percentile scale so a single loud spike does not flatten everything else.
-    Any failure -> zeros + ⚠️, so the key is ALWAYS present.
+    Returns a ``subprocess.Popen`` to be joined by ``compute_loudness``, None
+    when there is no audio path (compute_loudness logs that case itself), or
+    the raised exception when spawning failed — compute_loudness re-raises it
+    at the join point so the failure log and zeros contract stay exactly where
+    (and what) they were with the old blocking call.
     """
-    n = len(beat_times)
     if not audio_file:
-        print("      ⚠️ Loudness: no audio path threaded to stage2; using zeros")
-        return np.zeros(n, dtype=float)
+        return None
     try:
         from ffmpeg_processing import FFMPEG_PATH
 
@@ -207,9 +213,39 @@ def compute_loudness(audio_file: Optional[str], start_time: float,
             cmd += ['-t', f'{float(duration):.6f}']
         cmd += ['-af', 'ebur128', '-f', 'null', '-']
 
-        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.PIPE, text=True)
-        stderr = proc.stderr or ""
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True)
+    except Exception as e:
+        return e
+
+
+def compute_loudness(audio_file: Optional[str], start_time: float,
+                     duration: Optional[float], beat_times: np.ndarray,
+                     probe=None) -> np.ndarray:
+    """EBU R128 momentary loudness sampled at each beat.
+
+    Runs ffmpeg's ebur128 filter once and parses the deterministic ``t:``/``M:``
+    stderr trace (one sample per 100 ms). Momentary values are clamped at -60
+    LUFS (silence reports ~-120) and mapped to 0..1 with a robust 5th->95th
+    percentile scale so a single loud spike does not flatten everything else.
+    Any failure -> zeros + ⚠️, so the key is ALWAYS present.
+
+    ``probe`` is an already-started ``_start_loudness_probe`` result to join
+    (the overlap path); when None the pass is spawned here and this call blocks
+    on it exactly like before.
+    """
+    n = len(beat_times)
+    if not audio_file:
+        print("      ⚠️ Loudness: no audio path threaded to stage2; using zeros")
+        return np.zeros(n, dtype=float)
+    try:
+        if probe is None:
+            probe = _start_loudness_probe(audio_file, start_time, duration)
+        if isinstance(probe, BaseException):
+            raise probe  # deferred spawn failure -> identical ⚠️ + zeros below
+        # No timeout: the old subprocess.run call had no deadline either.
+        _stdout, stderr = probe.communicate()
+        stderr = stderr or ""
 
         times: list = []
         mom: list = []

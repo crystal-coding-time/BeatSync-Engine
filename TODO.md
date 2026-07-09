@@ -24,15 +24,15 @@ Temporary tracking file — delete when all waves land (per CLAUDE.md docs polic
 | C2 | Delete dead `_select_vulkan_device` (stage5, zero callers) | auto_mode/stage5_qwen_scene_worker.py | done (owner-tested, committed) |
 | C3 | Drop the top-level `import librosa` in logger.py (banner uses `importlib.metadata.version`, same printed string) | logger.py | done (owner-tested, committed) |
 
-## Wave 2 — backlog (start after Wave 1 is owner-approved)
+## Wave 2 — batch 1 (W2-1/2/3/5) complete, owner-tested 2026-07-08; remainder is backlog
 
 | ID | Item | Depends on |
 |----|------|-----------|
-| W2-1 | Split `extract_clip_segment_ffmpeg` into plan/execute halves | A2 |
-| W2-2 | Split `create_music_video` into `_render_lossless` / `_render_standard` + RenderContext | B1 |
-| W2-3 | `RenderSettings` dataclass; kill the 4× settings listing and the 22-arg positional chain in gui.py | — |
+| W2-1 | Split `extract_clip_segment_ffmpeg` into plan/execute halves | A2 (met) — **done (owner-tested, committed)** |
+| W2-2 | Split `create_music_video` into `_render_lossless` / `_render_standard` + RenderContext | B1 (met) — **done (owner-tested, committed)** |
+| W2-3 | `RenderSettings` dataclass; kill the 4× settings listing and the 22-arg positional chain in gui.py | — **done (owner-tested, committed)** |
 | W2-4 | Frame guard from the encode's own stderr `frame=` counter (drop the per-segment ffprobe spawn) | A1 |
-| W2-5 | Cold-run audio decode dedup: shared `_decoded_wav` cache for structure+stems; overlap the ebur128 pass via Popen | — |
+| W2-5 | Cold-run audio decode dedup: shared `_decoded_wav` cache for structure+stems; overlap the ebur128 pass via Popen | — **done (owner-tested, committed)** |
 | W2-6 | Extract `analyze_beats_auto` phase helpers (incl. the buried downbeat-anchor override) | C1 |
 | W2-7 | TypedDict contracts (BeatFeatures / SegmentProfile / PlannedClip) + `EffectContext` dataclass | — |
 | W2-8 | Vectorize stage-6 reservation/auction sweeps (exact tie-breaks preserved) | — |
@@ -44,6 +44,51 @@ Temporary tracking file — delete when all waves land (per CLAUDE.md docs polic
 | W2-14 | Low-severity sweep: bisect in text_overlay, naming/annotation fixes, `_decoded_wav` temp-dir leak | — |
 
 ## Results log
+- **Wave 2 combined port (W2-1/2/3/5 in the working tree)**: PASS. Standard
+  (cpu): pre-Wave-2 baseline (via stash) == patched run1 == run2 (framemd5
+  `21f2a15b…`). ProRes: patched double-run identical (`40619e0d…`; vs-original
+  identity proven per-config in the W2-2 worktree). Frame guards green ×4.
+  (Baseline hash differs from Wave 1's because the service restart re-cooled
+  the analysis sidecars and all-in-one-mlx has documented cold-run flicker —
+  see W2-5 note; within-test comparison is warm-sidecar and valid.)
+  Service restarted on 7860. Owner manual test passed (216-cut render, frame guard green); committed.
+- **W2-5 (structure_stems.py, stage2_features.py, auto_mode/__init__.py,
+  +115/−28)**: PASS. framemd5 identical on single-song, multi-song, and
+  disabled-off-path configs; decode count 2→1 per song (4→2 multi-song);
+  shared WAV md5-identical to the old per-call decode; explicit
+  `release_decoded_audio` per song + atexit backstop; temp-dir leak fixed
+  (`shutil.rmtree`). ebur128 now overlaps stage-2 work as a Popen with the
+  byte-identical command/parse/failure behavior. Cold pipeline ~30-35% faster
+  (33.4s → ~22s on the 20s smoke). NOTE captured for the record: all-in-one-mlx
+  shows hairline cold-run variance (a [0,0.01] section / near-threshold
+  downbeat flicker) between two runs of UNMODIFIED code — pre-existing, and
+  exactly why the repo memoizes via sidecars; W2-5 proven inert to it.
+- **W2-2 (video_processor.py, +657/−472)**: PASS. framemd5 baseline == after×2
+  on standard, prores_proxy, crossfades-forced (9 boundaries dissolved), and
+  text-overlay configs; frame guards green; normalized console logs
+  line-identical. `create_music_video` is now a 67-line orchestrator (was
+  ~680) over `_resolve_render_config` (165) → `_plan_visuals` (79) →
+  `_render_lossless` (236) / `_render_standard` (246) with a 35-field
+  `RenderContext`; moved bodies are textually verbatim (anchor-asserted
+  line-slicing), zero rng/print reordering. Only gui.py imports from the
+  module and no imported name moved.
+- **W2-1 (ffmpeg_processing.py, +275/−185)**: PASS. framemd5 baseline == after×2
+  on defaults, duo-forced (portrait+split_screen, 4 vstack duo commands proven
+  in argv logs), and crossfade-forced (3 boundaries dissolved) configs; argv
+  logs identical across all; frame guards green. New shape: frozen
+  `SegmentRenderPlan` + `_plan_duo_segment` (65 ln) + `_plan_solo_segment`
+  (136 ln) + `_execute_segment_plan`; `extract_clip_segment_ffmpeg` body now
+  ~74 lines (was ~302 excl. docstring). Execute returns (ok, detail) so the
+  duo fallback keeps its exact print. Frame math + post_filters stay in the
+  orchestrator prelude (consumed by both planners).
+- **W2-3 (gui.py, +135/−77)**: PASS. framemd5 baseline == after×2 on kwargs-default,
+  kwargs-non-default, and settings-dict configs; dict path == kwargs path both pre
+  and post. Frozen `RenderSettings` is now the single source of names/defaults
+  (`SETTINGS_KEYS` derived from its fields); the override block → `from_dict`,
+  the `resolved_settings` repack → `to_settings_dict` (exact old transforms:
+  ProRes look gate, `look_cube or None`, bool coercions). `process_video`'s
+  22-positional capture matches pre-refactor exactly; `create_ui()` builds clean
+  on gradio 6.19.0 with a length assertion tying keys to components.
 - **Combined port (all of Wave 1 in the working tree)**: PASS. Standard (cpu)
   config: original-code baseline (via stash) == patched run1 == patched run2
   (framemd5 `130608ac…`). ProRes precise mode: patched double-run identical
