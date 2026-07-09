@@ -401,6 +401,81 @@ def create_ui() -> gr.Blocks:
                             value='bottom', label='Text position')
                         text_scale_input = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label='Text size')
 
+                # --- ProRes Precise Mode conflict guard ----------------------
+                # ProRes voids every creative control below (orchestrator's
+                # to_settings_dict look gate + the lossless_mode branches in
+                # video_processor). Greying them out is COSMETIC ONLY: disabled
+                # inputs still submit their values and the pipeline still
+                # nullifies them, so the resolved settings dict is byte-identical.
+                # This just makes the silent dependency visible. fit_mode and
+                # variety stay live — both are honored on ProRes proxies.
+                _prores_disabled_controls = [
+                    effect_style_input, look_input,
+                    effect_mode_input, effect_palette_input, effect_seed_input,
+                    effect_intensity_input, semantic_variety_input,
+                    speed_ramps_input, split_screen_input, crossfades_input,
+                    text_entries_input, text_position_input, text_scale_input,
+                ]
+                _prores_base_labels = [c.label for c in _prores_disabled_controls]
+                _PRORES_NOTE = ' — disabled in ProRes Precise Mode'
+
+                def _prores_conflict_guard(mode):
+                    prores = mode == 'prores_proxy'
+                    return [
+                        gr.update(interactive=not prores,
+                                  label=(base + _PRORES_NOTE) if prores else base)
+                        for base in _prores_base_labels
+                    ]
+
+                processing_mode.change(
+                    _prores_conflict_guard,
+                    inputs=[processing_mode],
+                    outputs=_prores_disabled_controls,
+                )
+
+                # --- Render recipe readout -----------------------------------
+                # Plain-English echo of the current control state so the mode's
+                # effect is visible before clicking. Read-only sugar: NOT a
+                # settings field, NOT wired into process_video's outputs.
+                _STYLE_LABELS = {'clean': 'Minimal', 'amv': 'Music video', 'hype': 'Hype'}
+                _MODE_LABELS = {
+                    'h264_nvenc': 'H.264 (NVENC)', 'hevc_nvenc': 'HEVC (NVENC)',
+                    'h264_videotoolbox': 'H.264', 'hevc_videotoolbox': 'HEVC',
+                    'cpu': 'H.264 (CPU)', 'prores_proxy': 'ProRes Precise',
+                }
+
+                def _render_recipe(mode, style, look, variety, split, ramps, xfades, text):
+                    text_lines = [ln for ln in (text or '').splitlines() if ln.strip()]
+                    if mode == 'prores_proxy':
+                        parts = ['**ProRes Precise**', 'effects OFF', 'look OFF',
+                                 'text OFF', 'no retimes/split/crossfade', 'untouched footage']
+                        return '🎬 ' + '  ·  '.join(parts)
+                    parts = [f'**{_STYLE_LABELS.get(style, style)}**']
+                    if look:
+                        parts.append(f'{look} look')
+                    if style != 'clean':
+                        parts.append('effects ON')
+                    parts.append(f'variety {variety:.2g}')
+                    if text_lines:
+                        parts.append(f'text ×{len(text_lines)}')
+                    if split:
+                        parts.append('split-screen ON')
+                    if ramps:
+                        parts.append('speed ramps ON')
+                    if xfades:
+                        parts.append('crossfades ON')
+                    parts.append(_MODE_LABELS.get(mode, mode))
+                    return '🎬 ' + '  ·  '.join(parts)
+
+                _recipe_inputs = [
+                    processing_mode, effect_style_input, look_input, variety_input,
+                    split_screen_input, speed_ramps_input, crossfades_input, text_entries_input,
+                ]
+                recipe_readout = gr.Markdown('', elem_id='recipe-readout')
+                for _c in _recipe_inputs:
+                    _c.change(_render_recipe, inputs=_recipe_inputs, outputs=recipe_readout)
+                app.load(_render_recipe, inputs=_recipe_inputs, outputs=recipe_readout)
+
                 process_btn = gr.Button('🎬 Create Music Video', variant='primary', size='lg')
 
             with gr.Column(scale=1):
@@ -438,7 +513,9 @@ def create_ui() -> gr.Blocks:
                 session_state
             ],
             outputs=[video_output, status_output, session_state],
-            show_progress='hidden'
+            # 'minimal' shows a small spinner so a multi-minute render never
+            # looks frozen; the streamed status text carries the real detail.
+            show_progress='minimal'
         ).then(
             fn=lambda: gr.update(interactive=True),
             inputs=None,

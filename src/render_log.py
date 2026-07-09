@@ -64,11 +64,18 @@ class RenderLogConsole:
 
 
 class StageConsoleLogger:
-    """Small CMD logger: stage start, up to 5 useful lines, stage end."""
+    """Small CMD logger: stage start, up to 5 useful lines, stage end.
 
-    def __init__(self, stream, max_lines_per_stage: int = 5):
+    `mirror`, when supplied, is called with each curated content line (the same
+    ≤5 lines/stage that reach the terminal). The Gradio worker passes the status
+    queue's `put` here so the per-stage detail the pipeline already computes also
+    streams to the on-screen status box, not just the render log/console.
+    """
+
+    def __init__(self, stream, max_lines_per_stage: int = 5, mirror=None):
         self.stream = stream
         self.max_lines_per_stage = max(1, int(max_lines_per_stage))
+        self.mirror = mirror
         self.stage_number: int | None = None
         self.stage_started = 0.0
         self.stage_line_count = 0
@@ -97,6 +104,12 @@ class StageConsoleLogger:
         if message:
             self._write(f"  {message}\n")
             self.stage_line_count += 1
+            if self.mirror is not None:
+                # Mirror to the UI status queue; never let plumbing break a render.
+                try:
+                    self.mirror(message)
+                except Exception:
+                    pass
 
     def end_stage(self) -> None:
         if self.stage_number is None:

@@ -53,8 +53,23 @@ VideoFilesInput: TypeAlias = List[str]
 StatusResult: TypeAlias = Tuple[str, str, Dict]
 
 
+# Human-readable status shown in the UI for each pipeline stage. The pipeline
+# internally still emits "Stage N is processing." strings (auto_mode._notify_progress);
+# process_video's progress_callback maps either form to the friendly label below
+# while keeping the console-logger stage signal intact.
+STAGE_LABELS: dict[int, str] = {
+    1: "Analyzing audio (beats & tempo)…",
+    2: "Reading per-beat features…",
+    3: "Finding song sections…",
+    4: "Choosing cuts on the beat grid…",
+    5: "Tagging visuals…",
+    6: "Planning the edit & rendering…",
+}
+_LABEL_TO_STAGE: dict[str, int] = {label: n for n, label in STAGE_LABELS.items()}
+
+
 def _stage_status(stage_number: int) -> str:
-    return f"Stage {stage_number} is processing. Please wait."
+    return STAGE_LABELS.get(stage_number, f"Working… (stage {stage_number})")
 
 
 def _as_existing_source_path(file_path: str | None) -> str | None:
@@ -439,7 +454,10 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
     status_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
     initial_status = _stage_status(1)
-    console_logger = StageConsoleLogger(sys.__stdout__)
+    # mirror=status_queue.put streams the curated per-stage content lines the
+    # console logger already produces (source counts, beats/BPM, cut counts,
+    # planner summary) to the UI status box, not just the render log.
+    console_logger = StageConsoleLogger(sys.__stdout__, mirror=status_queue.put)
     render_console = RenderLogConsole(get_output_dir())
 
     # Single settings dict from here down: the style/effect/text parameter
@@ -455,10 +473,19 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
     ), strict=True))
 
     def progress_callback(message: str) -> None:
-        status_queue.put(message)
-        match = re.search(r"Stage (\d+) is processing", message)
-        if match:
-            console_logger.start_stage(int(match.group(1)))
+        # Accept either the pipeline's legacy "Stage N is processing." string or
+        # an already-friendly label, resolve the stage number for the console
+        # logger, and surface the friendly label to the UI. Non-stage messages
+        # (should not occur today) pass through unchanged.
+        stage_n = _LABEL_TO_STAGE.get(message)
+        if stage_n is None:
+            match = re.search(r"Stage (\d+) is processing", message)
+            stage_n = int(match.group(1)) if match else None
+        if stage_n is not None:
+            console_logger.start_stage(stage_n)
+            status_queue.put(_stage_status(stage_n))
+        else:
+            status_queue.put(message)
 
     def worker() -> None:
         try:
