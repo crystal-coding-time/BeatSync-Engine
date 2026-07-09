@@ -244,31 +244,12 @@ def _notify_console(console_callback: Callable[[int, str], None] | None,
         pass
 
 
-def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
-                       end_time: float = None, use_gpu: bool = False,
-                       video_files: List[str] = None,
-                       enable_video_analysis: bool = True,
-                       enable_qwen_semantics: bool = True,
-                       qwen_model_path: str = None,
-                       progress_callback: Callable[[str], None] | None = None,
-                       console_callback: Callable[[int, str], None] | None = None) -> Tuple[np.ndarray, Dict]:
+def _load_and_split_audio(audio_file: str, start_time: float, duration: float | None,
+                          cfg: AutoWaveConfig) -> Tuple[np.ndarray, int, float, np.ndarray, np.ndarray, np.ndarray]:
+    """Load + normalize the song, split harmonic/percussive, precompute shared mel.
+
+    Returns (y, sr, audio_duration, y_harmonic, y_percussive, mel_S).
     """
-    Build a cleaner Auto Mode cut plan.
-
-    The edit behaves like waves:
-    - small waves: longer holds, mainly phrase/bar anchors;
-    - medium waves: cuts every 2-4 beats;
-    - big waves: tighter 1-2 beat rhythm, but only on strong musical impacts.
-    """
-    cfg = CONFIG
-
-    print("🤖 AUTO MODE V4 - Audio-Visual Rhythmic GMV/AMV Planner")
-    print("   Rhythm-first audio cuts + semantic video moment matching")
-
-    duration = None
-    if end_time and end_time > start_time:
-        duration = end_time - start_time
-
     print("   🎵 Loading audio...")
     y, sr = librosa.load(audio_file, sr=cfg.sr, offset=start_time, duration=duration, mono=True)
     if y.size == 0:
@@ -293,26 +274,21 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         y=y_percussive, sr=sr, hop_length=cfg.hop_length, fmax=0.5 * sr,
     )))
 
-    _notify_progress(progress_callback, 1)
-    print("   🥁 Step 1: Detecting stable beat grid...")
-    beat_times, tempo, beat_frames, onset_env, downbeat_times = detect_master_beat_grid(
-        y_percussive, sr, cfg, y_full=y, mel_S=mel_S
-    )
-    if len(beat_times) < 2:
-        raise ValueError("Auto Mode could not detect enough rhythmic events to build a cut plan.")
-    print(f"      ✓ {len(beat_times)} beats detected at {tempo:.1f} BPM")
-    _notify_console(console_callback, 1, f"Beat grid: {len(beat_times)} beats at {tempo:.1f} BPM")
-    if downbeat_times.size:
-        print(f"      ✓ {downbeat_times.size} downbeats (beat-this)")
-        _notify_console(console_callback, 1, f"Downbeats: {downbeat_times.size} (beat-this)")
+    return y, sr, audio_duration, y_harmonic, y_percussive, mel_S
 
-    _notify_progress(progress_callback, 2)
-    print("   🌊 Step 2: Reading energy waves and rhythm impacts...")
-    features = analyze_wave_features(
-        y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu,
-        y_harmonic=y_harmonic, audio_file=audio_file,
-        start_time=start_time, duration=duration, mel_S=mel_S,
-    )
+
+def _apply_downbeat_anchors(features: Dict, beat_times: np.ndarray,
+                            downbeat_times: np.ndarray) -> None:
+    """Overwrite stage-2's naive anchors with model downbeats (cross-stage mutation).
+
+    Stage 2 seeds ``features["is_bar_anchor"]``/``is_phrase_anchor`` with a naive
+    every-4th-beat grid. When the beat-this backend delivered real downbeats,
+    this step REPLACES those anchors in place: bar anchors become the model's
+    downbeats, phrase anchors every second downbeat. Stage 4's ``anchor_bonus``
+    scoring consumes the result unchanged — this is the buried mutation that
+    makes downbeat detection actually steer cut placement. No downbeats
+    (backend missing/disabled) leaves stage 2's anchors untouched.
+    """
     if downbeat_times.size:
         # Real downbeats replace the naive every-4th-beat grid: bar anchors are
         # the model's downbeats, phrase anchors every second downbeat. This
@@ -326,18 +302,12 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
             phrase_idx = np.where(is_downbeat)[0][::2]
             phrase[phrase_idx] = True
             features["is_phrase_anchor"] = phrase
-    wave = np.asarray(features.get("wave", []), dtype=float)
-    impact = np.asarray(features.get("impact_score", []), dtype=float)
-    rhythm = np.asarray(features.get("rhythm_score", []), dtype=float)
-    _notify_console(console_callback, 2, "Energy and rhythm features ready")
-    if wave.size:
-        _notify_console(console_callback, 2, f"Energy wave: avg {float(np.mean(wave)):.2f}, peak {float(np.max(wave)):.2f}")
-    if impact.size:
-        strong_impacts = int(np.sum(impact >= _safe_percentile(impact, 88, 0.88)))
-        _notify_console(console_callback, 2, f"Strong rhythm impacts: {strong_impacts}/{len(impact)} beats")
-    if rhythm.size:
-        _notify_console(console_callback, 2, f"Rhythm strength: avg {float(np.mean(rhythm)):.2f}, peak {float(np.max(rhythm)):.2f}")
 
+
+def _load_optional_structure_and_stems(audio_file: str, beat_times: np.ndarray,
+                                       features: Dict,
+                                       console_callback: Callable[[int, str], None] | None) -> Dict | None:
+    """Optional structure/stem backends: graft stem features, return structure (or None)."""
     # Wave-14: optional music-structure + stem-signal backend (all-in-one-mlx /
     # demucs-mlx via src/structure_stems.py). Lazily imported and fully
     # self-guarded: a missing module (Windows/Intel/uninstalled), kill switch, or
@@ -398,6 +368,145 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
             console_callback, 3,
             f"Structure backend: {len(_labels)} sections ({', '.join(_labels[:6])})",
         )
+
+    return structure
+
+
+def _pack_beat_info(features: Dict, beat_times: np.ndarray, downbeat_times: np.ndarray,
+                    selected_beats: np.ndarray, tempo: float, sections: List[Dict],
+                    selection_info, audio_visual_profile: Dict, video_analysis,
+                    audio_duration: float, structure: Dict | None) -> Dict:
+    """Package features into beat_info (the features/energy_profile/rhythm_data triple view)."""
+    energy_profile = {
+        "beat_energy": features["energy"],
+        "energy_levels": features["energy_levels"],
+        "rms": features["rms_curve"],
+        "spectral_centroid": features["centroid_curve"],
+        # Historic misnomer: the "zcr" slot has always carried the spectral
+        # flux curve. Downstream readers expect it under this key.
+        "zcr": features["flux_curve"],
+        "wave": features["wave"],
+        "arc": features["arc"],
+        "loudness": features["loudness"],
+    }
+
+    rhythm_data = {
+        "kick_strength": features["kick"],
+        "clap_strength": features["clap"],
+        "hihat_strength": features["hihat"],
+        "bass_strength": features["bass"],
+        "combined_strength": features["rhythm_score"],
+        "impact_strength": features["impact_score"],
+        "novelty_strength": features["novelty"],
+        "is_strong_kick": features["is_strong_kick"],
+        "is_strong_clap": features["is_strong_clap"],
+        "is_strong_hihat": features["is_strong_hihat"],
+        "is_strong_bass": features["is_strong_bass"],
+        "is_bar_anchor": features["is_bar_anchor"],
+        "is_phrase_anchor": features["is_phrase_anchor"],
+        "onset_superflux": features["onset_superflux"],
+        "harmonic_change": features["harmonic_change"],
+    }
+
+    # Wave-14: stem signals ride the carrying dicts alongside wave-13 features
+    # (drum_onset/vocal_presence with rhythm data; bass_energy with energy).
+    # Present only when the backend delivered them; old cached beat_info that
+    # never had these keys flows through downstream unchanged.
+    if "drum_onset" in features:
+        rhythm_data["drum_onset"] = features["drum_onset"]
+    if "vocal_presence" in features:
+        rhythm_data["vocal_presence"] = features["vocal_presence"]
+    if "bass_energy" in features:
+        energy_profile["bass_energy"] = features["bass_energy"]
+
+    beat_info = {
+        "times": beat_times,
+        "downbeat_times": downbeat_times,
+        "selected_times": selected_beats,
+        "tempo": tempo,
+        "sections": sections,
+        "energy_profile": energy_profile,
+        "rhythm_data": rhythm_data,
+        "rhythm_patterns": {s["index"]: s.get("dominant_pattern", "mixed") for s in sections},
+        "selection_info": selection_info,
+        "audio_visual_profile": audio_visual_profile,
+        "video_analysis": video_analysis,
+        "audio_duration": audio_duration,
+        "mode": "auto_v4_audio_visual_rhythmic_planner",
+        "auto_style": "audio_visual_rhythmic_gmv_amv",
+    }
+
+    if structure is not None:
+        beat_info["structure"] = structure
+
+    return beat_info
+
+
+def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
+                       end_time: float = None, use_gpu: bool = False,
+                       video_files: List[str] = None,
+                       enable_video_analysis: bool = True,
+                       enable_qwen_semantics: bool = True,
+                       qwen_model_path: str = None,
+                       progress_callback: Callable[[str], None] | None = None,
+                       console_callback: Callable[[int, str], None] | None = None) -> Tuple[np.ndarray, Dict]:
+    """
+    Build a cleaner Auto Mode cut plan.
+
+    The edit behaves like waves:
+    - small waves: longer holds, mainly phrase/bar anchors;
+    - medium waves: cuts every 2-4 beats;
+    - big waves: tighter 1-2 beat rhythm, but only on strong musical impacts.
+    """
+    cfg = CONFIG
+
+    print("🤖 AUTO MODE V4 - Audio-Visual Rhythmic GMV/AMV Planner")
+    print("   Rhythm-first audio cuts + semantic video moment matching")
+
+    duration = None
+    if end_time and end_time > start_time:
+        duration = end_time - start_time
+
+    y, sr, audio_duration, y_harmonic, y_percussive, mel_S = _load_and_split_audio(
+        audio_file, start_time, duration, cfg
+    )
+
+    _notify_progress(progress_callback, 1)
+    print("   🥁 Step 1: Detecting stable beat grid...")
+    beat_times, tempo, beat_frames, onset_env, downbeat_times = detect_master_beat_grid(
+        y_percussive, sr, cfg, y_full=y, mel_S=mel_S
+    )
+    if len(beat_times) < 2:
+        raise ValueError("Auto Mode could not detect enough rhythmic events to build a cut plan.")
+    print(f"      ✓ {len(beat_times)} beats detected at {tempo:.1f} BPM")
+    _notify_console(console_callback, 1, f"Beat grid: {len(beat_times)} beats at {tempo:.1f} BPM")
+    if downbeat_times.size:
+        print(f"      ✓ {downbeat_times.size} downbeats (beat-this)")
+        _notify_console(console_callback, 1, f"Downbeats: {downbeat_times.size} (beat-this)")
+
+    _notify_progress(progress_callback, 2)
+    print("   🌊 Step 2: Reading energy waves and rhythm impacts...")
+    features = analyze_wave_features(
+        y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu,
+        y_harmonic=y_harmonic, audio_file=audio_file,
+        start_time=start_time, duration=duration, mel_S=mel_S,
+    )
+    _apply_downbeat_anchors(features, beat_times, downbeat_times)
+    wave = np.asarray(features.get("wave", []), dtype=float)
+    impact = np.asarray(features.get("impact_score", []), dtype=float)
+    rhythm = np.asarray(features.get("rhythm_score", []), dtype=float)
+    _notify_console(console_callback, 2, "Energy and rhythm features ready")
+    if wave.size:
+        _notify_console(console_callback, 2, f"Energy wave: avg {float(np.mean(wave)):.2f}, peak {float(np.max(wave)):.2f}")
+    if impact.size:
+        strong_impacts = int(np.sum(impact >= _safe_percentile(impact, 88, 0.88)))
+        _notify_console(console_callback, 2, f"Strong rhythm impacts: {strong_impacts}/{len(impact)} beats")
+    if rhythm.size:
+        _notify_console(console_callback, 2, f"Rhythm strength: avg {float(np.mean(rhythm)):.2f}, peak {float(np.max(rhythm)):.2f}")
+
+    structure = _load_optional_structure_and_stems(
+        audio_file, beat_times, features, console_callback
+    )
 
     _notify_progress(progress_callback, 3)
     print("   🎼 Step 3: Detecting broad musical sections...")
@@ -485,65 +594,19 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
             print(f"   ⚠️  Video analysis failed; renderer will use fallback sampling: {e}")
             _notify_console(console_callback, 5, f"Video analysis failed; fallback sampling: {e}")
 
-    energy_profile = {
-        "beat_energy": features["energy"],
-        "energy_levels": features["energy_levels"],
-        "rms": features["rms_curve"],
-        "spectral_centroid": features["centroid_curve"],
-        "zcr": features["flux_curve"],
-        "wave": features["wave"],
-        "arc": features["arc"],
-        "loudness": features["loudness"],
-    }
-
-    rhythm_data = {
-        "kick_strength": features["kick"],
-        "clap_strength": features["clap"],
-        "hihat_strength": features["hihat"],
-        "bass_strength": features["bass"],
-        "combined_strength": features["rhythm_score"],
-        "impact_strength": features["impact_score"],
-        "novelty_strength": features["novelty"],
-        "is_strong_kick": features["is_strong_kick"],
-        "is_strong_clap": features["is_strong_clap"],
-        "is_strong_hihat": features["is_strong_hihat"],
-        "is_strong_bass": features["is_strong_bass"],
-        "is_bar_anchor": features["is_bar_anchor"],
-        "is_phrase_anchor": features["is_phrase_anchor"],
-        "onset_superflux": features["onset_superflux"],
-        "harmonic_change": features["harmonic_change"],
-    }
-
-    # Wave-14: stem signals ride the carrying dicts alongside wave-13 features
-    # (drum_onset/vocal_presence with rhythm data; bass_energy with energy).
-    # Present only when the backend delivered them; old cached beat_info that
-    # never had these keys flows through downstream unchanged.
-    if "drum_onset" in features:
-        rhythm_data["drum_onset"] = features["drum_onset"]
-    if "vocal_presence" in features:
-        rhythm_data["vocal_presence"] = features["vocal_presence"]
-    if "bass_energy" in features:
-        energy_profile["bass_energy"] = features["bass_energy"]
-
-    beat_info = {
-        "times": beat_times,
-        "downbeat_times": downbeat_times,
-        "selected_times": selected_beats,
-        "tempo": tempo,
-        "sections": sections,
-        "energy_profile": energy_profile,
-        "rhythm_data": rhythm_data,
-        "rhythm_patterns": {s["index"]: s.get("dominant_pattern", "mixed") for s in sections},
-        "selection_info": selection_info,
-        "audio_visual_profile": audio_visual_profile,
-        "video_analysis": video_analysis,
-        "audio_duration": audio_duration,
-        "mode": "auto_v4_audio_visual_rhythmic_planner",
-        "auto_style": "audio_visual_rhythmic_gmv_amv",
-    }
-
-    if structure is not None:
-        beat_info["structure"] = structure
+    beat_info = _pack_beat_info(
+        features=features,
+        beat_times=beat_times,
+        downbeat_times=downbeat_times,
+        selected_beats=selected_beats,
+        tempo=tempo,
+        sections=sections,
+        selection_info=selection_info,
+        audio_visual_profile=audio_visual_profile,
+        video_analysis=video_analysis,
+        audio_duration=audio_duration,
+        structure=structure,
+    )
 
     try:
         if use_gpu and GPU_AVAILABLE:

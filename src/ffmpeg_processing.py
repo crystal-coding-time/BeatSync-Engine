@@ -232,9 +232,42 @@ def count_video_frames(video_file: str) -> int | None:
         return None
 
 
-def _verify_segment_frames(output_file: str, expected: int) -> bool:
-    """Post-extract guard: the segment must hold exactly the planned frames."""
-    actual = count_video_frames(output_file)
+# ffmpeg's default-loglevel stats counter on stderr ("frame=  123 fps=...").
+# The FINAL occurrence is the total number of frames written to the (single)
+# mapped video output, which for our segment encodes equals what
+# ffprobe -count_packets would report on the file.
+_ENCODE_FRAME_RE = re.compile(r'frame=\s*(\d+)')
+
+
+def _parse_encoded_frames(stderr: str) -> int | None:
+    """Frame count from an encode's own stderr stats; None if absent.
+
+    Segment encodes run at ffmpeg's default loglevel, so the stats line is
+    always present in the stderr _run_media_command already captured — reading
+    it saves one ffprobe spawn per segment. Callers fall back to the ffprobe
+    guard only when no counter is found (e.g. a build/loglevel that suppresses
+    stats)."""
+    if not stderr:
+        return None
+    matches = _ENCODE_FRAME_RE.findall(stderr)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return None
+
+
+def _verify_segment_frames(output_file: str, expected: int,
+                           actual: int | None = None) -> bool:
+    """Post-extract guard: the segment must hold exactly the planned frames.
+
+    actual, when provided, is the frame count already parsed from the
+    encoder's own stderr (see _parse_encoded_frames); otherwise ffprobe
+    counts the file's packets. Accept/reject logic is identical either way.
+    """
+    if actual is None:
+        actual = count_video_frames(output_file)
     if actual is None:
         print(f"   ⚠️  Could not verify frame count of {os.path.basename(output_file)}; keeping it")
         return True
@@ -1728,7 +1761,8 @@ def _run_and_verify_segment(cmd: List[str], output_file: str,
         return False, _short_ffmpeg_error(result.stderr, 400)
     if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
         return False, _VERIFY_FAILED_DETAIL
-    if not _verify_segment_frames(output_file, output_frame_count):
+    if not _verify_segment_frames(output_file, output_frame_count,
+                                  actual=_parse_encoded_frames(result.stderr)):
         return False, _VERIFY_FAILED_DETAIL
     return True, ""
 
@@ -2287,6 +2321,208 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
 
     raise Exception(f"ProRes segment extraction error: {last_error}")
 
+def _add_assembly_audio_input(cmd: List[str], audio_file: str | None,
+                              start_time: float, end_time: float | None) -> None:
+    """Append the assembly's (optionally trimmed) audio input block."""
+    if not audio_file:
+        return
+    if end_time and end_time > start_time:
+        cmd.extend(['-ss', str(start_time), '-t', str(end_time - start_time), '-i', audio_file])
+    elif start_time > 0:
+        cmd.extend(['-ss', str(start_time), '-i', audio_file])
+    else:
+        cmd.extend(['-i', audio_file])
+
+
+def _add_assembly_audio_end_bound(cmd: List[str], total_frames: "int | None",
+                                  fps: float) -> None:
+    """Trim the audio at the video's end WITHOUT -shortest.
+
+    The frame-locked timeline rounds round(audio_duration*fps), so the
+    video can legitimately run up to half a frame past the audio; with
+    -shortest the muxer then drops the final video packet (observed:
+    4561/4562 frames). Bounding the output half a frame past the video
+    end keeps every video packet and still cuts the audio at the video
+    boundary.
+    """
+    if total_frames and fps > 0:
+        cmd.extend(['-t', f'{(int(total_frames) + 0.5) / float(fps):.6f}'])
+    else:
+        cmd.extend(['-shortest'])
+
+
+def _assemble_prores(concat_file: str, video_files: List[str],
+                     output_file: str, audio_file: "str | None",
+                     start_time: float, end_time: "float | None",
+                     total_frames: "int | None", fps: float, temp_dir: str,
+                     temp_files: List[str]) -> None:
+    """ProRes assembly: lossless stream-copy concat, then a separate PCM
+    extract + mux (audio as the master timeline). Intermediates are appended
+    to temp_files as they are created so the orchestrator's cleanup covers
+    them even when a step raises."""
+    # ProRes: concat with stream copy (lossless)
+    print(f"   🔗 Concatenating {len(video_files)} segments (lossless stream copy)...")
+
+    temp_video = os.path.join(temp_dir, f'video_only_{uuid.uuid4().hex}.mov')
+    temp_files.append(temp_video)
+
+    cmd = [
+        FFMPEG_PATH,
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_file,
+        '-c', 'copy',
+        '-y',
+        temp_video
+    ]
+
+    result = _run_media_command(cmd, timeout=300)
+
+    if result.returncode != 0:
+        raise Exception(f"Concatenation failed: {result.stderr}")
+
+    # Add audio if provided
+    if audio_file:
+        print(f"   🎵 Adding music track...")
+
+        temp_audio = os.path.join(temp_dir, f'music_{uuid.uuid4().hex}.wav')
+        temp_files.append(temp_audio)
+
+        audio_cmd = [FFMPEG_PATH]
+        _add_assembly_audio_input(audio_cmd, audio_file, start_time, end_time)
+
+        audio_cmd.extend([
+            '-acodec', 'pcm_s24le',
+            '-ar', '48000',
+            '-ac', '2',
+            '-y',
+            temp_audio
+        ])
+
+        result = _run_media_command(audio_cmd, timeout=120)
+
+        if result.returncode != 0:
+            raise Exception(f"Audio extraction failed: {result.stderr}")
+
+        # Combine video + audio with AUDIO as master timeline
+        cmd = [
+            FFMPEG_PATH,
+            '-i', temp_video,
+            '-i', temp_audio,
+            '-map', '0:v',
+            '-map', '1:a',
+            '-c:v', 'copy',
+            '-c:a', 'pcm_s24le',
+            '-ar', '48000',
+        ]
+        _add_assembly_audio_end_bound(cmd, total_frames, fps)
+        cmd.extend([
+            '-y',
+            output_file
+        ])
+
+        result = _run_media_command(cmd, timeout=300)
+
+        if result.returncode != 0:
+            raise Exception(f"Audio merging failed: {result.stderr}")
+
+        _safe_remove_file(temp_video)
+        _safe_remove_file(temp_audio)
+    else:
+        shutil.move(temp_video, output_file)
+
+
+def _assemble_copy(concat_file: str, output_file: str,
+                   audio_file: "str | None", start_time: float,
+                   end_time: "float | None", total_frames: "int | None",
+                   fps: float) -> bool:
+    """Fast H.264/H.265 assembly: concat stream-copy video + mux audio.
+
+    Returns True on success; False means the codec/container combination
+    rejected stream copy (warning printed) and the caller should fall back
+    to the re-encode strategy."""
+    print(f"   🔗 Fast final assembly: concat stream-copy video + mux audio...")
+    copy_started = time.perf_counter()
+    cmd = [
+        FFMPEG_PATH,
+        '-nostdin',
+        '-hide_banner',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_file,
+    ]
+    _add_assembly_audio_input(cmd, audio_file, start_time, end_time)
+    if audio_file:
+        cmd.extend(['-map', '0:v:0', '-map', '1:a:0'])
+    else:
+        cmd.extend(['-map', '0:v:0'])
+    cmd.extend(['-c:v', 'copy'])
+    if audio_file:
+        cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000'])
+        _add_assembly_audio_end_bound(cmd, total_frames, fps)
+    cmd.extend(['-fflags', '+genpts'])
+    if output_file.lower().endswith(('.mp4', '.mov', '.m4v')):
+        cmd.extend(['-movflags', '+faststart'])
+    cmd.extend(['-y', output_file])
+
+    result = _run_media_command(cmd, timeout=300)
+    if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+        print(f"   ✓ Fast concat-copy complete in {_fmt_seconds(time.perf_counter() - copy_started)}")
+        return True
+    print(
+        f"   ⚠️  Fast concat-copy failed in {_fmt_seconds(time.perf_counter() - copy_started)}; "
+        f"falling back to re-encode. {_short_ffmpeg_error(result.stderr, 900)}"
+    )
+    return False
+
+
+def _assemble_reencode(concat_file: str, video_files: List[str],
+                       output_file: str, audio_file: "str | None",
+                       start_time: float, end_time: "float | None",
+                       total_frames: "int | None", fps: float,
+                       use_nvenc: bool, gpu_encoder: str) -> None:
+    """Fallback/original behavior: H.264/H.265 full re-encode."""
+    print(f"   🔗 Concatenating and encoding {len(video_files)} segments...")
+    encode_started = time.perf_counter()
+    cmd = [FFMPEG_PATH]
+    cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
+
+    cmd.extend([
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_file
+    ])
+
+    _add_assembly_audio_input(cmd, audio_file, start_time, end_time)
+    if audio_file:
+        cmd.extend(['-map', '0:v', '-map', '1:a'])
+
+    if use_nvenc:
+        cmd.extend(get_gpu_quality_args(gpu_encoder, include_pix_fmt=True))
+    else:
+        cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
+
+    if audio_file:
+        cmd.extend([
+            '-c:a', 'pcm_s24le',
+            '-ar', '48000',
+        ])
+        _add_assembly_audio_end_bound(cmd, total_frames, fps)
+
+    cmd.extend([
+        '-fps_mode', 'cfr',
+        '-r', str(fps),
+        '-y',
+        output_file
+    ])
+
+    result = _run_media_command(cmd, timeout=600)
+
+    if result.returncode != 0:
+        raise Exception(f"Encoding failed: {result.stderr}")
+    print(f"   ✓ Full final re-encode complete in {_fmt_seconds(time.perf_counter() - encode_started)}")
+
+
 def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                               audio_file: str = None, start_time: float = 0.0,
                               end_time: float = None, use_nvenc: bool = False,
@@ -2295,12 +2531,16 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                               total_frames: int = None) -> str:
     """
     Concatenate video files using FFmpeg concat demuxer.
-    
+
     ✅ FRAME-ACCURATE: Maintains precise timing through concatenation
+
+    Strategy selection: .mov output → ProRes lossless assembly; otherwise the
+    fast concat stream-copy (unless BEATSYNC_FAST_CONCAT_COPY disables it),
+    falling back to the full re-encode when stream copy is rejected.
     """
     if temp_dir is None:
         temp_dir = os.path.dirname(output_file)
-    
+
     # Create concat file
     concat_file = os.path.join(temp_dir, f'concat_list_{uuid.uuid4().hex}.txt')
     with open(concat_file, 'w', encoding='utf-8') as f:
@@ -2309,107 +2549,15 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
             # path must be written as '\'' or the list fails to parse.
             escaped_path = video_file.replace('\\', '/').replace("'", "'\\''")
             f.write(f"file '{escaped_path}'\n")
-    
+
     is_prores = output_file.lower().endswith('.mov')
-    temp_video = None
-    temp_audio = None
-
-    def add_audio_input(cmd: List[str]) -> None:
-        if not audio_file:
-            return
-        if end_time and end_time > start_time:
-            cmd.extend(['-ss', str(start_time), '-t', str(end_time - start_time), '-i', audio_file])
-        elif start_time > 0:
-            cmd.extend(['-ss', str(start_time), '-i', audio_file])
-        else:
-            cmd.extend(['-i', audio_file])
-
-    def add_audio_end_bound(cmd: List[str]) -> None:
-        """Trim the audio at the video's end WITHOUT -shortest.
-
-        The frame-locked timeline rounds round(audio_duration*fps), so the
-        video can legitimately run up to half a frame past the audio; with
-        -shortest the muxer then drops the final video packet (observed:
-        4561/4562 frames). Bounding the output half a frame past the video
-        end keeps every video packet and still cuts the audio at the video
-        boundary.
-        """
-        if total_frames and fps > 0:
-            cmd.extend(['-t', f'{(int(total_frames) + 0.5) / float(fps):.6f}'])
-        else:
-            cmd.extend(['-shortest'])
+    temp_files: List[str] = []
 
     try:
         if is_prores:
-            # ProRes: concat with stream copy (lossless)
-            print(f"   🔗 Concatenating {len(video_files)} segments (lossless stream copy)...")
-            
-            temp_video = os.path.join(temp_dir, f'video_only_{uuid.uuid4().hex}.mov')
-            
-            cmd = [
-                FFMPEG_PATH,
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file,
-                '-c', 'copy',
-                '-y',
-                temp_video
-            ]
-            
-            result = _run_media_command(cmd, timeout=300)
-            
-            if result.returncode != 0:
-                raise Exception(f"Concatenation failed: {result.stderr}")
-            
-            # Add audio if provided
-            if audio_file:
-                print(f"   🎵 Adding music track...")
-                
-                temp_audio = os.path.join(temp_dir, f'music_{uuid.uuid4().hex}.wav')
-                
-                audio_cmd = [FFMPEG_PATH]
-                add_audio_input(audio_cmd)
-
-                audio_cmd.extend([
-                    '-acodec', 'pcm_s24le',
-                    '-ar', '48000',
-                    '-ac', '2',
-                    '-y',
-                    temp_audio
-                ])
-                
-                result = _run_media_command(audio_cmd, timeout=120)
-                
-                if result.returncode != 0:
-                    raise Exception(f"Audio extraction failed: {result.stderr}")
-                
-                # Combine video + audio with AUDIO as master timeline
-                cmd = [
-                    FFMPEG_PATH,
-                    '-i', temp_video,
-                    '-i', temp_audio,
-                    '-map', '0:v',
-                    '-map', '1:a',
-                    '-c:v', 'copy',
-                    '-c:a', 'pcm_s24le',
-                    '-ar', '48000',
-                ]
-                add_audio_end_bound(cmd)
-                cmd.extend([
-                    '-y',
-                    output_file
-                ])
-                
-                result = _run_media_command(cmd, timeout=300)
-                
-                if result.returncode != 0:
-                    raise Exception(f"Audio merging failed: {result.stderr}")
-                
-                _safe_remove_file(temp_video)
-                _safe_remove_file(temp_audio)
-            else:
-                shutil.move(temp_video, output_file)
-        
+            _assemble_prores(concat_file, video_files, output_file,
+                             audio_file, start_time, end_time, total_frames,
+                             fps, temp_dir, temp_files)
         else:
             # H.264/H.265 standard path. Temp clips were already encoded with
             # matching FPS/resolution/codec settings, so the fastest safe path is
@@ -2417,86 +2565,19 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
             # combination rejects stream copy, fall back to the old re-encode path.
             fast_concat_enabled = _env_flag('BEATSYNC_FAST_CONCAT_COPY', True)
 
-            if fast_concat_enabled:
-                print(f"   🔗 Fast final assembly: concat stream-copy video + mux audio...")
-                copy_started = time.perf_counter()
-                cmd = [
-                    FFMPEG_PATH,
-                    '-nostdin',
-                    '-hide_banner',
-                    '-f', 'concat',
-                    '-safe', '0',
-                    '-i', concat_file,
-                ]
-                add_audio_input(cmd)
-                if audio_file:
-                    cmd.extend(['-map', '0:v:0', '-map', '1:a:0'])
-                else:
-                    cmd.extend(['-map', '0:v:0'])
-                cmd.extend(['-c:v', 'copy'])
-                if audio_file:
-                    cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000'])
-                    add_audio_end_bound(cmd)
-                cmd.extend(['-fflags', '+genpts'])
-                if output_file.lower().endswith(('.mp4', '.mov', '.m4v')):
-                    cmd.extend(['-movflags', '+faststart'])
-                cmd.extend(['-y', output_file])
+            if not (fast_concat_enabled
+                    and _assemble_copy(concat_file, output_file, audio_file,
+                                       start_time, end_time, total_frames,
+                                       fps)):
+                _assemble_reencode(concat_file, video_files, output_file,
+                                   audio_file, start_time, end_time,
+                                   total_frames, fps, use_nvenc, gpu_encoder)
 
-                result = _run_media_command(cmd, timeout=300)
-                if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                    print(f"   ✓ Fast concat-copy complete in {_fmt_seconds(time.perf_counter() - copy_started)}")
-                    return output_file
-                print(
-                    f"   ⚠️  Fast concat-copy failed in {_fmt_seconds(time.perf_counter() - copy_started)}; "
-                    f"falling back to re-encode. {_short_ffmpeg_error(result.stderr, 900)}"
-                )
-
-            # Fallback/original behavior: H.264/H.265 full re-encode.
-            print(f"   🔗 Concatenating and encoding {len(video_files)} segments...")
-            encode_started = time.perf_counter()
-            cmd = [FFMPEG_PATH]
-            cmd.extend(get_hwaccel_args(use_nvenc, gpu_encoder))
-            
-            cmd.extend([
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file
-            ])
-            
-            add_audio_input(cmd)
-            if audio_file:
-                cmd.extend(['-map', '0:v', '-map', '1:a'])
-            
-            if use_nvenc:
-                cmd.extend(get_gpu_quality_args(gpu_encoder, include_pix_fmt=True))
-            else:
-                cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
-            
-            if audio_file:
-                cmd.extend([
-                    '-c:a', 'pcm_s24le',
-                    '-ar', '48000',
-                ])
-                add_audio_end_bound(cmd)
-            
-            cmd.extend([
-                '-fps_mode', 'cfr',
-                '-r', str(fps),
-                '-y',
-                output_file
-            ])
-            
-            result = _run_media_command(cmd, timeout=600)
-            
-            if result.returncode != 0:
-                raise Exception(f"Encoding failed: {result.stderr}")
-            print(f"   ✓ Full final re-encode complete in {_fmt_seconds(time.perf_counter() - encode_started)}")
-        
         return output_file
     finally:
         _safe_remove_file(concat_file)
-        _safe_remove_file(temp_audio)
-        _safe_remove_file(temp_video)
+        for temp_path in reversed(temp_files):
+            _safe_remove_file(temp_path)
 
 
 def detect_video_scene_changes(video_path: str, threshold: float = 0.28,

@@ -537,46 +537,97 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
     from scipy.optimize import linear_sum_assignment
 
     by_source: Dict[str, List[Dict]] = {}
-    for c in candidates:
-        by_source.setdefault(str(c.get("video_file")), []).append(c)
+    rows_of: Dict[str, List[int]] = {}       # source -> candidate list indices
+    for i, c in enumerate(candidates):
+        src = str(c.get("video_file"))
+        by_source.setdefault(src, []).append(c)
+        rows_of.setdefault(src, []).append(i)
 
     _score = score_cache.score if score_cache is not None else _score_candidate
-
-    # Auction-best approximation per segment (raw scores, no deque state),
-    # used only for the drop exemption threshold. Order-independent (max).
-    best_raw = [max(_score(c, p) for c in candidates) for p in profiles]
 
     sources = sorted(by_source)              # deterministic row order
     n_src = len(sources)
     n_seg = len(profiles)
+    n_cand = len(candidates)
+
+    # --- W2-8 vectorized seat scoring. ------------------------------------
+    # The (candidate, segment) score matrix is assembled FROM the exact
+    # floats `_score` returns -- `_score_candidate` reads only the profile's
+    # target, so one real call per (candidate, distinct target) covers every
+    # (candidate, segment) pair, exactly like the memoized sweep did. The
+    # only arithmetic applied on top is the same short-candidate `- 0.18`
+    # and the same `best_raw - 0.35` exemption threshold, as float64 ops
+    # bit-identical to the scalar originals. Never re-derive score math here.
+    targets = [p.get("target", "flow") for p in profiles]
+    tcol: Dict[str, int] = {}
+    rep_profiles: List[Dict] = []
+    for p, t in zip(profiles, targets):
+        if t not in tcol:
+            tcol[t] = len(rep_profiles)
+            rep_profiles.append(p)
+    S = np.empty((n_cand, len(rep_profiles)), dtype=np.float64)
+    for k, p in enumerate(rep_profiles):
+        for i, c in enumerate(candidates):
+            S[i, k] = _score(c, p)
+    col = np.array([tcol[t] for t in targets], dtype=np.intp)
+    M = S[:, col]                            # (n_cand, n_seg) seat scores
+
+    # Auction-best approximation per segment (raw scores, no duration
+    # penalty), used only for the drop exemption threshold.
+    best_raw = S.max(axis=0)[col]
+
+    # Short-candidate penalty: candidates shorter than 0.55x the segment lose
+    # 0.18. A missing "duration" defaulted to the segment's own requirement,
+    # which can never test short -- +inf encodes exactly that.
+    req = np.array([max(0.05, p["duration"]) for p in profiles],
+                   dtype=np.float64)
+    cand_dur = np.empty(n_cand, dtype=np.float64)
+    for i, c in enumerate(candidates):
+        if "duration" in c:
+            cand_dur[i] = max(0.05, float(c["duration"]))
+        else:
+            cand_dur[i] = np.inf
+    short = cand_dur[:, None] < (req * 0.55)[None, :]
+    M = np.where(short, M - 0.18, M)
+
+    is_drop = np.fromiter((t == "drop" for t in targets), dtype=bool,
+                          count=n_seg)
+    exempt_m = is_drop[None, :] & (M < (best_raw - 0.35)[None, :])
 
     # Per (row r, segment j) keep the single best candidate in each tier under
     # the exact greedy tie-break key (-score, j, str(id)); j is constant within
-    # a cell, so this reduces to "highest score, then lowest str(id)".
+    # a cell, so this reduces to "highest score, then lowest str(id)", with
+    # first-encounter (source-local candidate order) breaking full ties --
+    # rank candidates once by (str(id), position) and take, per segment, the
+    # lowest rank among the EXACTLY-equal maxima.
     prim_cell: Dict[tuple, tuple] = {}       # (r, j) -> (score, candidate)
     exempt_cell: Dict[tuple, tuple] = {}     # (r, j) -> (score, candidate)
 
-    def _better(new_score: float, new_c: Dict, cur: "tuple | None") -> bool:
-        if cur is None:
-            return True
-        # (-score, str(id)) ascending == greedy's opts.sort winner.
-        return (-new_score, str(new_c.get("id"))) < (-cur[0], str(cur[1].get("id")))
-
     for r, src in enumerate(sources):
-        for c in by_source[src]:
-            for j, p in enumerate(profiles):
-                score = _score(c, p)
-                required = max(0.05, p["duration"])
-                cand_duration = max(0.05, float(c.get("duration", required)))
-                if cand_duration < required * 0.55:
-                    score -= 0.18
-                key = (r, j)
-                if p.get("target") == "drop" and score < best_raw[j] - 0.35:
-                    if _better(score, c, exempt_cell.get(key)):
-                        exempt_cell[key] = (score, c)
-                    continue
-                if _better(score, c, prim_cell.get(key)):
-                    prim_cell[key] = (score, c)
+        cands_r = by_source[src]
+        rows = np.array(rows_of[src], dtype=np.intp)
+        k = len(cands_r)
+        sub = M[rows, :]                     # (k, n_seg)
+        ex = exempt_m[rows, :]
+        sids = [str(c.get("id")) for c in cands_r]
+        perm = sorted(range(k), key=lambda i: (sids[i], i))
+        rank = np.empty(k, dtype=np.intp)
+        for m, i_loc in enumerate(perm):
+            rank[i_loc] = m
+        for tier_mask, cell in ((~ex, prim_cell), (ex, exempt_cell)):
+            has = tier_mask.any(axis=0)
+            if not has.any():
+                continue
+            masked = np.where(tier_mask, sub, -np.inf)
+            col_best = masked.max(axis=0)
+            tie_rank = np.where((masked == col_best[None, :]) & tier_mask,
+                                rank[:, None], k)
+            win = tie_rank.min(axis=0)
+            for j in np.nonzero(has)[0].tolist():
+                i_loc = perm[int(win[j])]
+                # Store the winner's own (possibly penalized) score as a
+                # Python float -- the same value the scalar loop kept.
+                cell[(r, int(j))] = (float(sub[i_loc, j]), cands_r[i_loc])
 
     if not prim_cell and not exempt_cell:
         return {}

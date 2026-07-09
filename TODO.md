@@ -31,19 +31,62 @@ Temporary tracking file — delete when all waves land (per CLAUDE.md docs polic
 | W2-1 | Split `extract_clip_segment_ffmpeg` into plan/execute halves | A2 (met) — **done (owner-tested, committed)** |
 | W2-2 | Split `create_music_video` into `_render_lossless` / `_render_standard` + RenderContext | B1 (met) — **done (owner-tested, committed)** |
 | W2-3 | `RenderSettings` dataclass; kill the 4× settings listing and the 22-arg positional chain in gui.py | — **done (owner-tested, committed)** |
-| W2-4 | Frame guard from the encode's own stderr `frame=` counter (drop the per-segment ffprobe spawn) | A1 |
+| W2-4 | Frame guard from the encode's own stderr `frame=` counter (drop the per-segment ffprobe spawn) | A1 (met) — **done (owner-tested, committed)** |
 | W2-5 | Cold-run audio decode dedup: shared `_decoded_wav` cache for structure+stems; overlap the ebur128 pass via Popen | — **done (owner-tested, committed)** |
-| W2-6 | Extract `analyze_beats_auto` phase helpers (incl. the buried downbeat-anchor override) | C1 |
+| W2-6 | Extract `analyze_beats_auto` phase helpers (incl. the buried downbeat-anchor override) | C1 (met) — **done (owner-tested, committed)** |
 | W2-7 | TypedDict contracts (BeatFeatures / SegmentProfile / PlannedClip) + `EffectContext` dataclass | — |
-| W2-8 | Vectorize stage-6 reservation/auction sweeps (exact tie-breaks preserved) | — |
+| W2-8 | Vectorize stage-6 reservation/auction sweeps (exact tie-breaks preserved) | — **done (owner-tested, committed)** (reservations vectorized; auction loop measured slower vectorized → deliberately kept as-is) |
 | W2-9 | `OptionalBackend` protocol + shared `SidecarCache` for Qwen/YuNet/DINOv2 | — |
-| W2-10 | Stage-5: persistent executor with bounded in-flight window (no per-wave pool churn) | — |
+| W2-10 | Stage-5: persistent executor with bounded in-flight window (no per-wave pool churn) | — **done (owner-tested, committed)** |
 | W2-11 | Merge Qwen single/batch orchestration; extract the shared CPU/GPU metric-scoring formula | — |
 | W2-12 | gui.py module split; explicit ui_content imports; delete the 18 dead symbols | W2-3 |
-| W2-13 | `concatenate_videos_ffmpeg` strategy split | A2 |
+| W2-13 | `concatenate_videos_ffmpeg` strategy split | A2 (met) — **done (owner-tested, committed)** |
 | W2-14 | Low-severity sweep: bisect in text_overlay, naming/annotation fixes, `_decoded_wav` temp-dir leak | — |
 
 ## Results log
+- **Wave 2 batch 2 combined port (W2-4/6/8/10/13)**: PASS. Fresh private media,
+  sidecars warmed pre-baseline; standard: stash-baseline == patched×2, and the
+  hash equals the ORIGINAL pre-audit Wave-1 value (`130608ac…`); ProRes
+  double-run equals the original too (`a3e50024…`). Frame guards green ×4.
+  Output provably frame-identical to the code before any refactoring began.
+  Service restarted on 7860. Owner manual test passed (291-cut render, frame guard green); committed.
+- **W2-8 (stage6_av_planner.py, +78/−27)**: PASS, partial by design. Coverage
+  reservations vectorized from the exact memoized score floats with `_better`'s
+  `(-score, str(id))` + first-encounter tie semantics replicated (2.1× at
+  240 cand/190 seg; win grows with scale). The `_choose_candidate` pre-draw+
+  argmax variant was implemented, proven byte-identical, then REVERTED —
+  measured slower (stateful penalty lookups dominate; numpy overhead net
+  regression). Duo auction left alone (conditional rng draws). Plan JSON
+  byte-identical + framemd5 identical across 4 configs incl. DINOv2 semantic
+  paths live; also proven on pickled cold-cache planner inputs.
+- **W2-10 (stage5_qwen_scene_worker.py, +359/−80)**: PASS. One persistent
+  executor per video + BoundedSemaphore(slots); wave barriers/recursions
+  replaced by explicit window accounting with equivalent retry / breaker /
+  slot-halving / CLI-sweep semantics (7-scenario fake-server matrix: result
+  dicts, restart logs, attempt counts all equal to baseline; convoy proof —
+  11 items overlapped a slow item vs 3 before, 4/4 slots busy). Real Qwen
+  Tier B: cold runs OK, Qwen batch 33.3s → 26.4s, warm-cache framemd5
+  baseline == post ×3, off-path identical. New log-only error-category
+  Counter per video (audit R2).
+- **W2-4/W2-13 (ffmpeg_processing.py, +260/−179)**: PASS. Encodes already run
+  at default loglevel, so the stderr `frame=` counter is parsed with NO argv
+  change (`-progress` not needed); ffprobe remains the parse-failure fallback.
+  Census 81/81 parse==ffprobe; negative test rejects identically pre/post with
+  the same print (needed the tpad clone guard disabled driver-side — a short
+  source alone is padded by design). Guard ffprobe spawns per run: 9→1
+  (defaults), 12→1 (crossfades); the remaining 1 is the run-level assembly
+  guard (stream-copy concat has no trustworthy frame= counter — correctly
+  left ffprobe). Concat split: `_assemble_prores/_copy/_reencode` + promoted
+  audio-input helpers, assembly argv byte-identical, temp lifecycle preserved
+  in a finally. framemd5 baseline == after×2 on all three configs.
+- **W2-6 (auto_mode/__init__.py, +175/−112)**: PASS. framemd5 identical
+  baseline×2 == after×2 on full-backend AND kill-switch off-path configs;
+  31 analysis arrays bit-equal; beat_info key sets identical. Line-level diff
+  audit: all 112 removed lines reappear verbatim (pure move). New shape:
+  `_load_and_split_audio` / `_apply_downbeat_anchors` (now documented as the
+  stage-2 anchor REPLACEMENT consumed by stage-4 anchor_bonus) /
+  `_load_optional_structure_and_stems` / `_pack_beat_info`; orchestrator 173
+  lines (was ~308).
 - **Wave 2 combined port (W2-1/2/3/5 in the working tree)**: PASS. Standard
   (cpu): pre-Wave-2 baseline (via stash) == patched run1 == run2 (framemd5
   `21f2a15b…`). ProRes: patched double-run identical (`40619e0d…`; vs-original

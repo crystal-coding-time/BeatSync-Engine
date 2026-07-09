@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -1131,64 +1132,94 @@ def _generate_serial(
     return item_id, _semantic_from_text(text), ""
 
 
-def _run_inference_wave(
+def _error_category(error: str) -> str:
+    """Bucket a failed-item error string for the end-of-video Counter log."""
+    if not error:
+        return "invalid_response"
+    lowered = error.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        return "timeout"
+    if "circuit breaker" in lowered or "wedged" in lowered:
+        return "breaker_open"
+    if "not running" in lowered:
+        return "server_unavailable"
+    if "http" in lowered:
+        return "http_error"
+    return "other"
+
+
+class _TagWindow:
+    """Retry/ratio accounting unit: one 'wave' of the old wave scheduler.
+
+    The persistent-executor scheduler pipelines submissions across windows so
+    a slow item can no longer idle the other llama-server slots, but retry
+    grants, the breaker group, and the valid-ratio trigger still operate on
+    windows of `batch_size` items so the recovery semantics stay those of the
+    old wave loop.
+    """
+
+    __slots__ = ("items", "unsubmitted", "outstanding", "results", "failed", "retried")
+
+    def __init__(self, items: List[Tuple[int, Dict]]) -> None:
+        self.items = list(items)
+        self.unsubmitted: deque = deque(self.items)
+        self.outstanding = 0
+        self.results: Dict[str, Dict] = {}
+        self.failed: List[Tuple[int, Dict, str]] = []
+        self.retried = False
+
+    def unfinished_items(self) -> List[Tuple[int, Dict]]:
+        return [
+            (fallback_index, item)
+            for fallback_index, item in self.items
+            if _candidate_id(item, fallback_index) not in self.results
+        ]
+
+
+def _serial_sweep(
     client: QwenLlamaClient,
-    wave_items: List[Dict],
+    window: _TagWindow,
     prompt: str,
-    base_index: int,
-) -> Dict[str, Dict]:
-    if not wave_items:
-        return {}
+    error_counts: Counter,
+) -> List[Tuple[int, Dict, str]]:
+    """No-llama-server path: one llama-mtmd-cli attempt per failed item."""
+    still_failed: List[Tuple[int, Dict, str]] = []
+    for fallback_index, item, _error in window.failed:
+        item_id, semantic, error = _generate_serial(client, item, prompt, fallback_index)
+        if semantic:
+            window.results[item_id] = semantic
+        else:
+            error_counts[_error_category(error)] += 1
+            still_failed.append((fallback_index, item, error))
+    return still_failed
 
-    semantics: Dict[str, Dict] = {}
-    failed: List[Tuple[int, Dict, str]] = []
-    server = client.server
-    concurrency = max(1, int(client.batch_size or 1))
 
-    if server and concurrency > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            future_to_item = {
-                executor.submit(_generate_with_server, client, item, prompt, base_index + offset): (offset, item)
-                for offset, item in enumerate(wave_items, 1)
-            }
-            for future in concurrent.futures.as_completed(future_to_item):
-                offset, item = future_to_item[future]
-                try:
-                    item_id, semantic, error = future.result()
-                except Exception as exc:
-                    item_id, semantic, error = _candidate_id(item, base_index + offset), {}, str(exc)
-                if semantic:
-                    semantics[item_id] = semantic
-                else:
-                    failed.append((offset, item, error))
-    else:
-        for offset, item in enumerate(wave_items, 1):
-            item_id, semantic, error = _generate_serial(client, item, prompt, base_index + offset)
-            if semantic:
-                semantics[item_id] = semantic
-            else:
-                failed.append((offset, item, error))
+def _serial_tag_item(
+    client: QwenLlamaClient,
+    fallback_index: int,
+    item: Dict,
+    prompt: str,
+    error_counts: Counter,
+) -> Tuple[Dict[str, Dict], bool]:
+    """One item through the old serial wave-of-one logic (batch size 1 / CLI).
 
-    if failed and client.server and not client.breaker.at_threshold():
-        retry_failed: List[Tuple[int, Dict, str]] = []
-        for offset, item, _error in failed:
-            item_id, semantic, error = _generate_with_server(client, item, prompt, base_index + offset)
-            if semantic:
-                semantics[item_id] = semantic
-            else:
-                retry_failed.append((offset, item, error))
-        failed = retry_failed
+    Returns ({item_id: semantic} or {}, requeue): requeue means the breaker's
+    one-shot server restart succeeded and the item must be re-run. Raises
+    ServerWedgedError when the breaker trips for good.
+    """
+    item_id, semantic, error = _generate_serial(client, item, prompt, fallback_index)
+    if semantic:
+        return {item_id: semantic}, False
+    error_counts[_error_category(error)] += 1
 
-    # Circuit breaker: consecutive request timeouts mean the server accepts
-    # work but never finishes it (2026-07-07 incident). Allow exactly one
-    # restart, then abort the whole tagging run with partial results. This
-    # runs BEFORE the reduced-slot retry below so a wedged server cannot
-    # ping-pong through slot-halving restarts.
-    if failed and client.breaker.at_threshold():
+    if client.server and not client.breaker.at_threshold():
+        item_id, semantic, error = _generate_with_server(client, item, prompt, fallback_index)
+        if semantic:
+            return {item_id: semantic}, False
+        error_counts[_error_category(error)] += 1
+
+    if client.breaker.at_threshold():
         if client.server and client.breaker.consume_restart():
-            # Restart at reduced slots: a SIGTERM-ignoring wedged server gets
-            # SIGKILLed by close(), and the fresh instance retries the failed
-            # items with less concurrency before the breaker gives up.
             reduced_slots = max(1, int(client.batch_size or 1) // 2)
             print(
                 f"Qwen watchdog: {client.breaker.threshold} consecutive request timeouts; "
@@ -1197,9 +1228,7 @@ def _run_inference_wave(
             )
             if client.restart_server_with_slots(reduced_slots):
                 client.breaker.reset_after_restart()
-                retry_items = [item for _offset, item, _error in failed]
-                semantics.update(_run_inference_wave(client, retry_items, prompt, base_index))
-                return semantics
+                return {}, True
         client.breaker.trip()
         client.close()
         print(
@@ -1209,23 +1238,273 @@ def _run_inference_wave(
         )
         raise ServerWedgedError("llama-server wedged: consecutive request timeouts")
 
-    valid_ratio = len(semantics) / max(1, len(wave_items))
-    if failed and client.server and client.batch_size > 1 and valid_ratio < 0.70:
-        reduced_slots = max(1, int(client.batch_size) // 2)
+    if not client.server:
+        item_id, semantic, error = _generate_serial(client, item, prompt, fallback_index)
+        if semantic:
+            return {item_id: semantic}, False
+        error_counts[_error_category(error)] += 1
+    return {}, False
+
+
+def _run_concurrent_phase(
+    client: QwenLlamaClient,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    pending_items: deque,
+    pending_groups: deque,
+    prompt: str,
+    semantics: Dict[str, Dict],
+    error_counts: Counter,
+    progress: Dict[str, int],
+    report,
+) -> None:
+    """Run queued items at the current slot count until done or a restart.
+
+    Submission is continuous: a BoundedSemaphore sized to the slot count is
+    acquired before each submit and released as each request finishes, so the
+    server always has work without unbounded queueing (the old code had a
+    hard barrier after every `batch_size` items). Returns normally when every
+    queued item is finalized, or after a breaker/ratio server restart with
+    the re-queued work left on pending_items/pending_groups for the caller's
+    loop (this loop replaces the old recursion). Raises ServerWedgedError
+    when the breaker trips for good.
+    """
+    concurrency = max(1, int(client.batch_size or 1))
+    sem = threading.BoundedSemaphore(concurrency)
+    in_flight: Dict[concurrent.futures.Future, Tuple[_TagWindow, int, Dict]] = {}
+    retry_queue: deque = deque()
+    open_windows: List[_TagWindow] = []
+    breaker_windows: List[_TagWindow] = []
+    halve_windows: List[_TagWindow] = []
+    fill_state: Dict[str, _TagWindow | None] = {"window": None}
+    stop = {"new_submissions": False}
+
+    def _next_submission():
+        if retry_queue:
+            return retry_queue.popleft()
+        window = fill_state["window"]
+        if window is None or not window.unsubmitted:
+            if pending_groups:
+                window = _TagWindow(pending_groups.popleft())
+            elif pending_items:
+                window = _TagWindow([
+                    pending_items.popleft()
+                    for _ in range(min(concurrency, len(pending_items)))
+                ])
+            else:
+                return None
+            open_windows.append(window)
+            fill_state["window"] = window
+        fallback_index, item = window.unsubmitted.popleft()
+        return window, fallback_index, item
+
+    def _submit(window: _TagWindow, fallback_index: int, item: Dict) -> None:
+        window.outstanding += 1
+
+        def _task():
+            try:
+                return _generate_with_server(client, item, prompt, fallback_index)
+            finally:
+                sem.release()
+
+        in_flight[executor.submit(_task)] = (window, fallback_index, item)
+
+    def _evaluate(window: _TagWindow) -> None:
+        # First round done: grant the single per-item retry under the same
+        # condition the old wave scheduler checked at wave end.
+        if window.failed and not window.retried:
+            window.retried = True
+            if client.server and not client.breaker.at_threshold():
+                retries, window.failed = window.failed, []
+                for fallback_index, item, _error in retries:
+                    retry_queue.append((window, fallback_index, item))
+                return
+        open_windows.remove(window)
+        # Same evaluation order as the old wave: breaker group first so a
+        # wedged server cannot ping-pong through slot-halving restarts.
+        if window.failed and client.breaker.at_threshold():
+            breaker_windows.append(window)
+            stop["new_submissions"] = True
+            return
+        valid_ratio = len(window.results) / max(1, len(window.items))
+        if window.failed and client.server and client.batch_size > 1 and valid_ratio < 0.70:
+            halve_windows.append(window)
+            stop["new_submissions"] = True
+            return
+        if window.failed and not client.server:
+            window.failed = _serial_sweep(client, window, prompt, error_counts)
+        report(len(window.items), window.results)
+
+    while True:
+        while not stop["new_submissions"]:
+            if not sem.acquire(blocking=False):
+                break
+            submission = _next_submission()
+            if submission is None:
+                sem.release()
+                break
+            _submit(*submission)
+        if not in_flight:
+            break
+        done, _ = concurrent.futures.wait(
+            set(in_flight), return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        for future in done:
+            window, fallback_index, item = in_flight.pop(future)
+            try:
+                item_id, semantic, error = future.result()
+            except Exception as exc:  # defensive: _generate_with_server catches
+                item_id, semantic, error = _candidate_id(item, fallback_index), {}, str(exc)
+            window.outstanding -= 1
+            if semantic:
+                window.results[item_id] = semantic
+            else:
+                error_counts[_error_category(error)] += 1
+                window.failed.append((fallback_index, item, error))
+            if (
+                window.outstanding == 0
+                and not window.unsubmitted
+                and not any(entry[0] is window for entry in retry_queue)
+            ):
+                _evaluate(window)
+
+    if not breaker_windows and not halve_windows:
+        return  # every queued item finalized at this slot count
+
+    # A restart is needed and in-flight work is drained. Windows interrupted
+    # mid-round keep their successes and re-queue the rest; the old scheduler
+    # had not started those items yet, and generation is deterministic per
+    # candidate, so the outcome is the same either way.
+    interrupted = list(open_windows)
+    open_windows.clear()
+    retry_queue.clear()
+
+    def _commit_and_requeue_interrupted() -> None:
+        for window in reversed(interrupted):
+            semantics.update(window.results)
+            progress["finalized"] += len(window.results)
+            for pair in reversed(window.unfinished_items()):
+                pending_items.appendleft(pair)
+
+    if breaker_windows:
+        # Old step order preserved: one restart at half slots, re-queue the
+        # unfinished items (successes kept, like the old recursion on the
+        # failed list); a second threshold event trips for good.
+        if client.server and client.breaker.consume_restart():
+            reduced_slots = max(1, int(client.batch_size or 1) // 2)
+            print(
+                f"Qwen watchdog: {client.breaker.threshold} consecutive request timeouts; "
+                f"restarting llama-server once with {reduced_slots} slot(s) before giving up",
+                flush=True,
+            )
+            if client.restart_server_with_slots(reduced_slots):
+                client.breaker.reset_after_restart()
+                _commit_and_requeue_interrupted()
+                for window in reversed(halve_windows):
+                    # Piggyback on the breaker restart's slot reduction.
+                    pending_groups.appendleft(list(window.items))
+                for window in reversed(breaker_windows):
+                    semantics.update(window.results)
+                    progress["finalized"] += len(window.results)
+                    pending_groups.appendleft([
+                        (fallback_index, item)
+                        for fallback_index, item, _error in window.failed
+                    ])
+                return
+        client.breaker.trip()
+        client.close()
         print(
-            f"Qwen llama.cpp wave valid ratio {valid_ratio:.0%}; retrying with {reduced_slots} slots",
+            "Qwen watchdog: llama-server is wedged (accepts requests but never completes them); "
+            "aborting semantic tagging with partial results",
             flush=True,
         )
-        if client.restart_server_with_slots(reduced_slots):
-            return _run_inference_wave(client, wave_items, prompt, base_index)
+        raise ServerWedgedError("llama-server wedged: consecutive request timeouts")
 
-    if failed and not client.server:
-        for offset, item, _error in failed:
-            item_id, semantic, _error = _generate_serial(client, item, prompt, base_index + offset)
-            if semantic:
-                semantics[item_id] = semantic
+    trigger = halve_windows[0]
+    valid_ratio = len(trigger.results) / max(1, len(trigger.items))
+    reduced_slots = max(1, int(client.batch_size) // 2)
+    print(
+        f"Qwen llama.cpp wave valid ratio {valid_ratio:.0%}; retrying with {reduced_slots} slots",
+        flush=True,
+    )
+    if client.restart_server_with_slots(reduced_slots):
+        _commit_and_requeue_interrupted()
+        for window in reversed(halve_windows):
+            # Re-run the whole window; the old recursion also recomputed the
+            # window's successes after a ratio restart.
+            pending_groups.appendleft(list(window.items))
+        return
+    # Restart failed: the client already fell back to llama-mtmd-cli. The old
+    # code kept the wave's successes and swept its failures serially once.
+    _commit_and_requeue_interrupted()
+    for window in halve_windows:
+        window.failed = _serial_sweep(client, window, prompt, error_counts)
+        report(len(window.items), window.results)
 
-    return semantics
+
+def _run_inference_windowed(
+    client: QwenLlamaClient,
+    frame_items: List[Dict],
+    prompt: str,
+    semantics: Dict[str, Dict],
+    error_counts: Counter,
+    progress: Dict[str, int],
+) -> None:
+    """Tag every candidate frame using one persistent executor per video.
+
+    Replaces the old wave loop (a fresh ThreadPoolExecutor and a hard barrier
+    every `batch_size` items). Scheduling changed; results are keyed by
+    candidate id so completion order cannot affect the response JSON, and all
+    recovery machinery keeps its old wave-level semantics via _TagWindow
+    groups (see _run_concurrent_phase). Finalized tags are written straight
+    into `semantics` so a breaker trip still returns partial results.
+    """
+    total = len(frame_items)
+    started = time.perf_counter()
+    pending_items: deque = deque(enumerate(frame_items, 1))
+    pending_groups: deque = deque()
+    executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+    def _report(finalized_count: int, results: Dict[str, Dict]) -> None:
+        semantics.update(results)
+        progress["finalized"] += finalized_count
+        elapsed = max(0.001, time.perf_counter() - started)
+        print(
+            f"Qwen llama.cpp tagged {progress['finalized']}/{total} "
+            f"({progress['finalized'] / elapsed:.2f}/s, batch {client.batch_size})",
+            flush=True,
+        )
+
+    try:
+        while pending_items or pending_groups:
+            concurrency = max(1, int(client.batch_size or 1))
+            if client.server and concurrency > 1:
+                if executor is None:
+                    # Sized once at the video's initial slot count; restarts
+                    # only ever reduce slots and the per-phase semaphore is
+                    # the actual in-flight bound, so spare threads just idle.
+                    executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=concurrency
+                    )
+                _run_concurrent_phase(
+                    client, executor, pending_items, pending_groups, prompt,
+                    semantics, error_counts, progress, _report,
+                )
+            else:
+                if pending_groups:
+                    regrouped = [pair for group in pending_groups for pair in group]
+                    pending_groups.clear()
+                    pending_items.extendleft(reversed(regrouped))
+                fallback_index, item = pending_items.popleft()
+                results, requeue = _serial_tag_item(
+                    client, fallback_index, item, prompt, error_counts
+                )
+                if requeue:
+                    pending_items.appendleft((fallback_index, item))
+                    continue
+                _report(1, results)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
 
 def _run_semantics_for_video(
@@ -1254,25 +1533,17 @@ def _run_semantics_for_video(
         timings["prefetch_seconds"] = time.perf_counter() - prefetch_started
         timings["frame_count"] = len(frame_items)
         inference_started = time.perf_counter()
-        idx = 0
+        error_counts: Counter = Counter()
+        progress = {"finalized": 0}
         try:
-            while idx < len(frame_items):
-                wave_size = max(1, int(client.batch_size or 1))
-                wave_items = frame_items[idx:idx + wave_size]
-                semantics.update(_run_inference_wave(client, wave_items, prompt, idx))
-                idx += len(wave_items)
-                elapsed = max(0.001, time.perf_counter() - inference_started)
-                rate = idx / elapsed
-                print(
-                    f"Qwen llama.cpp tagged {idx}/{len(frame_items)} "
-                    f"({rate:.2f}/s, batch {client.batch_size})",
-                    flush=True,
-                )
+            _run_inference_windowed(
+                client, frame_items, prompt, semantics, error_counts, progress
+            )
         except ServerWedgedError:
             timings["wedged"] = True
             print(
-                f"Qwen watchdog: skipping {len(frame_items) - idx} remaining candidates "
-                "for this video (server wedged)",
+                f"Qwen watchdog: skipping {len(frame_items) - progress['finalized']} "
+                "remaining candidates for this video (server wedged)",
                 flush=True,
             )
         elapsed = max(0.001, time.perf_counter() - inference_started)
@@ -1283,6 +1554,14 @@ def _run_semantics_for_video(
             f"in {elapsed:.1f}s ({len(frame_items) / elapsed:.2f} candidates/s)",
             flush=True,
         )
+        if error_counts:
+            # Surface the previously-dropped per-failure error strings as one
+            # line of categories (log-only; audit finding R2).
+            print(
+                "Qwen tagging errors by category: "
+                + ", ".join(f"{name}={count}" for name, count in error_counts.most_common()),
+                flush=True,
+            )
     finally:
         cap.release()
     return semantics, timings
