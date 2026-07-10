@@ -13,4 +13,10 @@ export PYTHONPATH="$PWD/src"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONIOENCODING=utf-8
 
+# Default to the beat-this transformer for beat AND downbeat tracking (cuts
+# land on real bar lines). Respects a user-set value; the ~8 MB small0
+# checkpoint auto-downloads on first use, and any failure falls back to
+# librosa automatically. Export BEATSYNC_BEAT_BACKEND=librosa to opt out.
+export BEATSYNC_BEAT_BACKEND="${BEATSYNC_BEAT_BACKEND:-beat_this}"
+
 exec .venv/bin/python src/gui.py "$@"

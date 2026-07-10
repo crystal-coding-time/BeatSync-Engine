@@ -407,6 +407,16 @@ def create_clip_parallel(job: ClipJob):
             video_file = planned_clip.get('video_file') or video_file
             video_duration = get_cached_video_duration(video_file)
             retime = planned_clip.get('retime')
+            if retime and extend_frames:
+                # Belt-and-braces (mirrors the partner strip below): crossfade
+                # selection excludes retimed boundaries, so this is unreachable
+                # today — but a retimed A-side's extend window would be added in
+                # output-clock seconds while the retime consumes speed× source,
+                # clone-freezing the tail mid-dissolve. Drop the extend, keep
+                # the retime.
+                print(f"   ⚠️  Crossfade extend dropped for clip {i + 1}: retimed segments never extend")
+                extend_frames = 0
+                extend_secs = 0.0
             if retime:
                 # Retime windows keep the plan's value (gated >= 0.6s upstream,
                 # so the planner's 0.05s floor never actually engages here).
@@ -958,7 +968,11 @@ def _plan_visuals(ctx: RenderContext) -> None:
         beat_info=beat_info,
         video_files=video_files,
         variety=variety,
-        semantic_variety=semantic_variety,
+        # Nulled in ProRes: the session analysis cache shares candidate dicts
+        # by reference, so a prior H.264 render may already have annotated them
+        # with embedding/visual_cluster keys — without this, a same-session
+        # ProRes plan would pick up semantic penalties a fresh session wouldn't.
+        semantic_variety=0.0 if lossless_mode else semantic_variety,
         speed_ramps=speed_ramps,
         lossless=lossless_mode,
         fps=fps,

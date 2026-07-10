@@ -51,7 +51,12 @@ EMBED_DIM = 384
 QUANT_DECIMALS = 4  # L2-normalize, then round each component to this many dp
 
 # Bump when preprocessing changes so stale sidecar caches recompute.
-PREPROC_VERSION = "dino_preproc_v1"
+# v2: 3 frames per window (25%/50%/75% of the window) mean-pooled, so a single
+# transition/black center frame can no longer poison the embedding.
+PREPROC_VERSION = "dino_preproc_v2_3frame"
+
+# Fractions of the window duration at which frames are sampled and pooled.
+_FRAME_FRACTIONS = (0.25, 0.50, 0.75)
 
 # Same cache directory video_analysis uses (input/video_analysis_cache), but the
 # sidecar filenames carry a distinct ``_dino`` suffix and their own signature, so
@@ -293,8 +298,9 @@ def _preprocess(frame_bgr: np.ndarray) -> np.ndarray:
     return np.expand_dims(chw, 0).astype(np.float32)
 
 
-def _embed_frame(session, input_name: str, frame_bgr: np.ndarray) -> List[float] | None:
-    """Return the L2-normalized, 4dp-rounded 384-d embedding for one frame."""
+def _embed_frame_raw(session, input_name: str, frame_bgr: np.ndarray) -> np.ndarray | None:
+    """Return the L2-unit-normalized float64 384-d embedding for one frame
+    (unquantized — quantization happens once, after pooling)."""
     try:
         tensor = _preprocess(frame_bgr)
         out = session.run(None, {input_name: tensor})[0]
@@ -306,7 +312,20 @@ def _embed_frame(session, input_name: str, frame_bgr: np.ndarray) -> List[float]
     norm = float(np.linalg.norm(vec))
     if norm <= 0.0 or not math.isfinite(norm):
         return None
-    unit = vec / norm
+    return vec / norm
+
+
+def _pool_embeddings(vecs: List[np.ndarray]) -> List[float] | None:
+    """Mean-pool unit vectors in float64, L2-renormalize, round to 4dp.
+    The 4dp rounding is the determinism firewall: only the quantized pooled
+    vector is ever stored or compared, so ONNX float jitter cannot leak out."""
+    if not vecs:
+        return None
+    mean = np.mean(np.stack(vecs), axis=0, dtype=np.float64)
+    norm = float(np.linalg.norm(mean))
+    if norm <= 0.0 or not math.isfinite(norm):
+        return None
+    unit = mean / norm
     return [round(float(x), QUANT_DECIMALS) for x in unit]
 
 
@@ -472,15 +491,17 @@ def annotate_candidates_with_embeddings(
         cache = _load_sidecar(cache_path, signature)
         cache_dirty = False
 
-        # Attach the per-candidate window key and center time up front.
+        # Attach the per-candidate window key and sampled frame times up front.
+        # Three frames per window (25/50/75% of the duration) — for zero-length
+        # windows / stills all three collapse to the same time, so the sorted
+        # de-duplicated tuple holds a single entry (one decode).
         planned = []
         for cand in group:
             start = float(cand.get("start", 0.0))
             end = float(cand.get("end", start))
-            center = cand.get("center")
-            if center is None:
-                center = start + max(0.0, end - start) * 0.5
-            planned.append((cand, _window_key(start, end), float(center)))
+            duration = max(0.0, end - start)
+            frame_times = tuple(sorted({start + duration * f for f in _FRAME_FRACTIONS}))
+            planned.append((cand, _window_key(start, end), frame_times))
 
         # Anything not in cache needs a real decode; only open the capture then.
         need_decode = [p for p in planned if p[1] not in cache]
@@ -491,26 +512,36 @@ def annotate_candidates_with_embeddings(
                 cap.release()
                 cap = None
 
-        # Decode in ascending center time so a single forward pass over the file
-        # keeps seeks cheap.
-        for cand, wkey, center in sorted(need_decode, key=lambda p: p[2]):
-            if cap is None:
-                continue
-            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, center) * 1000.0)
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                continue
-            vec = _embed_frame(session, input_name, frame)
-            if vec is None:
-                continue
-            cache[wkey] = vec
-            cache_dirty = True
+        # Decode every needed frame time in one ascending pass over the file so
+        # seeks stay cheap; identical times (overlapping windows, stills) are
+        # decoded and embedded exactly once.
+        frame_vecs: Dict[float, np.ndarray] = {}
+        if cap is not None:
+            all_times = sorted({t for _cand, _wkey, times in need_decode for t in times})
+            for t in all_times:
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t) * 1000.0)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                vec = _embed_frame_raw(session, input_name, frame)
+                if vec is not None:
+                    frame_vecs[t] = vec
 
         if cap is not None:
             cap.release()
 
+        # Pool the successful per-frame embeddings for each window; at least one
+        # good frame → an embedding, zero → no keys (exactly like a failed
+        # single-frame decode before).
+        for cand, wkey, times in need_decode:
+            pooled = _pool_embeddings([frame_vecs[t] for t in times if t in frame_vecs])
+            if pooled is None:
+                continue
+            cache[wkey] = pooled
+            cache_dirty = True
+
         # Assign embeddings (from cache or freshly decoded) to candidates.
-        for cand, wkey, _center in planned:
+        for cand, wkey, _times in planned:
             vec = cache.get(wkey)
             if vec is None:
                 stats["skipped"] += 1

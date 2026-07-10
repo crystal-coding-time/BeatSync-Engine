@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stage 2: beat-synchronous energy wave and rhythm feature extraction."""
 
+import os
 import re
 import subprocess
 from typing import Dict, Optional, Tuple
@@ -92,11 +93,6 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
     hihat_thr = _safe_percentile(hihat, 82, 0.72)
     bass_thr = _safe_percentile(bass, 74, 0.68)
 
-    is_phrase_anchor = np.zeros(len(beat_times), dtype=bool)
-    is_bar_anchor = np.zeros(len(beat_times), dtype=bool)
-    is_phrase_anchor[::max(1, cfg.phrase_beats)] = True
-    is_bar_anchor[::max(1, cfg.bar_beats)] = True
-
     # Wave-13: three extra per-beat features consumed by stage4 scoring and
     # stage6 planning. Each is ALWAYS present (zero-filled + ⚠️ on any failure),
     # deterministic (pure librosa/numpy or a deterministic ffmpeg parse), and
@@ -122,9 +118,29 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
         onset_superflux = np.zeros(len(beat_times), dtype=float)
 
     # Harmonic change (HCDF): tonnetz-distance between adjacent frames.
+    # (Computed before the bar/phrase anchors below because the downbeat-phase
+    # estimate consumes it; nothing between the old anchor spot and here reads
+    # the anchors, so the reorder is value-identical.)
     harmonic_change = compute_harmonic_change(
         y_harmonic if y_harmonic is not None else y, sr, beat_times, cfg
     )
+
+    # Bar/phrase anchors on the librosa path. Historically these started at
+    # beat 0 ([::4]/[::8]), which assumes beat 0 is a bar line — wrong for most
+    # songs, and these anchors carry the largest cut-scoring bonuses in stage 4.
+    # estimate_downbeat_phase() picks the most salient of the 4 possible bar
+    # phases instead. BEATSYNC_DOWNBEAT_PHASE=off (or 0) restores the old
+    # beat-0 grid byte-identically. When the beat_this backend supplies real
+    # downbeats, _apply_downbeat_anchors overwrites these anchors either way.
+    phase = 0
+    if os.environ.get("BEATSYNC_DOWNBEAT_PHASE", "on").strip().lower() not in ("off", "0"):
+        phase = estimate_downbeat_phase(kick, bass, harmonic_change,
+                                        bar_beats=max(1, cfg.bar_beats))
+        print(f"      ✓ Downbeat phase estimate: beat {phase} of {max(1, cfg.bar_beats)} starts the bar grid")
+    is_phrase_anchor = np.zeros(len(beat_times), dtype=bool)
+    is_bar_anchor = np.zeros(len(beat_times), dtype=bool)
+    is_phrase_anchor[phase::max(1, cfg.phrase_beats)] = True
+    is_bar_anchor[phase::max(1, cfg.bar_beats)] = True
 
     # EBU R128 momentary loudness at each beat (deterministic ffmpeg parse).
     loudness = compute_loudness(audio_file, start_time, duration, beat_times,
@@ -164,6 +180,21 @@ def analyze_wave_features(y: np.ndarray, y_percussive: np.ndarray, sr: int,
         "harmonic_change": harmonic_change,
         "loudness": loudness,
     }
+
+
+def estimate_downbeat_phase(kick: np.ndarray, bass: np.ndarray,
+                            harmonic_change: np.ndarray, bar_beats: int = 4) -> int:
+    """Estimate which beat index (0..bar_beats-1) the bar lines fall on.
+
+    Downbeats tend to carry the strongest kick/bass hits and the chord changes,
+    so score each of the ``bar_beats`` possible phases by the mean salience of
+    its every-``bar_beats``-th beat and take the best. Pure numpy over per-beat
+    arrays -> deterministic; np.argmax resolves ties to the lowest phase.
+    """
+    salience = 0.45 * kick + 0.30 * bass + 0.25 * harmonic_change
+    scores = [float(np.mean(salience[p::bar_beats])) if len(salience) > p else 0.0
+              for p in range(bar_beats)]
+    return int(np.argmax(scores))
 
 
 def compute_harmonic_change(y_harmonic: np.ndarray, sr: int, beat_times: np.ndarray,

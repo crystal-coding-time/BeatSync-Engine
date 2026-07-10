@@ -35,17 +35,37 @@ def _stable_rng(*parts) -> random.Random:
     return random.Random(seed)
 
 
+def _segment_energy(profile: SegmentProfile) -> float:
+    """Quantized cross-modal energy of a segment (wave 16), in [0, 1].
+
+    Blends the three audio intensity signals a profile always carries
+    (loudness dominant, wave for the sustained envelope, impact for the hit)
+    into one number `_score_candidate` matches clip kinetics against. The 2dp
+    round is the determinism firewall: this value enters `_ScoreCache` keys,
+    the coverage-reservation column dedup, and score comparisons, so it must
+    be an exact, platform-stable float. This helper is the single authority —
+    every consumer calls it rather than re-deriving the blend.
+    """
+    return round(0.5 * _clamp(profile.get("loudness", 0.5), default=0.5)
+                 + 0.3 * _clamp(profile.get("wave", 0.5), default=0.5)
+                 + 0.2 * _clamp(profile.get("impact", 0.5), default=0.5), 2)
+
+
 class _ScoreCache:
     """Per-run memo for ``_score_candidate(candidate, profile)``.
 
-    ``_score_candidate`` reads exactly one field off ``profile`` --
-    ``profile.get("target", "flow")`` -- everything else it uses comes from
-    ``candidate``. So its result only varies along two axes: which candidate,
-    and which target. This class memoizes on those two axes for a single
+    ``_score_candidate`` depends on ``profile`` through exactly two derived
+    values: ``profile.get("target", "flow")`` and (since wave 16) the
+    2dp-quantized segment energy ``_segment_energy(profile)`` — everything
+    else it uses comes from ``candidate``. So its result only varies along
+    three axes: which candidate, which target, and which quantized energy.
+    This class memoizes on those axes for a single
     ``build_planned_clip_sequence()`` run, so the O(candidates x segments)
     scoring the auction, coverage-reservation, duo-partner and materialize
     call sites all did independently collapses to O(candidates x distinct
-    targets) real evaluations (5 targets: drop/soft/build/rhythm/flow).
+    (target, energy) pairs) real evaluations — energy is on a 0.01 grid, so
+    the pair count stays small. If ``_score_candidate`` ever grows another
+    profile input, it must be quantized and added to this key.
 
     Candidates are plain dicts drawn, by reference, from one shared
     ``candidates`` list for the whole run -- no call site copies a candidate
@@ -63,11 +83,14 @@ class _ScoreCache:
 
     def score(self, candidate: Dict, profile: Dict) -> float:
         target = profile.get("target", "flow")
+        # Same quantized energy _score_candidate computes — 2dp rounding is
+        # what makes it a safe dict key (exact float, no drift).
+        e_seg = _segment_energy(profile)
         idx = self._index_of.get(id(candidate))
-        key = (idx, target)
+        key = (idx, target, e_seg)
         if key not in self._scores:
-            # Call the real scorer once per (candidate, target) -- never
-            # reimplement its math here.
+            # Call the real scorer once per (candidate, target, energy) --
+            # never reimplement its math here.
             self._scores[key] = _score_candidate(candidate, profile)
         return self._scores[key]
 
@@ -148,25 +171,36 @@ def build_planned_clip_sequence(
     Returns an empty list when no visual library is present, which tells the
     renderer to keep its old fallback sampling.
 
-    variety=0 is the exact legacy quality auction (no coverage guarantee —
-    weak sources can lose every pick). Any variety>0 reserves one segment per
-    source so everything the user uploaded appears at least once, and applies
-    proportional-fair usage pressure that pushes over-used sources toward an
-    even spread at 1.0.
+    variety=0 keeps the legacy quality-auction STRUCTURE (no coverage
+    guarantee — weak sources can lose every pick), though wave-16 rebalanced
+    the scores it ranks (see PLAN STABILITY below). Any variety>0 reserves one
+    segment per source so every upload with usable candidates appears at least
+    once, and applies proportional-fair usage pressure that pushes over-used
+    sources toward an even spread at 1.0.
 
     PLAN STABILITY / SLIDER SEMANTICS
-      * variety=0 AND semantic_variety=0 (AND split_screen=False) reproduce the
-        pre-wave-12 plan byte-for-byte — the legacy quality auction, untouched.
-        The mere PRESENCE of ``embedding`` / ``visual_cluster`` keys on
-        candidates changes nothing at semantic_variety=0.
-      * variety>0 plans CHANGE vs. wave 11 (accepted, deliberate): the linear,
-        capped ``file_rate`` reuse penalty is replaced by an EWMA
+      * Wave-16 scoring rebalance (accepted, deliberate — same precedent as
+        the wave-12 and wave-15 redesigns below): ``_score_candidate`` now
+        (a) scores untagged (non-``ai_analyzed``) candidates on drop segments
+        from measured signals instead of the fabricated combat/chase/explosion
+        placeholders, and (b) adds a continuous cross-modal energy-matching
+        term (clip kinetics vs. the segment's quantized ``_segment_energy``)
+        to EVERY score. ALL plans change vs. wave 15, INCLUDING variety=0 —
+        the pre-wave-12 byte-for-byte claim for the legacy auction no longer
+        holds, and there is no kill switch. Only the no-candidates path (no
+        video analysis at all → empty list → renderer fallback) is untouched.
+      * The mere PRESENCE of ``embedding`` / ``visual_cluster`` keys on
+        candidates still changes nothing at semantic_variety=0.
+      * variety>0 plans CHANGED vs. wave 11 (accepted, deliberate): the
+        linear, capped ``file_rate`` reuse penalty is replaced by an EWMA
         proportional-fair pressure term (``_FairShareEWMA``). The old formula
         scaled ``file_rate`` linearly and uncapped it, which late in long
         videos swamped content scores and degenerated to score-blind
         round-robin; PF instead penalizes only sources running ABOVE their fair
         share (``share * source_count > 1``), so content ordering survives. The
-        variety slider's meaning is redesigned; variety=0 is unchanged.
+        variety slider's meaning is redesigned; variety=0 keeps the legacy
+        auction STRUCTURE (no reservations, linear file penalty) even though
+        wave-16 rebalanced the scores it ranks.
 
     semantic_variety (0..1, needs candidate ``embedding``/``visual_cluster``
     keys from src/visual_embeddings.py — both OPTIONAL, missing → no penalty)
@@ -175,8 +209,9 @@ def build_planned_clip_sequence(
     embeddings. semantic_variety=0 short-circuits the whole feature (no deque
     bookkeeping, no embedding arithmetic) so it cannot perturb legacy plans.
 
-    split_screen=False (the default) produces byte-identical plans to the
-    pre-duo planner. When True, some eligible drop/rhythm segments gain an
+    split_screen=False (the default) adds nothing on top of the plan the
+    other settings produce (no partner keys, no extra usage accounting).
+    When True, some eligible drop/rhythm segments gain an
     additive "partner" dict (a second, cross-orientation source for a 2-up
     pane composite); everything else about the plan is unchanged apart from
     the partner's usage accounting. target_size is the output canvas
@@ -319,7 +354,11 @@ def build_planned_clip_sequence(
                              embed_arrays)
         if partner_candidate is not None:
             # A pane appearance is an appearance: the partner pays the same
-            # reuse/recency costs going forward and counts for coverage.
+            # usage / file-recency / PF / semantic costs going forward and
+            # counts for coverage. Its id deliberately does NOT enter
+            # recent_ids — appending would evict primary ids from the
+            # maxlen-10 window faster; a partner only dodges the -0.28
+            # id-recency penalty, not the rest.
             recent_videos.append(partner_candidate.get("video_file"))
             usage[partner_candidate.get("id")] += 1
             usage[partner_candidate.get("video_file")] += 1
@@ -474,8 +513,9 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
     PLAN STABILITY (wave-15 change, deliberate — same precedent as the wave-12
     proportional-fair redesign): variety>0 plans CHANGE, because reservation
     seating is now globally optimal rather than greedy. variety=0 never calls
-    this function (no reservations), so the legacy quality auction stays
-    byte-for-byte identical.
+    this function (no reservations); note however that the wave-16 scoring
+    rebalance in ``_score_candidate`` changes ALL plans, variety=0 included —
+    see ``build_planned_clip_sequence``'s PLAN STABILITY notes.
 
     Preserved semantics vs. greedy:
       * The per-(source, segment) seat score is identical, including the
@@ -555,24 +595,30 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
 
     # --- W2-8 vectorized seat scoring. ------------------------------------
     # The (candidate, segment) score matrix is assembled FROM the exact
-    # floats `_score` returns -- `_score_candidate` reads only the profile's
-    # target, so one real call per (candidate, distinct target) covers every
-    # (candidate, segment) pair, exactly like the memoized sweep did. The
-    # only arithmetic applied on top is the same short-candidate `- 0.18`
-    # and the same `best_raw - 0.35` exemption threshold, as float64 ops
-    # bit-identical to the scalar originals. Never re-derive score math here.
+    # floats `_score` returns -- `_score_candidate` reads the profile only
+    # through its target and (wave 16) its 2dp-quantized `_segment_energy`,
+    # so one real call per (candidate, distinct (target, energy) pair) covers
+    # every (candidate, segment) pair, exactly like the memoized sweep did.
+    # Deduping on target alone would smear one segment's energy score onto
+    # every same-target segment -- the representative-column key MUST match
+    # `_ScoreCache`'s profile axes. The only arithmetic applied on top is the
+    # same short-candidate `- 0.18` and the same `best_raw - 0.35` exemption
+    # threshold, as float64 ops bit-identical to the scalar originals. Never
+    # re-derive score math here.
     targets = [p.get("target", "flow") for p in profiles]
-    tcol: Dict[str, int] = {}
+    energies = [_segment_energy(p) for p in profiles]
+    tcol: Dict[tuple, int] = {}
     rep_profiles: List[Dict] = []
-    for p, t in zip(profiles, targets):
-        if t not in tcol:
-            tcol[t] = len(rep_profiles)
+    for p, t, e in zip(profiles, targets, energies):
+        if (t, e) not in tcol:
+            tcol[(t, e)] = len(rep_profiles)
             rep_profiles.append(p)
     S = np.empty((n_cand, len(rep_profiles)), dtype=np.float64)
     for k, p in enumerate(rep_profiles):
         for i, c in enumerate(candidates):
             S[i, k] = _score(c, p)
-    col = np.array([tcol[t] for t in targets], dtype=np.intp)
+    col = np.array([tcol[(t, e)] for t, e in zip(targets, energies)],
+                   dtype=np.intp)
     M = S[:, col]                            # (n_cand, n_seg) seat scores
 
     # Auction-best approximation per segment (raw scores, no duration
@@ -1034,7 +1080,21 @@ def _score_candidate(candidate: Dict, profile: SegmentProfile) -> float:
         tag_bonus += 0.10
 
     if target == "drop":
-        match = 0.46 * action + 0.16 * motion + 0.12 * combat + 0.10 * chase + 0.08 * explosion + 0.08 * quality
+        if candidate.get("ai_analyzed"):
+            match = 0.46 * action + 0.16 * motion + 0.12 * combat + 0.10 * chase + 0.08 * explosion + 0.08 * quality
+        else:
+            # Wave 16: without Qwen, video_analysis FABRICATES the semantic
+            # fields (chase=motion*0.6, combat=explosion=0.0), so the tagged
+            # formula silently degenerates to a motion echo plus dead weight.
+            # Untagged drops instead read real measured signals. The flow keys
+            # are normally always present (ANALYSIS_VERSION v11 recomputes
+            # stale sidecars); the plain-motion fallback engages only when the
+            # flow measurement FAILED for a candidate (video_analysis omits
+            # the keys on that path), so this branch works either way.
+            subject = _clamp(candidate.get("subject_motion", motion))
+            kinetic = _clamp(candidate.get("kinetic", motion))
+            contrast = _clamp(candidate.get("contrast", 0.5), default=0.5)
+            match = 0.46 * action + 0.16 * motion + 0.12 * subject + 0.10 * kinetic + 0.08 * quality + 0.08 * contrast
     elif target == "soft":
         match = 0.45 * beauty + 0.18 * soft + 0.13 * character + 0.14 * (1.0 - action) + 0.10 * quality
     elif target == "build":
@@ -1050,6 +1110,16 @@ def _score_candidate(candidate: Dict, profile: SegmentProfile) -> float:
         visibility_penalty += 0.18
     if quality < 0.24:
         visibility_penalty += 0.16
+
+    # Wave 16: continuous cross-modal energy matching, every target. Calm
+    # clips court quiet segments, kinetic clips court loud ones; the reward
+    # peaks (+0.18) at a perfect match and fades linearly with the gap.
+    # _segment_energy is 2dp-quantized — the determinism firewall that also
+    # keys _ScoreCache and the reservation-matrix column dedup, so all three
+    # must keep consuming the same helper.
+    e_seg = _segment_energy(profile)
+    e_clip = _clamp(candidate.get("kinetic", candidate.get("motion", 0.0)))
+    match += 0.18 * (1.0 - abs(e_clip - e_seg))
 
     return _clamp(match + tag_bonus + 0.12 * quality - visibility_penalty, lo=-1.0, hi=2.0)
 

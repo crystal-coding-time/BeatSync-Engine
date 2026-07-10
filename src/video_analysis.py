@@ -39,7 +39,7 @@ from visual_embeddings import OptionalBackend, SidecarCache
 
 setup_environment()
 
-ANALYSIS_VERSION = "auto_av_analysis_v10_subject_anchor"
+ANALYSIS_VERSION = "auto_av_analysis_v11_flow"
 DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models")
 DEFAULT_QWEN_GGUF_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "Qwen3VL-2B-Instruct-Q8_0.gguf")
 DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
@@ -1429,6 +1429,58 @@ def _score_from_primitives(brightness: float, contrast: float, saturation: float
     }
 
 
+def _mean_sample_dt(sample_times: np.ndarray) -> float:
+    """Mean spacing in seconds between sampled frames; 0.0 when fewer than 2."""
+    if sample_times is None or len(sample_times) < 2:
+        return 0.0
+    return float(np.mean(np.diff(np.asarray(sample_times, dtype=float))))
+
+
+def _measure_flow(gray_frames: Sequence[np.ndarray], sample_dt: float) -> Dict[str, float]:
+    """Dense Farneback optical flow over the already-decoded gray samples.
+
+    Measurement only — nothing consumes these keys here; the stage-6 planner
+    reads them separately. Returns kinetic / subject_motion / camera_motion,
+    each 0..1: per-pair means are normalized by frame height and sample_dt
+    (screen-heights/sec), then averaged and scaled. Values are rounded to 4dp
+    as the determinism firewall for the JSON sidecar cache. Single frame
+    (still image) or unusable spacing -> all zeros (genuinely motionless).
+    A measurement FAILURE returns {} — keys omitted, NOT zeros — so the
+    planner's `candidate.get("kinetic", motion)` fallback engages instead of
+    scoring an errored clip as perfectly calm footage."""
+    zeros = {"kinetic": 0.0, "subject_motion": 0.0, "camera_motion": 0.0}
+    if len(gray_frames) < 2 or not (sample_dt > 1e-6):
+        return zeros
+    try:
+        kin_vals: List[float] = []
+        subj_vals: List[float] = []
+        cam_vals: List[float] = []
+        for i in range(1, len(gray_frames)):
+            prev = gray_frames[i - 1]
+            curr = gray_frames[i]
+            flow = cv2.calcOpticalFlowFarneback(
+                prev, curr, None,
+                pyr_scale=0.5, levels=3, winsize=15,
+                iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
+            )  # (H, W, 2) pixels of displacement over one sample interval
+            norm = float(max(1, prev.shape[0])) * sample_dt  # px -> screen-heights/sec
+            mag = np.linalg.norm(flow, axis=2)
+            camera = np.median(flow.reshape(-1, 2), axis=0)  # global (camera) motion
+            residual = np.linalg.norm(flow - camera, axis=2)  # subject motion
+            kin_vals.append(float(np.mean(mag)) / norm)
+            subj_vals.append(float(np.mean(residual)) / norm)
+            cam_vals.append(float(np.linalg.norm(camera)) / norm)
+        return {
+            "kinetic": round(min(1.0, float(np.mean(kin_vals)) / 0.35), 4),
+            "subject_motion": round(min(1.0, float(np.mean(subj_vals)) / 0.25), 4),
+            "camera_motion": round(min(1.0, float(np.mean(cam_vals)) / 0.35), 4),
+        }
+    except Exception as exc:
+        print(f"   ⚠️  Optical-flow motion metrics failed ({exc}); keys omitted "
+              f"(scoring falls back to plain frame-diff motion).")
+        return {}
+
+
 def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarray,
                            start: float, duration: float, use_gpu: bool = False) -> Dict:
     if not frames:
@@ -1440,6 +1492,11 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
             # Anchor stays on CPU (numpy/cv2) even on the GPU metrics path so
             # both paths emit an identical schema.
             metrics["subject_anchor"] = _compute_subject_anchor(frames, sample_times, start)
+            # Flow too: computed on CPU from the same frames for schema parity.
+            metrics.update(_measure_flow(
+                [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames],
+                _mean_sample_dt(sample_times),
+            ))
             return metrics
         except Exception as exc:
             # Graceful degradation: one log line, then fall through to the CPU
@@ -1478,6 +1535,7 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
     metrics["subject_anchor"] = _compute_subject_anchor(
         frames, sample_times, start, gray_frames=gray_frames, diff_maps=diff_maps
     )
+    metrics.update(_measure_flow(gray_frames, _mean_sample_dt(sample_times)))
     return metrics
 
 
@@ -1858,7 +1916,7 @@ def _build_candidate(
     }
 
     candidate_id = f"{_hash_text(os.path.abspath(video_file), 10)}_{index:05d}_{int(start * 1000):08d}"
-    return {
+    candidate = {
         "id": candidate_id,
         "video_file": os.path.abspath(video_file),
         "source_name": source_name,
@@ -1887,6 +1945,13 @@ def _build_candidate(
         "semantic": semantic,
         "ai_analyzed": False,
     }
+    # Optical-flow keys are copied ONLY when the measurement produced them —
+    # a failed flow pass omits them so stage-6 scoring falls back to the plain
+    # frame-diff `motion` instead of reading an errored clip as perfectly calm.
+    for flow_key in ("kinetic", "subject_motion", "camera_motion"):
+        if flow_key in metrics:
+            candidate[flow_key] = float(metrics[flow_key])
+    return candidate
 
 
 def _fallback_tags(action: float, beauty: float, tension: float, soft: float, quality: float) -> List[str]:

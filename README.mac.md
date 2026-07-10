@@ -43,7 +43,8 @@ The vision stage is watchdogged: a hung llama-server request times out (60s stea
 Useful env vars:
 - `BEATSYNC_DISABLE_QWEN=1` — skip AI scene tagging (works without the model downloads)
 - `GRADIO_SERVER_PORT=<port>` — pin the UI port
-- `BEATSYNC_BEAT_BACKEND=beat_this` — use the [Beat This!](https://github.com/CPJKU/beat_this) transformer for beat **and downbeat** tracking (cuts prefer bar lines). Optional install: `.venv/bin/pip install beat-this torch torchaudio` (~8 MB model auto-downloads on first use). Runs on CPU by default; `BEATSYNC_BEAT_THIS_DEVICE=mps` forces the GPU. Falls back to librosa on any failure.
+- `BEATSYNC_BEAT_BACKEND` — beat-tracking backend. **`run.sh` now defaults this to `beat_this`** — the [Beat This!](https://github.com/CPJKU/beat_this) transformer for beat **and downbeat** tracking (cuts prefer real bar lines). Requires `.venv/bin/pip install beat-this torch torchaudio` (~8 MB model auto-downloads on first use); runs on CPU by default, `BEATSYNC_BEAT_THIS_DEVICE=mps` forces the GPU. Falls back to librosa on any failure. Export `BEATSYNC_BEAT_BACKEND=librosa` before `./run.sh` to use the classic librosa tracker instead.
+- `BEATSYNC_DOWNBEAT_PHASE=off` — on the librosa backend, bar/phrase anchors (the beats that attract the biggest cut bonuses) are phased onto the estimated downbeat (strongest kick/bass/chord-change grid position) instead of assuming beat 0 starts a bar. `off` (or `0`) restores the old beat-0 grid exactly. Irrelevant when beat-this downbeats are available — those override the anchors either way.
 - `BEATSYNC_CUT_LEAD_FRAMES=<0-2>` — how many frames before each beat the cut lands (default 1, the classic editor's trick; 0 restores exact on-beat cuts)
 
 ## Input formats

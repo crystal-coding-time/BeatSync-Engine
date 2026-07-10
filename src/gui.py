@@ -639,19 +639,19 @@ def create_ui() -> gr.Blocks:
                     with gr.Tab('The Cut'):
                         variety_input = gr.Slider(
                             0.0, 1.0, value=0.4, step=0.05, label='Source variety',
-                            info='0 = pure quality picks (some uploads may never appear). Higher guarantees every source at least one moment and spreads usage more evenly.')
+                            info='0 = pure quality picks (some uploads may never appear). Anything above 0 gives each upload with usable footage at least one moment; higher spreads usage more evenly.')
                         semantic_variety_input = gr.Slider(
                             0.0, 1.0, value=0.4, step=0.05, label='Visual variety',
-                            info='Avoid runs of visually similar shots (needs the DINOv2 model — scripts/fetch_dinov2.py).')
+                            info='Avoid runs of visually similar shots. Breaks near-ties; never overrides a clearly better-fitting clip. Needs the DINOv2 model (scripts/fetch_dinov2.py) and onnxruntime.')
                         split_screen_input = gr.Checkbox(
                             value=True, label='Pair vertical clips (split screen)',
-                            info='Renders some high-energy segments as two vertical clips side by side. Needs two or more vertical sources; fires on hard cuts only. H.264/HEVC modes only.')
+                            info='Renders some high-energy segments as two cross-orientation clips (side by side on a landscape canvas, stacked on portrait). Needs two or more such sources; duo boundaries are never crossfaded. H.264/HEVC modes only.')
                         crossfades_input = gr.Checkbox(
                             value=False, label='Crossfade calm cuts',
-                            info='Dissolves ~1 in 3 calm (soft/flow) boundaries instead of hard-cutting. Re-encodes those boundary chunks; hard cuts stay the fast default. H.264/HEVC modes only.')
+                            info='Dissolves ~1 in 3 eligible calm (soft/flow) boundaries instead of hard-cutting — retimed, paired, or very short segments are skipped. Re-encodes those boundary chunks; hard cuts stay the fast default. H.264/HEVC modes only.')
                         speed_ramps_input = gr.Checkbox(
                             value=False, label='Speed ramps (experimental)',
-                            info='Beat-aware retiming: slow-mo drifts on calm parts, rushes through builds, decel ramps and freeze hits on drops. Frame counts stay exact; H.264/HEVC modes only.')
+                            info='Beat-aware retiming: slow-mo drifts on soft parts, rushes through builds, decel ramps and freeze hits on drops. Frame counts stay exact; H.264/HEVC modes only.')
 
                     with gr.Tab('Framing'):
                         output_format_input = gr.Dropdown(
