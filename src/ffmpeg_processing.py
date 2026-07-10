@@ -1265,7 +1265,8 @@ def _plan_duo_render(primary_file: str, primary_start: float, primary_anchor,
 def build_text_overlay_graph(base_graph: str, fade_in_start: float,
                              fade_in_duration: float, fade_out_start: float,
                              fade: float = 0.35,
-                             text_input_index: int = 1) -> str:
+                             text_input_index: int = 1,
+                             overlay_y: int = 0) -> str:
     """Composite the looped transparent PNG input over the [basev] stream.
 
     Text is rendered by Pillow (see text_overlay.py) because this ffmpeg
@@ -1279,6 +1280,11 @@ def build_text_overlay_graph(base_graph: str, fade_in_start: float,
     text_input_index is the PNG's input position: 1 for solo segments
     (default, byte-identical to the historic graph), 2 for split-screen
     duos where inputs 0 and 1 are the two video sources.
+
+    overlay_y positions band-cropped styled sequences (styled_text returns
+    the band's top edge, kept even for yuv420 chroma alignment). The default
+    0 emits exactly the historic 'overlay=0:0' — classic byte-identity
+    depends on that string.
     """
     txt_chain = ["format=rgba"]
     if fade_in_duration > 0.001:
@@ -1287,8 +1293,19 @@ def build_text_overlay_graph(base_graph: str, fade_in_start: float,
     return (
         f"{base_graph};"
         f"[{text_input_index}:v]{','.join(txt_chain)}[txt];"
-        f"[basev][txt]overlay=0:0[outv]"
+        f"[basev][txt]overlay=0:{overlay_y:d}[outv]"
     )
+
+
+def text_overlay_input_args(png_or_pattern: str, fps: float) -> List[str]:
+    """Input args for the text overlay: a looped static PNG (classic path,
+    byte-identical to the historic args) or a '%06d' per-frame sequence
+    (styled path — see styled_text.py). The sequence needs -framerate so its
+    timestamps run on the segment clock the fade timings assume; overlay's
+    framesync holds the last frame if rounding leaves it a frame short."""
+    if '%06d' in png_or_pattern:
+        return ['-framerate', f'{fps:g}', '-start_number', '0', '-i', png_or_pattern]
+    return ['-loop', '1', '-i', png_or_pattern]
 
 
 def get_cpu_h264_quality_args(include_pix_fmt: bool = True) -> List[str]:
@@ -1791,7 +1808,7 @@ def _plan_duo_segment(video_file: str, start_time: float, anchor: dict,
                       partner: dict, image_source: bool, retime: dict,
                       exact_output_duration: float, fps: float,
                       target_size: Tuple[int, int], post_filters: List[str],
-                      text_overlay: Tuple[str, float, float, float],
+                      text_overlay: tuple,
                       output_frame_count: int, use_nvenc: bool,
                       gpu_encoder: str,
                       output_file: str) -> "SegmentRenderPlan | None":
@@ -1836,14 +1853,16 @@ def _plan_duo_segment(video_file: str, start_time: float, anchor: dict,
         f"[pane0][pane1]{duo_stack},setsar=1{post}[{base_label}]"
     )
     if text_overlay:
-        _, fade_in_start, fade_in_duration, fade_out_start = text_overlay
+        # 4-tuple (classic PNG) or 5-tuple with the styled band's overlay y.
+        fade_in_start, fade_in_duration, fade_out_start = text_overlay[1:4]
+        overlay_y = int(text_overlay[4]) if len(text_overlay) > 4 else 0
         filter_graph = build_text_overlay_graph(
             filter_graph, fade_in_start, fade_in_duration,
-            fade_out_start, text_input_index=2)
+            fade_out_start, text_input_index=2, overlay_y=overlay_y)
     input_args = list(duo_inputs[0])
     input_args.extend(duo_inputs[1])
     if text_overlay:
-        input_args.extend(['-loop', '1', '-i', text_overlay[0]])
+        input_args.extend(text_overlay_input_args(text_overlay[0], fps))
     # -vframes caps the COMPOSED stream; hstack/vstack pad a
     # briefly-short branch by repeating its last frame
     # (framesync default), so the cap — not the shortest branch —
@@ -1861,7 +1880,7 @@ def _plan_solo_segment(video_file: str, start_time: float,
                        image_source: bool, fps: float,
                        target_size: Tuple[int, int], fit_mode: str,
                        anchor: dict, post_filters: List[str],
-                       text_overlay: Tuple[str, float, float, float],
+                       text_overlay: tuple,
                        local_beats: List[float], output_frame_count: int,
                        use_nvenc: bool, gpu_encoder: str,
                        output_file: str) -> SegmentRenderPlan:
@@ -1907,8 +1926,9 @@ def _plan_solo_segment(video_file: str, start_time: float,
     pre_filters.extend(sar_fix)
 
     # text_overlay: (png_path, fade_in_start, fade_in_duration,
-    # fade_out_start) in this segment's local clock — see
-    # text_overlay.plan_text_windows.
+    # fade_out_start[, overlay_y]) in this segment's local clock — see
+    # text_overlay.plan_text_windows. The optional 5th element is the
+    # band-cropped styled sequence's overlay y (classic stays a 4-tuple).
     use_blur_graph = bool(target_size) and (fit_mode == 'blur' or hybrid_fg is not None)
     use_graph = use_blur_graph or bool(text_overlay)
     filter_graph = None
@@ -1951,9 +1971,12 @@ def _plan_solo_segment(video_file: str, start_time: float,
         if use_graph:
             filter_graph = f"[0:v]{filter_complex}[{base_label}]"
     if text_overlay:
-        _, fade_in_start, fade_in_duration, fade_out_start = text_overlay
+        # 4-tuple (classic PNG) or 5-tuple with the styled band's overlay y.
+        fade_in_start, fade_in_duration, fade_out_start = text_overlay[1:4]
+        overlay_y = int(text_overlay[4]) if len(text_overlay) > 4 else 0
         filter_graph = build_text_overlay_graph(filter_graph, fade_in_start,
-                                                fade_in_duration, fade_out_start)
+                                                fade_in_duration, fade_out_start,
+                                                overlay_y=overlay_y)
 
     input_args: List[str] = list(loop_args)
 
@@ -1982,7 +2005,7 @@ def _plan_solo_segment(video_file: str, start_time: float,
         ])
 
     if text_overlay:
-        input_args.extend(['-loop', '1', '-i', text_overlay[0]])
+        input_args.extend(text_overlay_input_args(text_overlay[0], fps))
 
     return SegmentRenderPlan(
         input_args=tuple(input_args),
@@ -2027,7 +2050,7 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                                 gpu_encoder: str = 'h264_nvenc',
                                 fit_mode: str = 'crop',
                                 extra_filters: List[str] = None,
-                                text_overlay: Tuple[str, float, float, float] = None,
+                                text_overlay: tuple = None,
                                 look_cube: str = None,
                                 retime: dict = None,
                                 *, anchor: dict = None,

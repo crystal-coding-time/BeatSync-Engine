@@ -66,9 +66,12 @@ from logger import setup_environment
 setup_environment()
 # NOW import other modules (after CUDA environment is set)
 import gradio as gr
+import math
 import multiprocessing
+import re
 import shutil
 import socket
+import subprocess
 
 from looks import ensure_look_cubes, list_looks
 
@@ -185,6 +188,271 @@ def cleanup_on_startup():
 
     except Exception as e:
         print(f"   ⚠️  Warning during startup cleanup: {e}")
+
+
+# --- Font discovery for the Text tab picker ----------------------------------
+
+_FONT_DIRS = [
+    os.path.expanduser('~/Library/Fonts'),
+    '/Library/Fonts',
+    '/System/Library/Fonts/Supplemental',
+    '/usr/share/fonts/truetype',      # Linux parity
+    'C:/Windows/Fonts',               # Windows parity
+]
+
+
+def _discover_font_choices() -> list:
+    """(label, path) choices for the font dropdown: 'Auto' plus every
+    .ttf/.otf found in the standard font directories, deduped by filename
+    (first hit wins — user fonts shadow system ones). Scan only; nothing is
+    loaded, so a corrupt file can't break UI construction."""
+    choices = [('Auto (Arial Bold / $BEATSYNC_FONT)', '')]
+    env_font = os.environ.get('BEATSYNC_FONT')
+    if env_font and os.path.exists(env_font):
+        choices.append((f'$BEATSYNC_FONT — {os.path.basename(env_font)}', env_font))
+    seen = set()
+    try:
+        for font_dir in _FONT_DIRS:
+            if not os.path.isdir(font_dir):
+                continue
+            for name in sorted(os.listdir(font_dir)):
+                if not name.lower().endswith(('.ttf', '.otf')):
+                    continue
+                if name.lower() in seen:
+                    continue
+                seen.add(name.lower())
+                choices.append((os.path.splitext(name)[0], os.path.join(font_dir, name)))
+    except Exception as e:
+        print(f"   ⚠️  Font scan failed ({e}) — dropdown offers Auto only")
+    return choices
+
+
+# --- Text schedule preview (read-only helpers) -------------------------------
+# The timeline planner silently skips entries that don't fit; until now the
+# only trace was a render-log warning discovered AFTER a multi-minute render.
+# These helpers power the Text tab's "Preview schedule" button. They are
+# strictly read-only and total: never start analysis, never run ffmpeg
+# renders, never mutate session state, never raise into Gradio.
+
+_TEXT_TAG_RE = re.compile(r'\[\s*(?:style|widget)\s*:', re.IGNORECASE)
+_TEXT_PREVIEW_HEADERS = ['#', 'Entry', 'Outcome', 'Notes']
+_CLASSIC_TAG_WARNING = ('⚠️ [tags] only render in Motion style — '
+                        "they'll appear as literal text in Classic")
+
+
+def _fmt_mmss(seconds: float) -> str:
+    total = max(0, int(round(float(seconds))))
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def _classic_tag_lint_message(text_value, style_value):
+    """U4 lint: [style:…]/[widget:…] tags are Motion-only; in Classic they
+    burn into the video as literal text. Returns the warning string or None."""
+    try:
+        if (style_value or 'classic') == 'classic' and _TEXT_TAG_RE.search(text_value or ''):
+            return _CLASSIC_TAG_WARNING
+    except Exception:
+        pass
+    return None
+
+
+def _probe_audio_duration(paths) -> float | None:
+    """Total duration of the selected songs via ffprobe (metadata read only,
+    no decode — well under a second). None when nothing is probeable."""
+    try:
+        from ffmpeg_processing import FFPROBE_PATH  # bundled bin/, else PATH
+    except Exception:
+        return None
+    total, found = 0.0, False
+    for p in (paths or []):
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            proc = subprocess.run(
+                [FFPROBE_PATH, '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'csv=p=0', p],
+                capture_output=True, text=True, timeout=10)
+            dur = float(proc.stdout.strip().splitlines()[0])
+            if math.isfinite(dur) and dur > 0:
+                total += dur
+                found = True
+        except Exception:
+            continue
+    return total if found else None
+
+
+def _preview_timeline(audio_files, session_state):
+    """Best cut grid recoverable WITHOUT running analysis.
+
+    Beat-exact path: orchestrator caches stages 1-5 per Gradio session as
+    session_state['analysis_cache'] = {key, local_audio_path, selected_beats,
+    beat_info}. It is trusted only while the current audio selection still
+    matches session_state['original_audio_paths'] AND the cache key's audio
+    tuple matches the resolved local paths (same staleness rule the render
+    uses; a changed video selection keeps the audio-driven beat grid valid).
+    The cut grid is rebuilt the way build_frame_aligned_cut_timeline does
+    ([0] + interior beats + [audio_duration]) minus frame quantization and
+    the 1-frame cut-lead — a sub-frame delta, invisible at M:SS granularity.
+
+    Fallback: an even 2s grid over the ffprobe'd total duration (labelled an
+    estimate; ~2s is a typical cut cadence, and the grid only needs enough
+    segments that entries don't falsely clash). No duration at all →
+    (None, None, 'none').
+
+    Returns (cut_times, beat_times, kind), kind ∈ {'beat-exact', 'estimate',
+    'none'}.
+    """
+    st = session_state if isinstance(session_state, dict) else {}
+    selection, _seen = [], set()
+    for a in (audio_files or []):
+        if a and a not in _seen:
+            _seen.add(a)
+            selection.append(a)
+    try:
+        cache = st.get('analysis_cache')
+        if (isinstance(cache, dict) and selection
+                and selection == st.get('original_audio_paths')
+                and tuple(st.get('local_audio_paths') or ())
+                == tuple((cache.get('key') or ((),))[0])):
+            beat_info = cache.get('beat_info') or {}
+            beats = sorted(float(b) for b in (cache.get('selected_beats') or ())
+                           if math.isfinite(float(b)))
+            duration = float(beat_info.get('audio_duration') or 0.0)
+            if duration <= 0 and beats:
+                duration = beats[-1]
+            if beats and duration > 0.5:
+                cut_times = [0.0] + [b for b in beats if 0.0 < b < duration] + [duration]
+                return cut_times, beat_info.get('times'), 'beat-exact'
+    except Exception:
+        pass
+    duration = _probe_audio_duration(selection)
+    if duration and duration > 0.5:
+        step = 2.0
+        cut_times = [i * step for i in range(int(duration / step) + 1)]
+        if duration - cut_times[-1] > 0.01:
+            cut_times.append(duration)
+        if len(cut_times) >= 2:
+            return cut_times, None, 'estimate'
+    return None, None, 'none'
+
+
+def _build_text_preview(text_value, style_value, audio_files, session_state):
+    """U1: one row per entry line, in original line order — its time window,
+    'SKIPPED — no room', or a lint note. Returns (note_markdown, rows).
+
+    May raise on truly unexpected input; the Gradio wrapper catches and shows
+    a friendly one-row table instead.
+    """
+    raw_lines = [ln for ln in (text_value or '').splitlines() if ln.strip()]
+    if not raw_lines:
+        return ('Nothing to preview — add a text entry above first.', [])
+    from text_overlay import parse_text_entries, plan_text_windows
+
+    # Parse line-by-line so every raw line keeps its identity even when the
+    # parser drops it. parse_text_entries is line-wise, so the concatenation
+    # equals parsing all lines at once and the planner sees the same entries
+    # the render will.
+    per_line = [parse_text_entries([ln]) for ln in raw_lines]
+    entries = [e for parsed in per_line for e in parsed]
+
+    cut_times, beat_times, kind = _preview_timeline(audio_files, session_state)
+
+    # Motion style widens windows for '[widget:… duration:Ns]' entries —
+    # mirror the render's min_durations so the preview reflects the widened
+    # plan. Same filter as the render: only finite positive durations count
+    # (the -1.0 'span window' sentinel stays None).
+    is_classic = (style_value or 'classic') == 'classic'
+    min_durations = None
+    if not is_classic and entries:
+        try:
+            from styled_text import parse_entry_tags
+            durs = [parse_entry_tags(t)[2] for t, _ in entries]
+            min_durations = [d if (d and d > 0) else None for d in durs]
+            if not any(min_durations):
+                min_durations = None
+        except Exception:
+            min_durations = None
+
+    schedule = []
+    planned = bool(entries) and cut_times is not None and len(cut_times) >= 2
+    if planned:
+        _seg_map, schedule = plan_text_windows(
+            entries, cut_times, beat_times=beat_times,
+            min_durations=min_durations)
+
+    remaining = list(schedule)  # placed (text, start, end), sorted by start
+    timeline_end = cut_times[-1] if cut_times else None
+
+    rows = []
+    entry_idx = 0
+    placed_count = 0
+    for line_no, (raw, parsed) in enumerate(zip(raw_lines, per_line), start=1):
+        raw = raw.strip()
+        display = raw if len(raw) <= 50 else raw[:49] + '…'
+        notes = []
+        if is_classic and _TEXT_TAG_RE.search(raw):
+            notes.append('[tags] only render in Motion style — literal text in Classic')
+        if not parsed:
+            # The parser dropped the whole line. Distinguish a readable stamp
+            # with no text ('@15') from an unreadable stamp by re-parsing with
+            # a placeholder word appended.
+            probe = parse_text_entries([raw + ' placeholder'])
+            if probe and probe[0][1] is not None:
+                notes.append('no text after the @-stamp')
+            elif raw.startswith('@'):
+                notes.append('@-stamp unreadable')
+            else:
+                notes.append('empty after parsing')
+            rows.append([str(line_no), display, 'NOT RENDERED', '; '.join(notes)])
+            continue
+        text, pin = entries[entry_idx]
+        want = min_durations[entry_idx] if min_durations else None
+        entry_idx += 1
+        if pin is None and raw.startswith('@'):
+            # Wording adapts to the parser's fallback: stamp stripped →
+            # auto-placed clean text; stamp kept → the '@…' renders literally.
+            if text == raw:
+                notes.append("@-stamp unreadable — whole line (incl. '@…') renders as literal text")
+            else:
+                notes.append('@-stamp unreadable — placed automatically (no pin)')
+        if want:
+            notes.append(f'widget widens window to ≥{want:g}s')
+        if pin is not None and timeline_end is not None and pin > timeline_end + 0.01:
+            notes.append(f'pin @{_fmt_mmss(pin)} is past the end of the audio '
+                         f'({_fmt_mmss(timeline_end)})')
+        if planned:
+            # Match placements back to entries by text, consuming in original
+            # entry order so duplicate lines pair up deterministically.
+            window = None
+            for i, (t, ws, we) in enumerate(remaining):
+                if t == text:
+                    window = remaining.pop(i)
+                    break
+            if window is not None:
+                placed_count += 1
+                outcome = f'{_fmt_mmss(window[1])}–{_fmt_mmss(window[2])}'
+            else:
+                outcome = 'SKIPPED — no room on the timeline'
+        else:
+            outcome = (f'@{_fmt_mmss(pin)} (pinned)' if pin is not None
+                       else 'auto — spread evenly')
+        rows.append([str(line_no), display, outcome, '; '.join(notes)])
+
+    if kind == 'beat-exact':
+        note = ("**Beat-exact preview** — windows come from this session's cached "
+                'beat analysis, the same grid the next render will use.')
+    elif kind == 'estimate':
+        note = ('**Estimate** (even grid over the probed song duration '
+                f'{_fmt_mmss(timeline_end)}) — render once to get beat-exact windows.')
+    else:
+        note = ('**Estimate — render once to get beat-exact windows.** No song '
+                'duration recoverable yet (load audio first); showing entry order only.')
+    if planned:
+        skipped = sum(1 for r in rows if r[2].startswith('SKIPPED'))
+        note += f'  \nPlaced {placed_count}/{len(entries)}'
+        if skipped:
+            note += f' · **{skipped} skipped**'
+    return note, rows
 
 
 def create_ui() -> gr.Blocks:
@@ -398,13 +666,100 @@ def create_ui() -> gr.Blocks:
                     with gr.Tab('Text'):
                         text_entries_input = gr.Textbox(
                             label='Text entries (one per line)', lines=4, value='',
-                            placeholder='Leave empty for no text.\nEach line appears once, spread evenly across the video.\nPin an entry to a time with @: "@15 Finish strong" or "@1:23 Halfway"',
+                            placeholder='Leave empty for no text.\nEach line appears once, spread evenly across the video.\nPin an entry to a time with @: "@15 Finish strong" or "@1:23 Halfway"\nMotion style adds tags: "[style:glitch] Drop!" or "Wait [widget:progress duration:4s]"',
                             info='Quotes, captions, titles — any text. Every line gets its own beat-snapped time window; @ pins one to a timestamp.')
+                        text_tag_lint = gr.Markdown('', visible=False)
+                        with gr.Row():
+                            tpl_caption_btn = gr.Button('+ Caption', size='sm')
+                            tpl_pinned_btn = gr.Button('+ Pinned @time', size='sm')
+                            tpl_loading_btn = gr.Button('+ Loading bar', size='sm')
+                            tpl_glitch_btn = gr.Button('+ Glitch', size='sm')
                         with gr.Row():
                             text_position_input = gr.Radio(
                                 choices=[('Lower third', 'bottom'), ('Center', 'center'), ('Top', 'top')],
                                 value='bottom', label='Text position')
                             text_scale_input = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label='Text size')
+                        with gr.Row():
+                            text_style_input = gr.Radio(
+                                choices=[('Classic', 'classic'), ('Motion', 'motion')],
+                                value='classic', label='Text style',
+                                info='Classic: static white captions (the original look). Motion: beat-reactive pulse + halo, with [style:glitch] and [widget:progress duration:4s] tags per line.')
+                            text_accent_input = gr.ColorPicker(
+                                value='#FF4D8D', label='Accent color',
+                                info='Motion style only: glitch tint and progress-bar fill.')
+                        with gr.Row():
+                            text_font_input = gr.Dropdown(
+                                choices=_discover_font_choices(),
+                                value='', label='Font',
+                                info='Fonts found on this Mac (~/Library/Fonts, /Library/Fonts, system Supplemental). Auto = Arial Bold or $BEATSYNC_FONT. Applies to Classic and Motion.')
+                            text_font_path_input = gr.Textbox(
+                                value='', label='Custom font file (overrides the dropdown)',
+                                placeholder='/path/to/YourFont-Bold.ttf — any .ttf/.otf, no install needed')
+
+                        # Quick-add template buttons: append a ready-made line to
+                        # the entries box. Templates that use Motion-only tags also
+                        # flip the style radio — otherwise a Classic render would
+                        # burn the literal "[widget:...]" text into the video.
+                        def _make_template_appender(template: str, needs_motion: bool):
+                            def _append(current: str, style: str):
+                                current = (current or '').rstrip()
+                                text = (current + '\n' if current else '') + template
+                                return text, ('motion' if needs_motion else style)
+                            return _append
+
+                        for _btn, _tpl, _motion in (
+                            (tpl_caption_btn, 'Your caption here', False),
+                            (tpl_pinned_btn, '@15 Your text at 15s', False),
+                            (tpl_loading_btn, 'Loading… [widget:progress duration:4s]', True),
+                            (tpl_glitch_btn, '[style:glitch] YOUR DROP LINE', True),
+                        ):
+                            _btn.click(
+                                _make_template_appender(_tpl, _motion),
+                                inputs=[text_entries_input, text_style_input],
+                                outputs=[text_entries_input, text_style_input])
+
+                        # U4: live Classic-tag lint. .change also fires on
+                        # programmatic updates, so the template buttons' style
+                        # flip refreshes the warning with no extra wiring.
+                        def _refresh_tag_lint(text_value, style_value):
+                            msg = _classic_tag_lint_message(text_value, style_value)
+                            return gr.update(value=msg or '', visible=bool(msg))
+
+                        for _lint_src in (text_entries_input, text_style_input):
+                            _lint_src.change(
+                                _refresh_tag_lint,
+                                inputs=[text_entries_input, text_style_input],
+                                outputs=[text_tag_lint])
+
+                        # U1: read-only schedule preview — shows per line WHERE
+                        # it lands (or that the planner would skip it) before a
+                        # multi-minute render. Display-only sugar: none of these
+                        # components joins settings_components/SETTINGS_KEYS.
+                        preview_schedule_btn = gr.Button('📋 Preview schedule', size='sm')
+                        text_preview_note = gr.Markdown('', visible=False)
+                        text_preview_table = gr.Dataframe(
+                            headers=list(_TEXT_PREVIEW_HEADERS), value=[],
+                            interactive=False, visible=False, wrap=True,
+                            column_widths=['6%', '42%', '28%', '24%'],
+                            label='Planned text schedule')
+
+                        def _on_text_preview(text_value, style_value, audio_files, session_st):
+                            try:
+                                note, rows = _build_text_preview(
+                                    text_value, style_value, audio_files, session_st)
+                            except Exception as e:  # total: never raise into Gradio
+                                note = '⚠️ Preview unavailable — the render itself is unaffected.'
+                                rows = [['', '(preview error)',
+                                         f'{type(e).__name__}: {e}'[:120],
+                                         'try again after loading audio']]
+                            return (gr.update(value=note, visible=True),
+                                    gr.update(value=rows, visible=bool(rows)))
+
+                        preview_schedule_btn.click(
+                            _on_text_preview,
+                            inputs=[text_entries_input, text_style_input,
+                                    audio_state, session_state],
+                            outputs=[text_preview_note, text_preview_table])
 
                     with gr.Tab('Export'):
                         if NVENC_AVAILABLE:
@@ -437,6 +792,8 @@ def create_ui() -> gr.Blocks:
                     effect_intensity_input, semantic_variety_input,
                     speed_ramps_input, split_screen_input, crossfades_input,
                     text_entries_input, text_position_input, text_scale_input,
+                    text_style_input, text_accent_input,
+                    text_font_input, text_font_path_input,
                 ]
                 _prores_base_labels = [c.label for c in _prores_disabled_controls]
                 _PRORES_NOTE = ' — disabled in ProRes Precise Mode'
@@ -512,6 +869,8 @@ def create_ui() -> gr.Blocks:
             look_input, variety_input, semantic_variety_input,
             speed_ramps_input, split_screen_input, crossfades_input,
             text_entries_input, text_position_input, text_scale_input,
+            text_style_input, text_accent_input,
+            text_font_input, text_font_path_input,
         ]
         assert len(SETTINGS_KEYS) == len(settings_components)
 

@@ -60,6 +60,19 @@ from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_c
 from effects import build_effect_filters, _stable_rng
 from text_overlay import parse_text_entries, plan_text_windows, render_text_png
 
+
+def _strip_entry_tags(text: str) -> str:
+    """Clean text for the classic fallback of a styled render: never burn
+    '[style:…]'/'[widget:…]' tags into the video. Prefers styled_text's own
+    parser (lazy import — pure-Python-safe even when cairosvg is missing);
+    a bare regex strip covers the pathological import failure."""
+    try:
+        from styled_text import parse_entry_tags
+        return parse_entry_tags(text)[0]
+    except Exception:
+        import re
+        return re.sub(r'\s*\[[^\][]*\]\s*', ' ', text).strip()
+
 # Import mode modules
 from auto_mode import analyze_beats_auto
 
@@ -710,6 +723,9 @@ class RenderContext:
     text_entries: Optional[List[str]]
     text_position: str
     text_scale: float
+    text_style: str
+    text_accent: str
+    text_font: str
     variety: float
     semantic_variety: float
     speed_ramps: bool
@@ -738,7 +754,9 @@ def _resolve_render_config(audio_file: str, video_files: VideoList,
                            text_position: str, text_scale: float,
                            variety: float, speed_ramps: bool,
                            split_screen: bool, crossfades: bool,
-                           settings: Dict) -> RenderContext:
+                           settings: Dict, text_style: str = 'classic',
+                           text_accent: str = '#FF4D8D',
+                           text_font: str = '') -> RenderContext:
     """Merge settings, detect fps, wipe the temp dir, resolve encoder and
     workers, init render_info, and build the frame-locked cut timeline."""
     # A settings dict (GUI path) overrides the individual style kwargs — the
@@ -755,6 +773,9 @@ def _resolve_render_config(audio_file: str, video_files: VideoList,
         text_entries = settings.get('text_entries', text_entries)
         text_position = settings.get('text_position', text_position)
         text_scale = settings.get('text_scale', text_scale)
+        text_style = settings.get('text_style', text_style)
+        text_accent = settings.get('text_accent', text_accent)
+        text_font = settings.get('text_font', text_font)
         variety = settings.get('variety', variety)
         speed_ramps = settings.get('speed_ramps', speed_ramps)
         split_screen = settings.get('split_screen', split_screen)
@@ -884,6 +905,8 @@ def _resolve_render_config(audio_file: str, video_files: VideoList,
         effect_palette=effect_palette, effect_seed=effect_seed,
         look_cube=look_cube, text_entries=text_entries,
         text_position=text_position, text_scale=text_scale,
+        text_style=text_style, text_accent=text_accent,
+        text_font=text_font,
         variety=variety, semantic_variety=semantic_variety,
         speed_ramps=speed_ramps, split_screen=split_screen,
         crossfades=crossfades, selected_beats=selected_beats,
@@ -1250,6 +1273,9 @@ def _render_standard(ctx: RenderContext) -> str:
     text_entries = ctx.text_entries
     text_position = ctx.text_position
     text_scale = ctx.text_scale
+    text_style = ctx.text_style
+    text_accent = ctx.text_accent
+    text_font = ctx.text_font or None  # '' = auto (BEATSYNC_FONT / candidates)
     crossfades = ctx.crossfades
     selected_beats = ctx.selected_beats
     segment_frames = ctx.segment_frames
@@ -1275,23 +1301,102 @@ def _render_standard(ctx: RenderContext) -> str:
     text_plan = {}
     if text_entries:
         entries = parse_text_entries(text_entries)
+        # Motion-style progress widgets need windows at least as long as
+        # their 'duration:Ns' (plus fades) or the bar completes early; the
+        # availability check runs BEFORE planning so a cairosvg-less fallback
+        # to classic also gets the classic window math. min_durations=None
+        # (classic) keeps planning bit-for-bit identical to the historic path.
+        styled_ready = False
+        min_durations = None
+        if text_style != 'classic':
+            try:
+                import cairosvg  # noqa: F401 — probe only; render imports it again
+                if os.environ.get('BEATSYNC_DISABLE_STYLEDTEXT'):
+                    raise RuntimeError('disabled via BEATSYNC_DISABLE_STYLEDTEXT')
+                from styled_text import parse_entry_tags
+                styled_ready = True
+                durs = [parse_entry_tags(t)[2] for t, _ in entries]
+                min_durations = [d if d and d > 0 else None for d in durs]
+                if not any(min_durations):
+                    min_durations = None
+            except Exception as e:
+                print(f"   ⚠️  Styled text unavailable ({e}) — using classic rendering")
         seg_map, schedule = plan_text_windows(
             entries, selected_beats,
             beat_times=(beat_info or {}).get('times'),
             planned_clip_sequence=planned_clip_sequence,
+            min_durations=min_durations,
         )
-        png_cache = {}
-        for seg_idx, (text, fade_in_start, fade_in_duration, fade_out_start) in seg_map.items():
-            png = png_cache.get(text)
-            if png is None:
-                png_path = os.path.join(session_temp_dir, f"text_{len(png_cache):03d}.png")
-                png = render_text_png(text, target_size, png_path,
-                                      position=text_position, scale=text_scale)
-                png_cache[text] = png
-            if png:
-                text_plan[seg_idx] = (png, fade_in_start, fade_in_duration, fade_out_start)
+        styled_patterns = None
+        styled_band_y = 0
+        if styled_ready and seg_map:
+            # Styled path: same planner, per-frame SVG sequences instead of
+            # one static PNG. Any failure (no font, rasterizer error)
+            # degrades to the classic renderer with one log line.
+            try:
+                from styled_text import build_styled_sequences
+                styled_patterns, styled_band_y = build_styled_sequences(
+                    entries=entries, schedule=schedule, seg_map=seg_map,
+                    cut_times=selected_beats, segment_frames=segment_frames,
+                    fps=fps, target_size=target_size,
+                    audio_file=ctx.audio_file, temp_dir=session_temp_dir,
+                    position=text_position, scale=text_scale,
+                    accent=text_accent, font_path=text_font)
+            except Exception as e:
+                print(f"   ⚠️  Styled text unavailable ({e}) — using classic rendering")
+                styled_patterns = None
+                if min_durations is not None:
+                    # The widget-widened windows only make sense for the styled
+                    # renderer; the classic fallback re-plans with the classic
+                    # window math so captions keep their historic pacing.
+                    seg_map, schedule = plan_text_windows(
+                        entries, selected_beats,
+                        beat_times=(beat_info or {}).get('times'),
+                        planned_clip_sequence=planned_clip_sequence,
+                        min_durations=None,
+                    )
+        if styled_patterns is not None:
+            for seg_idx, (text, fade_in_start, fade_in_duration, fade_out_start) in seg_map.items():
+                pattern = styled_patterns.get(seg_idx)
+                if pattern:
+                    # 5th element = overlay y for the band-cropped sequence
+                    # (see styled_text._compute_band). Classic entries stay
+                    # 4-tuples so the historic command strings are untouched;
+                    # ffmpeg_processing unpacks both shapes.
+                    text_plan[seg_idx] = (pattern, fade_in_start,
+                                          fade_in_duration, fade_out_start,
+                                          styled_band_y)
+        else:
+            png_cache = {}
+            for seg_idx, (text, fade_in_start, fade_in_duration, fade_out_start) in seg_map.items():
+                if text not in png_cache:
+                    # A styled render that degraded to classic must not burn
+                    # raw '[style:…]' tags into the video; explicit Classic
+                    # style keeps its text verbatim (byte-identity).
+                    draw_text = _strip_entry_tags(text) if text_style != 'classic' else text
+                    png = None
+                    if draw_text:
+                        png_path = os.path.join(session_temp_dir, f"text_{len(png_cache):03d}.png")
+                        png = render_text_png(draw_text, target_size, png_path,
+                                              position=text_position, scale=text_scale,
+                                              font_path=text_font)
+                    # Cache failures (None) too, so a missing font warns once
+                    # instead of once per segment.
+                    png_cache[text] = png
+                png = png_cache[text]
+                if png:
+                    text_plan[seg_idx] = (png, fade_in_start, fade_in_duration, fade_out_start)
         for text, ws, we in schedule:
             print(f"   Text overlay: 📝 {ws:6.2f}s–{we:6.2f}s  {text[:60]!r}")
+        skipped = len(entries) - len(schedule)
+        text_summary = (f"Text: placed {len(schedule)}/{len(entries)} entries, "
+                        f"{skipped} skipped" + (" (see render log)" if skipped else ""))
+        print(f"   📝 {text_summary}")
+        # Handoff for the curated UI status line: the console logger lives in
+        # the orchestrator, which reads render_info after the render returns
+        # (render_log._stage6_summary). Stashing the line here lets that
+        # summary surface it in the on-screen status box.
+        render_info['text_summary'] = text_summary
 
     # Interior beat offsets per segment (in each segment's local clock) so
     # beat-locked effects fire on real beats, not a tempo approximation.

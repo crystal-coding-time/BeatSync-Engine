@@ -114,6 +114,10 @@ class RenderSettings:
     text_entries: str = ''
     text_position: str = 'bottom'
     text_scale: float = 1.0
+    text_style: str = 'classic'
+    text_accent: str = '#FF4D8D'
+    text_font: str = ''       # font picker dropdown ('' = auto)
+    text_font_path: str = ''  # custom file path box; wins over the dropdown
 
     @classmethod
     def from_dict(cls, d: dict | None, base: 'RenderSettings | None' = None) -> 'RenderSettings':
@@ -156,6 +160,11 @@ class RenderSettings:
             'text_entries': [line.strip() for line in (self.text_entries or '').splitlines() if line.strip()],
             'text_position': self.text_position,
             'text_scale': self.text_scale,
+            'text_style': self.text_style,
+            'text_accent': self.text_accent,
+            # Two UI controls, one downstream knob: the custom path box wins
+            # over the dropdown; '' means the historic auto lookup.
+            'text_font': (self.text_font_path or '').strip() or self.text_font,
         }
 
 
@@ -186,6 +195,10 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
                        text_entries: str = _RS_DEFAULTS.text_entries,
                        text_position: str = _RS_DEFAULTS.text_position,
                        text_scale: float = _RS_DEFAULTS.text_scale,
+                       text_style: str = _RS_DEFAULTS.text_style,
+                       text_accent: str = _RS_DEFAULTS.text_accent,
+                       text_font: str = _RS_DEFAULTS.text_font,
+                       text_font_path: str = _RS_DEFAULTS.text_font_path,
                        settings: dict | None = None,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None) -> StatusResult:
@@ -202,6 +215,8 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
             speed_ramps=speed_ramps, split_screen=split_screen,
             crossfades=crossfades, text_entries=text_entries,
             text_position=text_position, text_scale=text_scale,
+            text_style=text_style, text_accent=text_accent,
+            text_font=text_font, text_font_path=text_font_path,
         )
         rs = RenderSettings.from_dict(settings, base=rs)
         parallel_workers = PARALLEL_WORKERS
@@ -473,7 +488,9 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
                  look_cube: str, variety: float, semantic_variety: float, speed_ramps: bool,
                  split_screen: bool, crossfades: bool,
                  text_entries: str, text_position: str,
-                 text_scale: float, session_state: dict) -> Iterator[StatusResult]:
+                 text_scale: float, text_style: str, text_accent: str,
+                 text_font: str, text_font_path: str,
+                 session_state: dict) -> Iterator[StatusResult]:
     status_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
     initial_status = _stage_status(1)
@@ -492,7 +509,8 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
         fit_mode, output_format, effect_style, effect_intensity,
         effect_mode, effect_palette, effect_seed, look_cube,
         variety, semantic_variety, speed_ramps, split_screen, crossfades,
-        text_entries, text_position, text_scale,
+        text_entries, text_position, text_scale, text_style, text_accent,
+        text_font, text_font_path,
     ), strict=True))
 
     def progress_callback(message: str) -> None:

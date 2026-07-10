@@ -210,6 +210,12 @@ def _stage6_summary(console_logger: StageConsoleLogger | None, beat_info: Dict |
         fps_text = f" @ {float(fps):.1f} FPS" if fps is not None else ""
         console_logger.line(f"Render timeline: {cuts} cuts, {frames} frames{fps_text}")
 
+    # Text placement summary (video_processor stashes it; skipped entries are
+    # otherwise invisible outside the render log).
+    text_summary = render_info.get("text_summary")
+    if text_summary:
+        console_logger.line(str(text_summary))
+
     clip_workers = render_info.get("clip_workers")
     requested_workers = render_info.get("requested_workers")
     worker_text = ""
