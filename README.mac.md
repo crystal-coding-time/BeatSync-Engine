@@ -111,6 +111,8 @@ Effects, text, looks and speed ramps apply to the H.264/HEVC modes only; ProRes 
 
 Every run writes its full pipeline output (including ffmpeg errors) to `output/render_<timestamp>.log` — if a render fails, the error message points at that log.
 
+If one source file can't be processed (a corrupt clip, or one that encodes so slowly it hits the 120s per-clip timeout), the render no longer fails: that segment is automatically refilled from a different source at the exact same length, so the beat sync of everything after it is preserved. The log names the failing file (`source: ...`) and the rescue (`🔁 Rescue: ...`) — worth checking afterwards so you can remove or re-encode chronic offenders.
+
 ## Text overlays
 
 Enter lines in the "Text entries" box (one entry per line — quotes, captions, titles, anything). Every line is guaranteed its own time window: entries are spaced evenly across the video, window starts snap to beats (preferring non-drop moments), each stays on screen ~3 seconds spanning cuts, fading in/out. Pin an entry to a moment with `@`: `@15 Finish strong` or `@1:23 Halfway there` — pins win, auto-placed entries move around them. The render log prints the exact schedule. Position (lower third/center/top) and size are configurable. The **Font** dropdown lists every `.ttf`/`.otf` found on the machine (user, library, and system-supplemental font folders); the custom-path box beside it takes any font file — no install needed (Motion registers it with CoreText at render time) — and overrides the dropdown. *Auto* keeps the historic default: `$BEATSYNC_FONT` if set, else Arial Bold. Prefer a Bold cut; the caption styling is built around one. Like effects, text applies to H.264/HEVC modes only.

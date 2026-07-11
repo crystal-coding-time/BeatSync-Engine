@@ -378,6 +378,11 @@ class ClipJob:
     xfade_extend_frames: int = 0
 
 
+# One bad source must not kill a full render: each failed segment gets this
+# many re-extraction attempts from seeded fallback sources before we abort.
+_CLIP_RESCUE_ATTEMPTS = 3
+
+
 def create_clip_parallel(job: ClipJob):
     """
     Wrapper function for parallel clip creation using FFmpeg.
@@ -1509,7 +1514,9 @@ def _render_standard(ctx: RenderContext) -> str:
                     clip_timings.append(float(clip_elapsed))
                 
                 if error:
-                    print(f"⚠️  Warning: Clip {i+1} failed after {_fmt_seconds(clip_elapsed)}: {error}")
+                    src_name = os.path.basename(clip_args[idx].video_file or '?')
+                    print(f"⚠️  Warning: Clip {i+1} failed after {_fmt_seconds(clip_elapsed)}: "
+                          f"{error} (source: {src_name})")
                     continue
                 
                 if clip_path is not None:
@@ -1532,13 +1539,44 @@ def _render_standard(ctx: RenderContext) -> str:
     clip_stage_seconds = time.perf_counter() - clip_stage_started
     _summarize_clip_timings(clip_timings, clip_stage_seconds)
 
-    # Do not silently drop failed clips. Dropping one segment compresses the
-    # output timeline and makes every later cut drift against the audio.
-    failed_count = sum(1 for f in clip_files if f is None)
-    if failed_count:
-        raise RuntimeError(
-            f"{failed_count} clip(s) failed; refusing to concatenate an incomplete timeline."
-        )
+    # Never drop a failed clip from the timeline: that would compress the
+    # output and make every later cut drift against the audio. Instead,
+    # rescue the segment — re-extract the same time slot (same frame count)
+    # from seeded fallback sources. Runs only when something already failed,
+    # so clean renders stay byte-identical; given the same failure set, the
+    # rescue itself is deterministic.
+    failed_indices = [idx for idx, f in enumerate(clip_files) if f is None]
+    for idx in failed_indices:
+        job = clip_args[idx]
+        rescued = False
+        for attempt in range(1, _CLIP_RESCUE_ATTEMPTS + 1):
+            pool = [v for v in video_files if v != job.video_file] or list(video_files)
+            fallback = _stable_rng('clip_rescue', idx, attempt).choice(pool)
+            print(f"   🔁 Rescue: re-extracting clip {idx + 1} from fallback source "
+                  f"{os.path.basename(fallback)} (attempt {attempt}/{_CLIP_RESCUE_ATTEMPTS})")
+            rescue_job = ClipJob(
+                index=job.index, video_file=fallback,
+                final_duration=job.final_duration, target_size=job.target_size,
+                use_nvenc=job.use_nvenc, gpu_encoder=job.gpu_encoder,
+                temp_dir=job.temp_dir, fps=job.fps,
+                # Planless path: seeded start time, exact frame count. The
+                # original plan's start/retime/partner belong to the failed
+                # source and cannot transfer.
+                planned_clip=None,
+                render_opts=job.render_opts,
+                xfade_extend_frames=job.xfade_extend_frames)
+            _, clip_path, _, _, error, clip_elapsed = create_clip_parallel(rescue_job)
+            if clip_path is not None and not error:
+                clip_files[idx] = clip_path
+                rescued = True
+                break
+            print(f"   ⚠️  Rescue attempt {attempt} failed after "
+                  f"{_fmt_seconds(clip_elapsed)}: {error}")
+        if not rescued:
+            raise RuntimeError(
+                f"Clip {idx + 1} failed and all {_CLIP_RESCUE_ATTEMPTS} rescue attempts "
+                f"failed; refusing to concatenate an incomplete timeline."
+            )
 
     if not clip_files:
         raise ValueError('No valid video clips could be created')
