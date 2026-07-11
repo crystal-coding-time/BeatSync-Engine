@@ -16,6 +16,7 @@ macOS port of a Windows-only beat-synced music video generator. Owner is learnin
 - **Frame-exactness**: `-vframes` is the frame-count authority; per-segment and assembly frame guards must pass; the frame-locked timeline (`segment_frames`) is the duration authority. `tpad=stop_mode=clone` before `fps=` guards demuxer underrun (GIF trailing display durations). Gotcha: `tmix` toggled with `enable=` silently drops frames — use split/trim/concat instead.
 - **Byte-identical off-paths**: every optional feature's disabled state (checkbox off, slider 0, model absent) must reproduce the previous behavior exactly.
 - **ProRes precise mode stays pristine**: no effects, retimes, duos, crossfades, or text; static centered framing on proxies.
+- **Probe-cache staleness**: `_MEDIA_INFO_CACHE` (ffmpeg_processing) is path-keyed and process-lifetime; any file REWRITTEN at a fixed path mid-session (e.g. multisong's concat wav) must call `invalidate_media_info(path)` right after writing, or later probes serve the previous file's duration.
 - **Graceful degradation**: optional backends (YuNet faces, beat-this, Qwen, DINOv2 embeddings, all-in-one-mlx/demucs-mlx, cairosvg for Motion text) fall back with one log line when missing; kill switches: `BEATSYNC_DISABLE_QWEN/EMBED/STRUCTURE/STEMS/STYLEDTEXT`, `BEATSYNC_YUNET_MODEL`, `BEATSYNC_BEAT_BACKEND` (=librosa reverts the Mac beat-this default), `BEATSYNC_DOWNBEAT_PHASE=off` (beat-0 anchor grid).
 - **15%-crop rule**: `MAX_CROP_PER_AXIS` caps content loss; subject anchors change WHERE we crop, never HOW MUCH.
 

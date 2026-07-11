@@ -284,8 +284,13 @@ def analyze_and_concat(audio_files: List[str], work_dir: str, *,
     # assumes: video_processor later ffprobes it to build the frame-locked cut
     # timeline. WAV is sample-exact (unlike mp3 container durations), so this
     # must agree to within one sample.
-    from ffmpeg_processing import get_video_duration
+    from ffmpeg_processing import get_video_duration, invalidate_media_info
 
+    # concat_path is a FIXED name in a per-session dir and we just overwrote
+    # it; the process-global probe cache would otherwise serve the PREVIOUS
+    # render's duration here (and to video_processor's timeline build) after
+    # any mid-session song-list change.
+    invalidate_media_info(concat_path)
     probed = float(get_video_duration(concat_path))
     if abs(probed - total_duration) > 1.5 / MUX_SR:
         raise RuntimeError(

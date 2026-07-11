@@ -708,6 +708,14 @@ def _get_media_info(video_file: str) -> MediaInfo | None:
     return info
 
 
+def invalidate_media_info(video_file: str) -> None:
+    """Drop a path's cached probe. The cache is keyed by path alone and the
+    server process is long-lived, so any file REWRITTEN at a fixed path
+    (multisong's concat wav) must invalidate here right after writing, or
+    every later probe serves the previous file's duration."""
+    _MEDIA_INFO_CACHE.pop(video_file, None)
+
+
 def get_cached_display_info(video_file: str):
     """(display_w, display_h, sar) with a per-run cache; None if the probe fails.
 
