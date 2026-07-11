@@ -108,6 +108,10 @@ class RenderSettings:
     look_cube: str = ''
     variety: float = 0.4
     semantic_variety: float = 0.4
+    # Content-aware effects: veto primitives that clash with the clip's
+    # semantic/motion profile and weight firing by musical impact (see
+    # effects.SEMANTIC_FX_MATRIX).
+    semantic_fx: bool = False
     speed_ramps: bool = False
     split_screen: bool = True
     crossfades: bool = False
@@ -118,6 +122,9 @@ class RenderSettings:
     text_accent: str = '#FF4D8D'
     text_font: str = ''       # font picker dropdown ('' = auto)
     text_font_path: str = ''  # custom file path box; wins over the dropdown
+    # Media-aware planning: upscale/loop-seam penalties and native-fps
+    # kinetics in the stage6 auction.
+    media_aware: bool = False
 
     @classmethod
     def from_dict(cls, d: dict | None, base: 'RenderSettings | None' = None) -> 'RenderSettings':
@@ -154,6 +161,7 @@ class RenderSettings:
             'look_cube': (None if is_prores else (self.look_cube or None)),
             'variety': self.variety,
             'semantic_variety': self.semantic_variety,
+            'semantic_fx': bool(self.semantic_fx),
             'speed_ramps': bool(self.speed_ramps),
             'split_screen': bool(self.split_screen),
             'crossfades': bool(self.crossfades),
@@ -165,13 +173,20 @@ class RenderSettings:
             # Two UI controls, one downstream knob: the custom path box wins
             # over the dropdown; '' means the historic auto lookup.
             'text_font': (self.text_font_path or '').strip() or self.text_font,
+            'media_aware': bool(self.media_aware),
         }
 
 
 # Canonical key order for the Gradio boundary: process_video's positional
 # settings parameters and create_ui's settings_components list both follow
 # RenderSettings field order, and dict(zip(...)) marries them.
-SETTINGS_KEYS: tuple[str, ...] = tuple(f.name for f in dataclass_fields(RenderSettings))
+# Fields without a GUI component yet stay OUT of SETTINGS_KEYS: gui.py
+# asserts len(SETTINGS_KEYS) == len(settings_components) and process_video
+# zips them strict=True, so a field only joins when its component lands.
+_NON_GUI_SETTINGS: frozenset[str] = frozenset()
+SETTINGS_KEYS: tuple[str, ...] = tuple(
+    f.name for f in dataclass_fields(RenderSettings)
+    if f.name not in _NON_GUI_SETTINGS)
 
 _RS_DEFAULTS = RenderSettings()
 
@@ -189,6 +204,7 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
                        look_cube: str = _RS_DEFAULTS.look_cube,
                        variety: float = _RS_DEFAULTS.variety,
                        semantic_variety: float = _RS_DEFAULTS.semantic_variety,
+                       semantic_fx: bool = _RS_DEFAULTS.semantic_fx,
                        speed_ramps: bool = _RS_DEFAULTS.speed_ramps,
                        split_screen: bool = _RS_DEFAULTS.split_screen,
                        crossfades: bool = _RS_DEFAULTS.crossfades,
@@ -199,6 +215,7 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
                        text_accent: str = _RS_DEFAULTS.text_accent,
                        text_font: str = _RS_DEFAULTS.text_font,
                        text_font_path: str = _RS_DEFAULTS.text_font_path,
+                       media_aware: bool = _RS_DEFAULTS.media_aware,
                        settings: dict | None = None,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None) -> StatusResult:
@@ -212,11 +229,13 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
             effect_mode=effect_mode, effect_palette=effect_palette,
             effect_seed=effect_seed, look_cube=look_cube,
             variety=variety, semantic_variety=semantic_variety,
+            semantic_fx=semantic_fx,
             speed_ramps=speed_ramps, split_screen=split_screen,
             crossfades=crossfades, text_entries=text_entries,
             text_position=text_position, text_scale=text_scale,
             text_style=text_style, text_accent=text_accent,
             text_font=text_font, text_font_path=text_font_path,
+            media_aware=media_aware,
         )
         rs = RenderSettings.from_dict(settings, base=rs)
         parallel_workers = PARALLEL_WORKERS
@@ -485,11 +504,12 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
                  effect_style: str,
                  effect_intensity: float, effect_mode: str,
                  effect_palette: List[str], effect_seed: float,
-                 look_cube: str, variety: float, semantic_variety: float, speed_ramps: bool,
+                 look_cube: str, variety: float, semantic_variety: float,
+                 semantic_fx: bool, speed_ramps: bool,
                  split_screen: bool, crossfades: bool,
                  text_entries: str, text_position: str,
                  text_scale: float, text_style: str, text_accent: str,
-                 text_font: str, text_font_path: str,
+                 text_font: str, text_font_path: str, media_aware: bool,
                  session_state: dict) -> Iterator[StatusResult]:
     status_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
@@ -508,9 +528,10 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
     render_settings = dict(zip(SETTINGS_KEYS, (
         fit_mode, output_format, effect_style, effect_intensity,
         effect_mode, effect_palette, effect_seed, look_cube,
-        variety, semantic_variety, speed_ramps, split_screen, crossfades,
+        variety, semantic_variety, semantic_fx,
+        speed_ramps, split_screen, crossfades,
         text_entries, text_position, text_scale, text_style, text_accent,
-        text_font, text_font_path,
+        text_font, text_font_path, media_aware,
     ), strict=True))
 
     def progress_callback(message: str) -> None:

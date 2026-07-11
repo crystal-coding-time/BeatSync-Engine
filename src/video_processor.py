@@ -520,6 +520,7 @@ def create_clip_parallel(job: ClipJob):
             palette_seed=opts.get('effect_seed', 0),
             local_beats=(opts.get('segment_beats') or {}).get(i),
             transitions=opts.get('transitions', True),
+            semantic_fx=opts.get('semantic_fx', False),
         )
 
         if is_image_source(video_file):
@@ -738,6 +739,8 @@ class RenderContext:
     text_font: str
     variety: float
     semantic_variety: float
+    media_aware: bool
+    semantic_fx: bool
     speed_ramps: bool
     split_screen: bool
     crossfades: bool
@@ -795,6 +798,11 @@ def _resolve_render_config(audio_file: str, video_files: VideoList,
     # on this function) — read it alongside the other settings, defaulting to
     # the same 0.4 the GUI slider ships with.
     semantic_variety = float((settings or {}).get('semantic_variety', 0.4))
+    # Media-aware planning and content-aware effects travel the same
+    # settings-dict-only route as semantic_variety; both default False so
+    # every existing plan stays byte-identical.
+    media_aware = bool((settings or {}).get('media_aware', False))
+    semantic_fx = bool((settings or {}).get('semantic_fx', False))
 
     video_creation_started = time.perf_counter()
 
@@ -918,6 +926,7 @@ def _resolve_render_config(audio_file: str, video_files: VideoList,
         text_style=text_style, text_accent=text_accent,
         text_font=text_font,
         variety=variety, semantic_variety=semantic_variety,
+        media_aware=media_aware, semantic_fx=semantic_fx,
         speed_ramps=speed_ramps, split_screen=split_screen,
         crossfades=crossfades, selected_beats=selected_beats,
         segment_frames=segment_frames, segment_durations=segment_durations,
@@ -980,6 +989,10 @@ def _plan_visuals(ctx: RenderContext) -> None:
         # precise mode never pairs clips, so don't even ask for duos there.
         split_screen=split_screen and not lossless_mode,
         target_size=target_size,
+        # Media-aware auction adjustments (planner picks only — like variety,
+        # they choose WHICH source serves a segment, never how it is rendered,
+        # so ProRes precise mode keeps them too).
+        media_aware=ctx.media_aware,
     )
     if planned_clip_sequence:
         plan_summary = summarize_clip_plan(
@@ -1435,6 +1448,9 @@ def _render_standard(ctx: RenderContext) -> str:
         'tempo': (beat_info or {}).get('tempo'),
         'text_plan': text_plan,
         'segment_beats': segment_beats,
+        # Content-aware effect selection (veto matrix + impact-weighted
+        # firing) inside build_effect_filters; False = historical engine.
+        'semantic_fx': ctx.semantic_fx,
         # Split transitions ride the effects engine, so they follow the
         # style: any non-clean style gets them.
         'transitions': bool(effect_style and effect_style != 'clean'),

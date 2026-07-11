@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import os
 import random
 from collections import Counter, deque
 from typing import Dict, List, Sequence
@@ -165,6 +167,7 @@ def build_planned_clip_sequence(
     split_screen: bool = False,
     target_size: tuple | None = None,
     semantic_variety: float = 0.0,
+    media_aware: bool = False,
 ) -> List[PlannedClip]:
     """Build exact source clip choices for every output segment.
 
@@ -218,6 +221,15 @@ def build_planned_clip_sequence(
     (width, height) used only to decide pairing orientation — the caller
     (video_processor, wave 7C) passes its resolved target resolution; None is
     treated as a landscape 16:9 canvas.
+
+    media_aware=False (the default) adds NOTHING — plans stay byte-identical.
+    When True, the auctions add signed adjustments computed OUTSIDE the score
+    cache (see _media_aware_adjustment): an upscale penalty for sub-canvas
+    sources (target_size supplies the canvas width), a loop-seam penalty for
+    seamy GIFs on segments longer than one GIF pass, and a native-frame-pair
+    kinetic correction for sub-15fps sources. All the fields it reads
+    (media_type, source_width, loop_seam, kinetic_native) are optional —
+    missing data means no adjustment.
     """
     beat_info = beat_info or {}
     video_analysis = beat_info.get("video_analysis") or {}
@@ -278,6 +290,19 @@ def build_planned_clip_sequence(
     if split_screen and not lossless:
         duo_pair_files = _duo_pair_files(candidates, target_size)
 
+    # Media-aware auction state (media_aware=True only): the canvas width the
+    # upscale penalty measures against, plus fire counters for the one debug
+    # line below. media_aware=False leaves canvas_w=0/stats=None and no call
+    # sites touch them, so legacy plans cannot be perturbed.
+    canvas_w = 0
+    media_stats: Counter | None = None
+    if media_aware:
+        try:
+            canvas_w = int(target_size[0]) if target_size else 0
+        except (TypeError, ValueError, IndexError):
+            canvas_w = 0
+        media_stats = Counter()
+
     recent_ids = deque(maxlen=10)
     recent_videos = deque(maxlen=5)
     usage = Counter()
@@ -305,6 +330,9 @@ def build_planned_clip_sequence(
                 recent_clusters=recent_clusters,
                 recent_embeds=recent_embeds,
                 embed_arrays=embed_arrays,
+                media_aware=media_aware,
+                canvas_w=canvas_w,
+                media_stats=media_stats,
             )
         if not candidate:
             continue
@@ -336,6 +364,9 @@ def build_planned_clip_sequence(
                 recent_clusters=recent_clusters,
                 recent_embeds=recent_embeds,
                 embed_arrays=embed_arrays,
+                media_aware=media_aware,
+                canvas_w=canvas_w,
+                media_stats=media_stats,
             )
         if partner_candidate is not None:
             planned_clip["partner"] = _materialize_partner(
@@ -367,6 +398,13 @@ def build_planned_clip_sequence(
             if semantic_variety > 0.0:
                 _record_semantic(partner_candidate, recent_clusters,
                                  recent_embeds, embed_arrays)
+
+    if media_aware and media_stats is not None:
+        print(f"   🧩 Media-aware auction (canvas {canvas_w}px): "
+              f"upscale penalty ×{media_stats['upscale']}, "
+              f"loop-seam penalty ×{media_stats['loop_seam']}, "
+              f"native-kinetic correction ×{media_stats['kinetic_native']} "
+              f"(candidate evaluations)")
 
     if len(planned) != len(durations_arr):
         return []
@@ -991,6 +1029,89 @@ def _semantic_penalty(candidate: Dict, semantic_variety: float,
     return penalty
 
 
+def _candidate_media_type(candidate: Dict) -> str:
+    """'still' | 'gif' | 'video' for a candidate.
+
+    Reads the analysis-time media_type field; candidates from sidecars that
+    predate it (or external callers) fall back to the same extension-based
+    derivation video_analysis uses, so the answer is identical either way.
+    """
+    media_type = candidate.get("media_type")
+    if media_type:
+        return str(media_type)
+    path = str(candidate.get("video_file") or "")
+    if os.path.splitext(path)[1].lower() == ".gif":
+        return "gif"
+    from ffmpeg_processing import is_image_source
+    return "still" if is_image_source(path) else "video"
+
+
+def _media_aware_adjustment(candidate: Dict, profile: SegmentProfile,
+                            canvas_w: int,
+                            stats: "Counter | None" = None) -> float:
+    """Signed auction score delta for media-aware planning (media_aware only).
+
+    Deliberately applied OUTSIDE ``_ScoreCache`` alongside the other auction
+    penalties (recency/usage/PF/semantic), so the cache keeps its exact
+    (candidate, target, quantized-energy) key semantics. Three terms, each
+    zero when its data is missing (graceful degradation):
+
+      * upscale: -0.12 * log2(canvas_w / source_w) for sources narrower than
+        the output canvas — every halving of resolution costs another 0.12.
+        Stills are exempt: they are often high-res photos, and their synthetic
+        metadata is a separate policy problem for a later work package.
+      * loop-seam: -0.20 * loop_seam for a GIF serving a segment longer than
+        one GIF pass (it will visibly wrap) — seamless GIFs (seam≈0) stay
+        preferred fillers, seamy ones keep winning sub-loop-length segments.
+      * native-kinetic: sub-15fps sources carry ``kinetic_native`` (optical
+        flow on consecutive native frame pairs; the standard fixed-dt sampling
+        produces garbage magnitudes there). The cached score already paid the
+        wave-16 energy term with the bogus ``kinetic``; this adds exactly the
+        difference so the effective energy term uses the native measurement.
+
+    ``stats`` (when provided) counts per-evaluation fires for the one debug
+    line the planner prints.
+    """
+    delta = 0.0
+    media_type = _candidate_media_type(candidate)
+
+    if media_type != "still" and canvas_w > 0:
+        try:
+            source_w = float(candidate.get("source_width") or 0.0)
+        except (TypeError, ValueError):
+            source_w = 0.0
+        if 0.0 < source_w < canvas_w:
+            delta -= 0.12 * math.log2(canvas_w / source_w)
+            if stats is not None:
+                stats["upscale"] += 1
+
+    if media_type == "gif":
+        seam = _clamp(candidate.get("loop_seam", 0.0))
+        try:
+            loop_duration = float(candidate.get("video_duration") or 0.0)
+            segment_duration = float(profile["duration"])
+        except (TypeError, ValueError, KeyError):
+            loop_duration = segment_duration = 0.0
+        if seam > 0.0 and loop_duration > 0.0 and segment_duration > loop_duration:
+            delta -= 0.20 * seam
+            if stats is not None:
+                stats["loop_seam"] += 1
+
+    kinetic_native = candidate.get("kinetic_native")
+    if kinetic_native is not None:
+        e_seg = _segment_energy(profile)
+        # Mirror _score_candidate's e_clip expression exactly, then swap it
+        # for the native measurement: delta = new energy term - old one.
+        e_old = _clamp(candidate.get("kinetic", candidate.get("motion", 0.0)))
+        e_new = _clamp(kinetic_native)
+        if e_new != e_old:
+            delta += 0.18 * (abs(e_old - e_seg) - abs(e_new - e_seg))
+            if stats is not None:
+                stats["kinetic_native"] += 1
+
+    return delta
+
+
 def _choose_candidate(
     candidates: Sequence[Dict],
     profile: SegmentProfile,
@@ -1008,6 +1129,9 @@ def _choose_candidate(
     recent_clusters: "deque | None" = None,
     recent_embeds: "deque | None" = None,
     embed_arrays: "Dict[int, np.ndarray] | None" = None,
+    media_aware: bool = False,
+    canvas_w: int = 0,
+    media_stats: "Counter | None" = None,
 ) -> Dict | None:
     best_candidate = None
     best_score = -999.0
@@ -1045,6 +1169,10 @@ def _choose_candidate(
             score -= _semantic_penalty(candidate, semantic_variety,
                                        recent_clusters, recent_embeds,
                                        embed_arrays)
+
+        if media_aware:
+            score += _media_aware_adjustment(candidate, profile, canvas_w,
+                                             media_stats)
 
         score += rng.random() * 0.015
         if score > best_score:
@@ -1225,6 +1353,16 @@ def _materialize_clip(candidate: Dict, profile: SegmentProfile, index: int,
         "wave": profile.get("wave"),
         "impact": profile.get("impact"),
         "loudness": profile.get("loudness"),
+        # Content profile for the semantic_fx effect gate: measured motion and
+        # stage5 semantic scores travel with the plan so effects.py can veto
+        # primitives that clash with the footage. Extra keys are inert to the
+        # renderer; missing candidate fields forward as None (graceful).
+        "kinetic": candidate.get("kinetic"),
+        "subject_motion": candidate.get("subject_motion"),
+        "motion": candidate.get("motion"),
+        "action_score": candidate.get("action_score"),
+        "beauty_score": candidate.get("beauty_score"),
+        "semantic": candidate.get("semantic"),
     }
 
 
@@ -1285,6 +1423,9 @@ def _maybe_choose_duo_partner(
     recent_clusters: "deque | None" = None,
     recent_embeds: "deque | None" = None,
     embed_arrays: "Dict[int, np.ndarray] | None" = None,
+    media_aware: bool = False,
+    canvas_w: int = 0,
+    media_stats: "Counter | None" = None,
 ) -> Dict | None:
     """Partner candidate for a duo segment, or None to render the primary solo.
 
@@ -1353,6 +1494,10 @@ def _maybe_choose_duo_partner(
             score -= _semantic_penalty(candidate, semantic_variety,
                                        recent_clusters, recent_embeds,
                                        embed_arrays)
+
+        if media_aware:
+            score += _media_aware_adjustment(candidate, profile, canvas_w,
+                                             media_stats)
 
         anchor = candidate.get("subject_anchor")
         try:

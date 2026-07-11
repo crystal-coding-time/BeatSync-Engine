@@ -39,7 +39,12 @@ from visual_embeddings import OptionalBackend, SidecarCache
 
 setup_environment()
 
-ANALYSIS_VERSION = "auto_av_analysis_v11_flow"
+# v12: candidates additionally carry media_type/source_width/source_height/
+# source_fps, GIF loop_seam, and *_native flow for sub-15fps sources (the
+# media-aware planner's inputs). The bump recomputes stale sidecars; every
+# pre-existing field is derived exactly as in v11, so plans that ignore the
+# new fields stay byte-identical.
+ANALYSIS_VERSION = "auto_av_analysis_v12_media"
 DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models")
 DEFAULT_QWEN_GGUF_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "Qwen3VL-2B-Instruct-Q8_0.gguf")
 DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
@@ -715,6 +720,23 @@ def _analyze_single_video(
             )
         else:
             print(f"      Warning: OpenCV could not open {name}; candidate analysis skipped.")
+
+    # Media-intelligence fields (always computed — they are labels/metadata the
+    # planner only ACTS on when media_aware is enabled, so adding them never
+    # changes a legacy plan). media_type is derived purely from the extension,
+    # matching ffmpeg_processing.is_image_source's still/video split with GIFs
+    # called out separately.
+    if candidates:
+        ext = os.path.splitext(video_file)[1].lower()
+        media_type = ("still" if is_image_source(video_file)
+                      else "gif" if ext == ".gif" else "video")
+        for candidate in candidates:
+            candidate["media_type"] = media_type
+            candidate["source_width"] = int(width)
+            candidate["source_height"] = int(height)
+            candidate["source_fps"] = round(float(fps), 4)
+        if media_type != "still":
+            _annotate_lowfps_media(video_file, fps, media_type == "gif", candidates)
 
     qwen_seconds = 0.0
     if enable_ai and candidates and not defer_ai:
@@ -1479,6 +1501,88 @@ def _measure_flow(gray_frames: Sequence[np.ndarray], sample_dt: float) -> Dict[s
         print(f"   ⚠️  Optical-flow motion metrics failed ({exc}); keys omitted "
               f"(scoring falls back to plain frame-diff motion).")
         return {}
+
+
+# Sources below this fps get an additional native-frame-pair flow measurement:
+# the standard window sampling spaces samples ~0.3-0.7s apart, and Farneback
+# magnitudes over gaps that wide (several source frames of displacement) are
+# garbage. GIFs typically run 10-15fps.
+_NATIVE_FLOW_MAX_FPS = 15.0
+# Full-decode cap for the extras pass (low-fps sources only, frames already
+# resized to <=360px — at 15fps this covers 80s of source).
+_LOWFPS_DECODE_MAX_FRAMES = 1200
+
+
+def _annotate_lowfps_media(video_file: str, fps: float, is_gif: bool,
+                           candidates: List[Dict]) -> None:
+    """GIF loop-seam + native-pair optical flow extras for low-fps sources.
+
+    Adds ONLY new candidate fields — ``loop_seam`` (grayscale absdiff mean of
+    last vs. first frame, 0..1, 0 = seamless loop; GIFs only) and
+    ``kinetic_native``/``subject_motion_native``/``camera_motion_native``
+    (``_measure_flow`` on consecutive native frames with dt = 1/source_fps;
+    sub-15fps sources only). The existing kinetic/motion keys are never
+    touched, so plans that ignore these fields stay byte-identical. Values are
+    4dp-rounded like the rest of the sidecar (determinism firewall). Any
+    failure leaves the fields absent after one log line — the media-aware
+    planner treats missing data as "no adjustment".
+    """
+    measure_native = float(fps) < _NATIVE_FLOW_MAX_FPS
+    if not candidates or not (is_gif or measure_native):
+        return
+    try:
+        cap = _open_video_capture(video_file)
+        if not cap.isOpened():
+            return
+        gray_frames: List[np.ndarray] = []
+        try:
+            while len(gray_frames) < _LOWFPS_DECODE_MAX_FRAMES:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                gray_frames.append(cv2.cvtColor(
+                    _resize_for_analysis(frame, max_width=360),
+                    cv2.COLOR_BGR2GRAY))
+        finally:
+            cap.release()
+        if len(gray_frames) < 2:
+            return
+
+        note_parts = [f"{len(gray_frames)} native frames"]
+        if is_gif:
+            seam = round(float(np.mean(cv2.absdiff(gray_frames[-1],
+                                                   gray_frames[0]))) / 255.0, 4)
+            for candidate in candidates:
+                candidate["loop_seam"] = seam
+            note_parts.append(f"loop seam {seam:.3f}")
+
+        if measure_native:
+            dt = 1.0 / max(1e-6, float(fps))
+            whole_flow: Dict[str, float] | None = None
+            annotated = 0
+            for candidate in candidates:
+                i0 = max(0, int(round(float(candidate.get("start", 0.0)) * fps)))
+                i1 = min(len(gray_frames),
+                         int(round(float(candidate.get("end", 0.0)) * fps)) + 1)
+                window = gray_frames[i0:i1]
+                if len(window) < 2:
+                    # Degenerate window (still-like or probe drift): fall back
+                    # to one whole-source measurement, computed at most once.
+                    if whole_flow is None:
+                        whole_flow = _measure_flow(gray_frames, dt)
+                    flow = whole_flow
+                else:
+                    flow = _measure_flow(window, dt)
+                for key in ("kinetic", "subject_motion", "camera_motion"):
+                    if key in flow:
+                        candidate[f"{key}_native"] = float(flow[key])
+                        annotated += 1
+            note_parts.append(f"native flow on {annotated // 3} candidates "
+                              f"(dt={dt:.3f}s)")
+        print(f"      Low-fps media extras: {', '.join(note_parts)}")
+    except Exception as exc:
+        print(f"      ⚠️  Low-fps media extras skipped for "
+              f"{_safe_name(video_file)}: {exc}")
 
 
 def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarray,

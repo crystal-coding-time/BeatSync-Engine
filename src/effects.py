@@ -64,6 +64,16 @@ class EffectContext:
     pack: int
     mirror_used: bool
     needs_scale_restore: bool
+    # Firing-probability multiplier (semantic_fx only). Builders fold it into
+    # their WHETHER-thresholds (`rng.random() < P * k * ctx.fire_scale`) so
+    # effects concentrate where the music hits. Exactly 1.0 whenever
+    # semantic_fx is off: X * 1.0 == X bit-for-bit in IEEE754 and the rng
+    # draw count is unchanged, so the off-path draw sequence and every
+    # comparison stay byte-identical to the pre-semantic_fx engine. Unlike
+    # _loudness_gain (amplitude only), this multiplier deliberately changes
+    # WHETHER an effect fires — that is its whole job, and it is allowed to
+    # because the semantic_fx flag gates it.
+    fire_scale: float = 1.0
 
 
 def _stable_rng(*parts) -> random.Random:
@@ -97,6 +107,97 @@ def _loudness_gain(ctx: EffectContext) -> float:
     if loudness is None:
         return 1.0
     return 0.75 + 0.5 * _clamp01(loudness)
+
+
+# ---------------------------------------------------------------------------
+# Effect x content compatibility (semantic_fx only). A declarative matrix of
+# primitive id -> predicate over the planned clip's semantic/motion fields,
+# consulted BEFORE each builder runs, as a veto: a vetoed primitive's builder
+# is never called, so none of its rng draws happen. That reshuffles the shared
+# ctx.rng stream for everything after it — which is exactly why the matrix is
+# only ever consulted when semantic_fx is ON; the off-path loop is untouched
+# and consumes the exact historical draw sequence.
+#
+# Graceful degradation: every field read returns None when the planner didn't
+# supply it, and a predicate whose inputs are all unknown passes — un-analyzed
+# clips behave as today. Today's plan dicts (stage6 _materialize_clip) carry
+# 'impact' but NOT the optical-flow motion metrics (kinetic/subject_motion)
+# or stage5 semantic scores (action/beauty/character) — those still live on
+# the candidate dicts. The reads below cover both the flat spellings and the
+# stage5 'semantic' sub-dict spellings so the matrix lights up the moment the
+# planner starts forwarding them, without an effects.py change.
+# ---------------------------------------------------------------------------
+
+
+def _sem_field(clip: Dict, *keys) -> Optional[float]:
+    """First present numeric among flat clip keys, then the stage5 'semantic'
+    sub-dict; None when the plan carries none of the spellings."""
+    sem = clip.get('semantic')
+    sem = sem if isinstance(sem, dict) else {}
+    for key in keys:
+        for source in (clip, sem):
+            value = source.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0.0, min(1.0, float(value)))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _sem_needs_motion(clip: Dict) -> bool:
+    # Glitch/shake family sells motion; veto on footage we KNOW is serene.
+    kinetic = _sem_field(clip, 'kinetic', 'motion')
+    action = _sem_field(clip, 'action', 'action_score', 'action_intensity')
+    if kinetic is None and action is None:
+        return True
+    return ((kinetic is not None and kinetic >= 0.35)
+            or (action is not None and action >= 0.5))
+
+
+def _sem_needs_impact(clip: Dict) -> bool:
+    # Punch/flash effects sell a hit; no hit, no punch.
+    impact = _sem_field(clip, 'impact')
+    return impact is None or impact >= 0.4
+
+
+def _sem_calm_subject(clip: Dict) -> bool:
+    # Smears read as mush over busy subjects.
+    subject = _sem_field(clip, 'subject_motion')
+    return subject is None or subject <= 0.5
+
+
+def _sem_not_beauty_dominant(clip: Dict) -> bool:
+    # Tilting/warping serene beauty shots undercuts them.
+    beauty = _sem_field(clip, 'beauty', 'beauty_score')
+    if beauty is None or beauty < 0.6:
+        return True
+    action = _sem_field(clip, 'action', 'action_score', 'action_intensity')
+    return action is not None and action >= 0.3
+
+
+def _sem_not_face_dominant(clip: Dict) -> bool:
+    # Mirrored faces look wrong.
+    character = _sem_field(clip, 'character', 'character_focus')
+    return character is None or character < 0.6
+
+
+SEMANTIC_FX_MATRIX = {
+    'strobe': _sem_needs_motion,
+    'pixelize_burst': _sem_needs_motion,
+    'chroma_shift': _sem_needs_motion,
+    'shake': _sem_needs_motion,
+    'white_flash': _sem_needs_impact,
+    'punch_zoom': _sem_needs_impact,
+    'punch_fill': _sem_needs_impact,
+    'trails': _sem_calm_subject,
+    'hue_sweep': _sem_calm_subject,
+    'dutch_tilt': _sem_not_beauty_dominant,
+    'fisheye': _sem_not_beauty_dominant,
+    'half_mirror': _sem_not_face_dominant,
+    'kaleido_quad': _sem_not_face_dominant,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +256,7 @@ def _fx_punch_fill(ctx: EffectContext) -> None:
     # Rare in curated mode (~1 in 4 eligible hybrid-tier drops; only AMV/Hype
     # ever reach the builders); boosted in custom/shuffle, keeping the drop
     # affinity, so a ticked palette entry actually shows up.
-    chance = 0.25 if ctx.curated else 0.6 * ctx.k
+    chance = (0.25 if ctx.curated else 0.6 * ctx.k) * ctx.fire_scale
     if fill_rng.random() >= chance:
         return
     # f_fill/f_fit is the zoom that takes the letterboxed fit to full-bleed.
@@ -269,7 +370,7 @@ def _fx_dutch_tilt(ctx: EffectContext) -> None:
     # Rare in curated mode (~1 in 6 eligible drop/rhythm segments, and only
     # AMV/Hype ever reach the builders); boosted in custom/shuffle so a
     # ticked palette entry actually shows up.
-    chance = (1.0 / 6.0) if ctx.curated else 0.5 * ctx.k
+    chance = ((1.0 / 6.0) if ctx.curated else 0.5 * ctx.k) * ctx.fire_scale
     if tilt_rng.random() >= chance:
         return
     # 4-8 degrees at full intensity, scaled by k like the other primitives'
@@ -343,9 +444,9 @@ def _fx_sat_pulse(ctx: EffectContext) -> None:
 def _fx_chroma_shift(ctx: EffectContext) -> None:
     # Occasional chromatic aberration on hard segments.
     if ctx.curated:
-        fire = (ctx.hype or ctx.target == 'drop') and ctx.rng.random() < 0.35 * ctx.k
+        fire = (ctx.hype or ctx.target == 'drop') and ctx.rng.random() < 0.35 * ctx.k * ctx.fire_scale
     else:
-        fire = ctx.target in ('drop', 'rhythm', 'build') and ctx.rng.random() < 0.5 * ctx.k
+        fire = ctx.target in ('drop', 'rhythm', 'build') and ctx.rng.random() < 0.5 * ctx.k * ctx.fire_scale
     if not fire:
         return
     shift = 3 if ctx.hype else 2
@@ -356,10 +457,10 @@ def _fx_pixelize_burst(ctx: EffectContext) -> None:
     # Pixelize burst right at drop cuts, decaying quickly.
     if ctx.curated:
         fire = (ctx.hype and ctx.target == 'drop' and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.45 * ctx.k)
+                and ctx.rng.random() < 0.45 * ctx.k * ctx.fire_scale)
     else:
         fire = (ctx.target == 'drop' and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.6 * ctx.k)
+                and ctx.rng.random() < 0.6 * ctx.k * ctx.fire_scale)
     if not fire:
         return
     block = max(8, int(round(12 + 20 * ctx.k)))
@@ -371,10 +472,10 @@ def _fx_zoom_blur(ctx: EffectContext) -> None:
     # Directional smear standing in for zoom blur on drop cuts.
     if ctx.curated:
         fire = (ctx.target == 'drop' and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.30 * ctx.k)
+                and ctx.rng.random() < 0.30 * ctx.k * ctx.fire_scale)
     else:
         fire = (ctx.target == 'drop' and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.5 * ctx.k)
+                and ctx.rng.random() < 0.5 * ctx.k * ctx.fire_scale)
     if not fire:
         return
     radius = max(4, int(round(10 * ctx.k * (0.5 + 0.5 * ctx.energy) * _loudness_gain(ctx))))
@@ -443,7 +544,7 @@ def _fx_motion_smear(ctx: EffectContext) -> None:
     # Rare in curated mode (~1 in 6 eligible drop/rhythm segments, and only
     # AMV/Hype ever reach the builders); boosted in custom/shuffle so a
     # ticked palette entry actually shows up — same shape as dutch_tilt.
-    chance = (1.0 / 6.0) if ctx.curated else 0.5 * ctx.k
+    chance = ((1.0 / 6.0) if ctx.curated else 0.5 * ctx.k) * ctx.fire_scale
     if smear_rng.random() >= chance:
         return
     # frames=3-4, ascending weights. Verified empirically (scratch render:
@@ -495,10 +596,10 @@ def _fx_strobe(ctx: EffectContext) -> None:
     # in the first 0.6s (hype drops with strong impacts in curated mode).
     if ctx.curated:
         fire = (ctx.hype and ctx.target == 'drop' and ctx.energy > 0.75
-                and ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.25 * ctx.k)
+                and ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.25 * ctx.k * ctx.fire_scale)
     else:
         fire = (ctx.target == 'drop' and ctx.energy > 0.6
-                and ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.5 * ctx.k)
+                and ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.5 * ctx.k * ctx.fire_scale)
     if not fire:
         return
     ctx.filters.append("negate=enable='lt(mod(n,8),2)*lt(t,0.6)'")
@@ -509,10 +610,10 @@ def _fx_trails(ctx: EffectContext) -> None:
     # Motion trails on calmer segments: frame-mix echo, or lagfun light-paint.
     if ctx.curated:
         fire = (ctx.target in ('flow', 'soft') and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.30 * ctx.k)
+                and ctx.rng.random() < 0.30 * ctx.k * ctx.fire_scale)
     else:
         fire = (ctx.target in ('flow', 'soft') and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.55 * ctx.k)
+                and ctx.rng.random() < 0.55 * ctx.k * ctx.fire_scale)
     if not fire:
         return
     lag = (ctx.hype if ctx.curated else True) and ctx.rng.random() < 0.5
@@ -529,10 +630,10 @@ def _fx_hue_sweep(ctx: EffectContext) -> None:
     # Slow hue sweep through build-ups.
     if ctx.curated:
         fire = (ctx.hype and ctx.target == 'build' and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.35 * ctx.k)
+                and ctx.rng.random() < 0.35 * ctx.k * ctx.fire_scale)
     else:
         fire = (ctx.target == 'build' and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.6 * ctx.k)
+                and ctx.rng.random() < 0.6 * ctx.k * ctx.fire_scale)
     if not fire:
         return
     rate = 30 + int(round(60 * ctx.k))
@@ -543,9 +644,9 @@ def _fx_hue_sweep(ctx: EffectContext) -> None:
 def _fx_fisheye(ctx: EffectContext) -> None:
     # Rare subtle fisheye bulge.
     if ctx.curated:
-        fire = ctx.hype and ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.12 * ctx.k
+        fire = ctx.hype and ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.12 * ctx.k * ctx.fire_scale
     else:
-        fire = ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.25 * ctx.k
+        fire = ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.25 * ctx.k * ctx.fire_scale
     if not fire:
         return
     ctx.filters.append(f"lenscorrection=k1={-0.15 * ctx.k:.3f}:k2=-0.05:i=bilinear")
@@ -556,10 +657,10 @@ def _fx_posterize_flash(ctx: EffectContext) -> None:
     # Posterize flash on drops (8 luma levels, first 0.3s).
     if ctx.curated:
         fire = (ctx.hype and ctx.target == 'drop' and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.15 * ctx.k)
+                and ctx.rng.random() < 0.15 * ctx.k * ctx.fire_scale)
     else:
         fire = (ctx.target == 'drop' and ctx.pack < ctx.pack_cap
-                and ctx.rng.random() < 0.35 * ctx.k)
+                and ctx.rng.random() < 0.35 * ctx.k * ctx.fire_scale)
     if not fire:
         return
     ctx.filters.append("lutyuv=y='floor(val/32)*32+16':enable='lt(t,0.3)'")
@@ -573,7 +674,7 @@ def _fx_half_mirror(ctx: EffectContext) -> None:
     # segment (they all restructure the whole frame).
     if ctx.curated or ctx.mirror_used or ctx.pack >= ctx.pack_cap:
         return
-    if not (ctx.target in ('rhythm', 'flow', 'build') and ctx.rng.random() < 0.4 * ctx.k):
+    if not (ctx.target in ('rhythm', 'flow', 'build') and ctx.rng.random() < 0.4 * ctx.k * ctx.fire_scale):
         return
     ctx.filters.append(
         "crop=iw/2:ih:0:0,split[mfa][mfb];[mfb]hflip[mfbf];[mfa][mfbf]hstack"
@@ -586,7 +687,7 @@ def _fx_kaleido_quad(ctx: EffectContext) -> None:
     # Four-way kaleidoscope: top-left quarter mirrored across both axes.
     if ctx.curated or ctx.mirror_used or ctx.pack >= ctx.pack_cap:
         return
-    if not (ctx.target in ('drop', 'build') and ctx.rng.random() < 0.25 * ctx.k):
+    if not (ctx.target in ('drop', 'build') and ctx.rng.random() < 0.25 * ctx.k * ctx.fire_scale):
         return
     ctx.filters.append(
         "crop=iw/2:ih/2:0:0,split[kqa][kqb];[kqb]hflip[kqbf];[kqa][kqbf]hstack,"
@@ -602,7 +703,7 @@ def _fx_beat_flip(ctx: EffectContext) -> None:
     # interval; without them it approximates from the tempo.
     if ctx.curated or ctx.mirror_used or ctx.pack >= ctx.pack_cap:
         return
-    if not (ctx.target in ('rhythm', 'drop') and ctx.rng.random() < 0.35 * ctx.k):
+    if not (ctx.target in ('rhythm', 'drop') and ctx.rng.random() < 0.35 * ctx.k * ctx.fire_scale):
         return
     beats = ctx.beats
     if len(beats) >= 2:
@@ -632,7 +733,7 @@ def _fx_vignette_grain(ctx: EffectContext) -> None:
     if not fire:
         return
     ctx.filters.append("vignette=PI/5")
-    if ctx.rng.random() < 0.5 * ctx.k:
+    if ctx.rng.random() < 0.5 * ctx.k * ctx.fire_scale:
         ctx.filters.append("noise=alls=5:allf=t")
 
 
@@ -796,12 +897,20 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
                          palette: Optional[Sequence[str]] = None,
                          palette_seed: int = 0,
                          local_beats: Optional[Sequence[float]] = None,
-                         transitions: bool = True) -> List[str]:
+                         transitions: bool = True,
+                         semantic_fx: bool = False) -> List[str]:
     """Return -vf snippets for one segment. Empty list = no effects.
 
     local_beats are the segment's interior beat times in its own clock; when
     provided, beat-locked primitives gate on the real beats instead of a
     tempo-frequency approximation.
+
+    semantic_fx (default off) turns on content-aware effect selection: the
+    SEMANTIC_FX_MATRIX vetoes primitives that clash with the clip's
+    semantic/motion profile, and firing probabilities scale with the
+    segment's musical impact (ctx.fire_scale). Off (the default) the loop,
+    thresholds and rng draw sequence are byte-identical to the
+    pre-semantic_fx engine.
     """
     if not style or style == 'clean':
         return []
@@ -873,8 +982,16 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
         # (shake's crop; the whip_pan transition's crop) so the trailing
         # restore scale runs only when it's actually needed.
         needs_scale_restore=False,
+        # Impact-weighted firing (semantic_fx only): 0.6x on dead-quiet
+        # segments up to 1.4x on full hits, so effects concentrate where the
+        # music actually lands. Missing 'impact' -> _clamp01 default 0.5 ->
+        # exactly 1.0, and semantic_fx off -> exactly 1.0: multiplying a
+        # threshold by 1.0 is an IEEE754 no-op, so the off-path comparisons
+        # (and draw sequence) stay bit-for-bit historical.
+        fire_scale=(0.6 + 0.8 * _clamp01(clip.get('impact'))) if semantic_fx else 1.0,
     )
 
+    vetoed: List[str] = []
     for pid in sequence:
         if palette_set is not None:
             # push_in/pull_out share one builder invoked under 'push_in'.
@@ -883,7 +1000,25 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
                     continue
             elif pid not in palette_set:
                 continue
+        if semantic_fx:
+            # Effect x content veto BEFORE the builder's probability roll:
+            # a vetoed builder is never called, so it consumes no rng. This
+            # branch is only ever reached with semantic_fx on — the off-path
+            # loop body is exactly the historical one.
+            predicate = SEMANTIC_FX_MATRIX.get(pid)
+            if predicate is not None and not predicate(clip):
+                vetoed.append(pid)
+                continue
         EFFECT_REGISTRY[pid]['builder'](ctx)
+
+    if semantic_fx and (vetoed or abs(ctx.fire_scale - 1.0) >= 0.005):
+        # One inspectable line per segment in the render log (max).
+        notes = []
+        if vetoed:
+            notes.append(f"veto {','.join(vetoed)}")
+        if abs(ctx.fire_scale - 1.0) >= 0.005:
+            notes.append(f"fire x{ctx.fire_scale:.2f} (impact {_clamp01(clip.get('impact')):.2f})")
+        print(f"   🎛 semantic_fx seg {segment_index}: {'; '.join(notes)}")
 
     filters = ctx.filters
 

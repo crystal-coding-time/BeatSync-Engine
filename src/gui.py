@@ -595,6 +595,9 @@ def create_ui() -> gr.Blocks:
                         effect_intensity_input = gr.Slider(
                             0.0, 1.0, value=0.7, step=0.05, label='Effect intensity',
                             info='How hard the beat-aware effects hit. Lower = subtle pulses; higher = punchier zooms and flashes on the drops.')
+                        semantic_fx_input = gr.Checkbox(
+                            value=False, label='Content-aware effects',
+                            info='Effects check the footage before firing: no glitch or shake on serene clips, no mirror effects on face close-ups, and effects concentrate where the music hits hardest. Untagged clips fall back to measured motion; missing data means the effect behaves as before.')
                         with gr.Accordion('Customize effects (optional)', open=False):
                             effect_mode_input = gr.Radio(
                                 choices=[('Curated', 'curated'), ('Custom', 'custom'), ('Surprise shuffle', 'shuffle')],
@@ -643,6 +646,9 @@ def create_ui() -> gr.Blocks:
                         semantic_variety_input = gr.Slider(
                             0.0, 1.0, value=0.4, step=0.05, label='Visual variety',
                             info='Avoid runs of visually similar shots. Breaks near-ties; never overrides a clearly better-fitting clip. Needs the DINOv2 model (scripts/fetch_dinov2.py) and onnxruntime.')
+                        media_aware_input = gr.Checkbox(
+                            value=False, label='Media-aware selection',
+                            info='Smarter picks for mixed uploads: low-resolution clips are less likely to be blown up onto the canvas, GIFs prefer segments they can cover in one pass (seamless loops are exempt), and GIF motion is measured at its native speed.')
                         split_screen_input = gr.Checkbox(
                             value=True, label='Pair vertical clips (split screen)',
                             info='Renders some high-energy segments as two cross-orientation clips (side by side on a landscape canvas, stacked on portrait). Needs two or more such sources; duo boundaries are never crossfaded. H.264/HEVC modes only.')
@@ -790,6 +796,7 @@ def create_ui() -> gr.Blocks:
                     effect_style_input, look_input,
                     effect_mode_input, effect_palette_input, effect_seed_input,
                     effect_intensity_input, semantic_variety_input,
+                    semantic_fx_input,
                     speed_ramps_input, split_screen_input, crossfades_input,
                     text_entries_input, text_position_input, text_scale_input,
                     text_style_input, text_accent_input,
@@ -867,10 +874,12 @@ def create_ui() -> gr.Blocks:
             effect_style_input, effect_intensity_input,
             effect_mode_input, effect_palette_input, effect_seed_input,
             look_input, variety_input, semantic_variety_input,
+            semantic_fx_input,
             speed_ramps_input, split_screen_input, crossfades_input,
             text_entries_input, text_position_input, text_scale_input,
             text_style_input, text_accent_input,
             text_font_input, text_font_path_input,
+            media_aware_input,
         ]
         assert len(SETTINGS_KEYS) == len(settings_components)
 

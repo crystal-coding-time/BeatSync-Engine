@@ -206,6 +206,14 @@ class _PlannedClipRequired(TypedDict):
     wave: Optional[float]
     impact: Optional[float]
     loudness: Optional[float]
+    # Candidate content profile, forwarded verbatim for the semantic_fx
+    # effect gate (effects._sem_field); None/absent degrades gracefully.
+    kinetic: Optional[float]
+    subject_motion: Optional[float]
+    motion: Optional[float]
+    action_score: Optional[float]
+    beauty_score: Optional[float]
+    semantic: Optional[dict]
 
 
 class PlannedClip(_PlannedClipRequired, total=False):
