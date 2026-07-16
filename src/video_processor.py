@@ -50,6 +50,7 @@ from ffmpeg_processing import (
     seconds_to_frame_count,
     frame_count_to_seconds,
     is_image_source,
+    contributes_render_fps,
     build_ken_burns_filter,
     count_video_frames,
     retime_source_window,
@@ -817,12 +818,13 @@ def _resolve_render_config(audio_file: str, video_files: VideoList,
     # Determine FPS to use
     if fps is None:
         # Auto-detect from the first real video file. Stills have no timebase
-        # of their own, so they must never decide the render fps.
+        # of their own and GIF display-duration timing must not set the render
+        # clock (contributes_render_fps), so neither can decide the fps.
         try:
-            fps_source = next((f for f in video_files if not is_image_source(f)), None)
+            fps_source = next((f for f in video_files if contributes_render_fps(f)), None)
             if fps_source is None:
                 fps = 30.0
-                print(f"🎞️ All sources are still images; using default FPS: {fps}")
+                print(f"🎞️ No real-video source (stills/GIFs only); using default FPS: {fps}")
             else:
                 fps = get_video_fps(fps_source)
                 print(f"🎞️ Auto-detected FPS from input video: {fps}")

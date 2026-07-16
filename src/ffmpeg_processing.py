@@ -205,6 +205,87 @@ def is_image_source(path: str) -> bool:
     return os.path.splitext(str(path))[1].lower() in IMAGE_EXTENSIONS
 
 
+def contributes_render_fps(path: str) -> bool:
+    """True when a source's container fps is a valid vote for the render fps.
+
+    Stills have no timebase (the probe layer reports a synthetic 30) and GIFs
+    run on display durations at ~10-15fps that must not drag the whole render
+    down — both are resampled onto the canvas clock by the fps= stage at
+    extraction, so neither gets a vote.
+    """
+    ext = os.path.splitext(str(path))[1].lower()
+    return ext not in IMAGE_EXTENSIONS and ext != '.gif'
+
+
+# EXIF orientation -> upright-correction filters. ffmpeg autorotates VIDEO
+# streams from displaymatrix side data, but the still-image demuxers ignore
+# EXIF orientation entirely — without this a phone photo tagged "rotate 90°"
+# renders sideways. Orientations 5-8 swap the display dimensions.
+_EXIF_ORIENTATION_FILTERS = {
+    2: ['hflip'],
+    3: ['hflip', 'vflip'],
+    4: ['vflip'],
+    5: ['transpose=0'],
+    6: ['transpose=1'],
+    7: ['transpose=3'],
+    8: ['transpose=2'],
+}
+_ORIENTATION_SWAPS_DIMS = {5, 6, 7, 8}
+
+# Path-keyed and process-lifetime, same immutability contract as
+# _MEDIA_INFO_CACHE (uploaded media is never rewritten at a fixed path).
+_SOURCE_NORMALIZE_CACHE: dict = {}
+
+
+def _source_normalize_info(path: str) -> Tuple[int, bool]:
+    """(exif_orientation, has_alpha) for a still/GIF, via Pillow, cached.
+
+    Pillow is already a hard dependency (text overlay rendering). Any read
+    failure degrades to (1, False) = no correction, i.e. the pre-fix chain.
+    """
+    cached = _SOURCE_NORMALIZE_CACHE.get(path)
+    if cached is not None:
+        return cached
+    orientation, has_alpha = 1, False
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            try:
+                orientation = int(img.getexif().get(0x0112) or 1)
+            except Exception:
+                orientation = 1
+            has_alpha = (img.mode in ('RGBA', 'LA', 'PA')
+                         or 'transparency' in img.info)
+    except Exception:
+        orientation, has_alpha = 1, False
+    if orientation not in _EXIF_ORIENTATION_FILTERS:
+        orientation = 1
+    _SOURCE_NORMALIZE_CACHE[path] = (orientation, has_alpha)
+    return orientation, has_alpha
+
+
+def source_normalize_filters(path: str) -> List[str]:
+    """Per-source corrective filters for stills and GIFs, or [].
+
+    Orientation (stills only — GIFs carry no EXIF): transpose/flip to the
+    upright view. Alpha (stills + GIFs): yuv420p output has no alpha channel
+    and a plain conversion just DROPS it, leaking whatever RGB the transparent
+    pixels happen to carry (matte garbage, palette colors); premultiply
+    composites them onto black instead. Sources with neither trait return []
+    so their chains stay byte-identical.
+    """
+    ext = os.path.splitext(str(path))[1].lower()
+    if ext not in IMAGE_EXTENSIONS and ext != '.gif':
+        return []
+    orientation, has_alpha = _source_normalize_info(path)
+    filters: List[str] = []
+    if ext in IMAGE_EXTENSIONS:
+        filters.extend(_EXIF_ORIENTATION_FILTERS.get(orientation, []))
+    if has_alpha:
+        filters.extend(['format=gbrap', 'premultiply=inplace=1'])
+    return filters
+
+
 def count_video_frames(video_file: str) -> int | None:
     """Frame count of the first video stream; None if it can't be determined.
 
@@ -686,6 +767,13 @@ def _probe_media_info(video_file: str) -> MediaInfo | None:
                     sar = float(num) / float(den)
             except ValueError:
                 pass
+    if width and height and is_image_source(video_file):
+        # Report the DISPLAY dimensions of an EXIF-rotated still: fit
+        # planning and the canvas pick must see the same upright frame that
+        # source_normalize_filters produces at render time.
+        orientation, _ = _source_normalize_info(video_file)
+        if orientation in _ORIENTATION_SWAPS_DIMS:
+            width, height = height, width
     return MediaInfo(duration=duration, fps=fps, width=width, height=height,
                      sar=sar)
 
@@ -1231,8 +1319,10 @@ def _duo_input_plan(video_file: str, start_time: float, exact_duration: float,
     loop_args, start_time = get_loop_input_args(video_file, start_time,
                                                 exact_duration)
     filter_seek = bool(loop_args) and start_time > 0
-    pre_filters = build_segment_pre_filters(
-        exact_duration, fps, trim_start=start_time if filter_seek else 0.0)
+    pre_filters = (source_normalize_filters(video_file)
+                   + build_segment_pre_filters(
+                       exact_duration, fps,
+                       trim_start=start_time if filter_seek else 0.0))
     input_args = list(loop_args)
     if filter_seek:
         input_args.extend(['-i', video_file])
@@ -1492,11 +1582,18 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None,
         '-i', video_file,
         '-map', '0:v:0',
     ])
+    normalize_filters = source_normalize_filters(video_file)
     if target_size:
         # Same fit behavior as the standard pipeline (SAR normalization,
         # blur fit, limited-crop hybrid) — -vf accepts the internal-split
-        # graph because it stays single-input/single-output.
-        cmd.extend(['-vf', build_source_fit_chain(video_file, target_size, fit_mode)])
+        # graph because it stays single-input/single-output. Orientation and
+        # alpha corrections are framing facts, not effects, so they belong in
+        # precise mode too.
+        cmd.extend(['-vf', ",".join(
+            normalize_filters
+            + [build_source_fit_chain(video_file, target_size, fit_mode)])])
+    elif normalize_filters:
+        cmd.extend(['-vf', ",".join(normalize_filters)])
     cmd.extend([
         '-c:v', 'prores',  # ProRes encoder
         '-profile:v', '0',  # Proxy quality (0=Proxy, 1=LT, 2=Standard, 3=HQ)
@@ -1920,6 +2017,10 @@ def _plan_solo_segment(video_file: str, start_time: float,
         exact_source_duration, fps, trim_start=start_time if filter_seek else 0.0,
         retime=retime, output_duration=exact_output_duration,
         source_fps=segment_source_fps)
+    # EXIF upright + alpha flatten run first so every downstream fit/crop
+    # decision sees the frame the way it will actually display ([] for
+    # anything that needs neither — the common case stays byte-identical).
+    pre_filters = source_normalize_filters(video_file) + pre_filters
 
     # Per-source fit decisions: SAR normalization for anamorphic inputs,
     # the limited-crop hybrid when plain Smart crop would discard more

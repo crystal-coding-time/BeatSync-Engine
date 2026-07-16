@@ -24,7 +24,8 @@ import contextlib
 from dataclasses import dataclass, fields as dataclass_fields, replace as dataclass_replace
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
 
-from ffmpeg_processing import get_video_fps, get_video_resolution, is_image_source, FFMPEG_PATH
+from ffmpeg_processing import (get_video_fps, get_video_resolution,
+                               contributes_render_fps, FFMPEG_PATH)
 
 from gpu_cpu_utils import (
     PARALLEL_WORKERS,
@@ -311,12 +312,12 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
             output_fps = custom_fps
         else:
             # Follow the fps of the highest-resolution source (the source that
-            # also decides the canvas in legacy "match best source" mode) — a
-            # 10fps GIF that happens to be first in the list must not drag the
-            # whole render down to 10fps. Still images have no real fps (probe
-            # returns a flat 30), so they can't win this pick even when they
-            # win the resolution.
-            fps_candidates = [p for p in local_video_paths if not is_image_source(p)]
+            # also decides the canvas in legacy "match best source" mode).
+            # Stills and GIFs get no vote (contributes_render_fps): stills
+            # have no real fps, and a 10fps GIF — even one that wins the
+            # resolution pick — must not drag the whole render down to 10fps;
+            # both are resampled onto the canvas clock at extraction.
+            fps_candidates = [p for p in local_video_paths if contributes_render_fps(p)]
             if fps_candidates:
                 best_path = max(
                     fps_candidates,
