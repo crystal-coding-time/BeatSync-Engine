@@ -8,7 +8,7 @@ import math
 import os
 import random
 from collections import Counter, deque
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -168,6 +168,7 @@ def build_planned_clip_sequence(
     target_size: tuple | None = None,
     semantic_variety: float = 0.0,
     media_aware: bool = False,
+    semantic_fx: bool = False,
 ) -> List[PlannedClip]:
     """Build exact source clip choices for every output segment.
 
@@ -408,7 +409,7 @@ def build_planned_clip_sequence(
 
     if len(planned) != len(durations_arr):
         return []
-    _assign_boundary_transitions(planned)
+    _assign_boundary_transitions(planned, semantic_fx=semantic_fx)
     if speed_ramps and not lossless:
         # Retime specs never reach precise mode: the ProRes branch extracts
         # plain windows and must stay pristine for external editing.
@@ -449,9 +450,12 @@ def _assign_retime_specs(planned: List[PlannedClip], candidates: Sequence[Dict],
             continue
 
         source_fps = get_cached_video_fps(video_file)
-        if source_fps < 24.0:
+        if source_fps < 24.0 or os.path.splitext(video_file)[1].lower() == ".gif":
             # Low-fps sources (GIFs run 10-15fps) are already frame-duplicated
-            # by the fps= normalization; retiming them is pure judder.
+            # by the fps= normalization; retiming them is pure judder. The
+            # extension check closes the container-fps hole: a GIF whose
+            # header claims >=24fps still runs on display durations and
+            # retimes just as badly.
             continue
 
         target = str(clip.get("target", "flow"))
@@ -805,13 +809,45 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
 # out/in chains occupy ~0.2s and need normal footage around them to read.
 _TRANSITION_MIN_SEG = 0.3
 
+# semantic_fx only: minimum |camera_dir_x| (camera_motion 0..1 scale) before
+# a whip pan's direction is overridden to continue the outgoing clip's
+# measured horizontal camera drift. Below it the rng coin flip stands.
+_WHIP_DIR_MATCH_MIN = 0.10
 
-def _assign_boundary_transitions(planned: List[PlannedClip]) -> None:
+
+def _whip_camera_dir_x(clip: PlannedClip) -> Optional[float]:
+    """Horizontal camera-drift component for the whip-pan direction match.
+
+    Prefers the native-pair measurement (sub-15fps sources — the standard
+    sampling's flow is garbage there, same reasoning as the media-aware
+    kinetic correction); None when analysis produced neither."""
+    for key in ("camera_dir_x_native", "camera_dir_x"):
+        value = clip.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _assign_boundary_transitions(planned: List[PlannedClip],
+                                 semantic_fx: bool = False) -> None:
     """Label consecutive clip pairs with split-transition specs.
 
     Each transition is rendered as two per-segment effect chains (an out-chain
     on clip i's tail and an in-chain on clip i+1's head), so assembly stays
     concat stream-copy. Kept occasional on purpose; deterministic per boundary.
+
+    semantic_fx=False is the byte-identical historical path. semantic_fx=True
+    adds two content-aware rules: (a) whip pans never land on a boundary
+    where either side is a still image (a whip sells camera motion; a frozen
+    frame can't), and (b) when the outgoing clip carries a meaningful
+    measured horizontal camera drift, the whip's direction continues that
+    drift across the cut instead of the coin flip. Both are safe for the rng
+    invariants because every boundary owns its own _stable_rng stream and
+    nothing draws from it after the direction flip.
     """
     for i in range(len(planned) - 1):
         a, b = planned[i], planned[i + 1]
@@ -846,12 +882,32 @@ def _assign_boundary_transitions(planned: List[PlannedClip]) -> None:
                 kind = "glitch_cut"
         if kind is None:
             continue
+        if (semantic_fx and kind == "whip_pan"
+                and "still" in (_candidate_media_type(a), _candidate_media_type(b))):
+            # A whip pan fakes a fast camera move; against a frozen frame it
+            # reads as a rendering glitch. Skipping here is rng-safe: each
+            # boundary has its own stream, and the direction draw below is
+            # the stream's last consumer.
+            print(f"   🎛 semantic_fx boundary {i}: whip_pan vetoed (still image on the cut)")
+            continue
 
         spec: TransitionSpec = {"type": kind}
         if kind == "whip_pan":
             # Same direction on both sides = continuous camera motion across
             # the cut.
-            spec["direction"] = "right" if rng.random() < 0.5 else "left"
+            direction = "right" if rng.random() < 0.5 else "left"
+            if semantic_fx:
+                dir_x = _whip_camera_dir_x(a)
+                if dir_x is not None and abs(dir_x) >= _WHIP_DIR_MATCH_MIN:
+                    # Continue the outgoing clip's on-screen drift. Measured
+                    # +x = content moving right; direction 'left' sweeps the
+                    # crop window left, which keeps content moving right —
+                    # so the sign inverts. The coin flip above is still drawn
+                    # (dead) to keep the stream's draw positions fixed.
+                    direction = "left" if dir_x > 0 else "right"
+                    print(f"   🎛 semantic_fx boundary {i}: whip_pan direction "
+                          f"'{direction}' matched to camera drift (dir_x {dir_x:+.2f})")
+            spec["direction"] = direction
         a["transition_out"] = dict(spec)
         b["transition_in"] = dict(spec)
 
@@ -1058,16 +1114,20 @@ def _media_aware_adjustment(candidate: Dict, profile: SegmentProfile,
 
       * upscale: -0.12 * log2(canvas_w / source_w) for sources narrower than
         the output canvas — every halving of resolution costs another 0.12.
-        Stills are exempt: they are often high-res photos, and their synthetic
-        metadata is a separate policy problem for a later work package.
-      * loop-seam: -0.20 * loop_seam for a GIF serving a segment longer than
-        one GIF pass (it will visibly wrap) — seamless GIFs (seam≈0) stay
-        preferred fillers, seamy ones keep winning sub-loop-length segments.
+        Applies to stills too (wave 2): their probe width/height are real
+        (and EXIF-oriented), so a low-res photo pays the same blow-up cost
+        as a low-res clip.
+      * loop-seam: -0.20 * loop_seam, scaled by how many EXTRA passes the
+        segment forces (min(2, wraps-1)) — a GIF wrapping 1.1× pays almost
+        nothing, 2× pays the full seam penalty, 3×+ pays double. Seamless
+        GIFs (seam≈0) stay preferred fillers at any length.
       * native-kinetic: sub-15fps sources carry ``kinetic_native`` (optical
         flow on consecutive native frame pairs; the standard fixed-dt sampling
         produces garbage magnitudes there). The cached score already paid the
         wave-16 energy term with the bogus ``kinetic``; this adds exactly the
         difference so the effective energy term uses the native measurement.
+        Wave 2 completes the swap for untagged DROP segments, whose cached
+        formula also paid 0.10 * kinetic directly.
 
     ``stats`` (when provided) counts per-evaluation fires for the one debug
     line the planner prints.
@@ -1075,7 +1135,7 @@ def _media_aware_adjustment(candidate: Dict, profile: SegmentProfile,
     delta = 0.0
     media_type = _candidate_media_type(candidate)
 
-    if media_type != "still" and canvas_w > 0:
+    if canvas_w > 0:
         try:
             source_w = float(candidate.get("source_width") or 0.0)
         except (TypeError, ValueError):
@@ -1093,7 +1153,8 @@ def _media_aware_adjustment(candidate: Dict, profile: SegmentProfile,
         except (TypeError, ValueError, KeyError):
             loop_duration = segment_duration = 0.0
         if seam > 0.0 and loop_duration > 0.0 and segment_duration > loop_duration:
-            delta -= 0.20 * seam
+            wrap_factor = min(2.0, segment_duration / loop_duration - 1.0)
+            delta -= 0.20 * seam * wrap_factor
             if stats is not None:
                 stats["loop_seam"] += 1
 
@@ -1108,6 +1169,12 @@ def _media_aware_adjustment(candidate: Dict, profile: SegmentProfile,
             delta += 0.18 * (abs(e_old - e_seg) - abs(e_new - e_seg))
             if stats is not None:
                 stats["kinetic_native"] += 1
+            # Untagged drop segments also paid 0.10 * kinetic inside the
+            # cached formula (_score_candidate's measured-signal branch);
+            # swap that term too, mirroring its exact fallback chain.
+            if (str(profile.get("target", "flow")) == "drop"
+                    and not candidate.get("ai_analyzed")):
+                delta += 0.10 * (e_new - e_old)
 
     return delta
 
@@ -1363,6 +1430,14 @@ def _materialize_clip(candidate: Dict, profile: SegmentProfile, index: int,
         "action_score": candidate.get("action_score"),
         "beauty_score": candidate.get("beauty_score"),
         "semantic": candidate.get("semantic"),
+        # v13 additions (semantic_fx consumers): analysis media type for the
+        # still-image gates, and measured camera-drift direction for the
+        # whip-pan direction match (native variants win on sub-15fps media).
+        "media_type": candidate.get("media_type"),
+        "camera_dir_x": candidate.get("camera_dir_x"),
+        "camera_dir_y": candidate.get("camera_dir_y"),
+        "camera_dir_x_native": candidate.get("camera_dir_x_native"),
+        "camera_dir_y_native": candidate.get("camera_dir_y_native"),
     }
 
 

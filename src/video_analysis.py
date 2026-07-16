@@ -44,7 +44,13 @@ setup_environment()
 # media-aware planner's inputs). The bump recomputes stale sidecars; every
 # pre-existing field is derived exactly as in v11, so plans that ignore the
 # new fields stay byte-identical.
-ANALYSIS_VERSION = "auto_av_analysis_v12_media"
+# v13: candidates additionally carry camera_dir_x/camera_dir_y (dominant
+# camera-motion direction from the mean Farneback camera vector, same 0..1
+# scale as camera_motion; plus *_native variants for sub-15fps sources) —
+# consumed by the semantic_fx whip-pan direction match. Every pre-existing
+# field is derived exactly as in v12, so plans that ignore the new fields
+# stay byte-identical.
+ANALYSIS_VERSION = "auto_av_analysis_v13_camdir"
 DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models")
 DEFAULT_QWEN_GGUF_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "Qwen3VL-2B-Instruct-Q8_0.gguf")
 DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
@@ -1462,7 +1468,8 @@ def _measure_flow(gray_frames: Sequence[np.ndarray], sample_dt: float) -> Dict[s
     """Dense Farneback optical flow over the already-decoded gray samples.
 
     Measurement only — nothing consumes these keys here; the stage-6 planner
-    reads them separately. Returns kinetic / subject_motion / camera_motion,
+    reads them separately. Returns kinetic / subject_motion / camera_motion
+    (plus the camera_dir_x/camera_dir_y direction components, v13),
     each 0..1: per-pair means are normalized by frame height and sample_dt
     (screen-heights/sec), then averaged and scaled. Values are rounded to 4dp
     as the determinism firewall for the JSON sidecar cache. Single frame
@@ -1470,13 +1477,15 @@ def _measure_flow(gray_frames: Sequence[np.ndarray], sample_dt: float) -> Dict[s
     A measurement FAILURE returns {} — keys omitted, NOT zeros — so the
     planner's `candidate.get("kinetic", motion)` fallback engages instead of
     scoring an errored clip as perfectly calm footage."""
-    zeros = {"kinetic": 0.0, "subject_motion": 0.0, "camera_motion": 0.0}
+    zeros = {"kinetic": 0.0, "subject_motion": 0.0, "camera_motion": 0.0,
+             "camera_dir_x": 0.0, "camera_dir_y": 0.0}
     if len(gray_frames) < 2 or not (sample_dt > 1e-6):
         return zeros
     try:
         kin_vals: List[float] = []
         subj_vals: List[float] = []
         cam_vals: List[float] = []
+        cam_vecs: List[np.ndarray] = []
         for i in range(1, len(gray_frames)):
             prev = gray_frames[i - 1]
             curr = gray_frames[i]
@@ -1492,10 +1501,26 @@ def _measure_flow(gray_frames: Sequence[np.ndarray], sample_dt: float) -> Dict[s
             kin_vals.append(float(np.mean(mag)) / norm)
             subj_vals.append(float(np.mean(residual)) / norm)
             cam_vals.append(float(np.linalg.norm(camera)) / norm)
+            cam_vecs.append(camera / norm)  # signed vector, screen-heights/sec
+        # Dominant camera-motion DIRECTION: the vector mean of the per-pair
+        # camera vectors (so back-and-forth shake cancels toward zero, unlike
+        # camera_motion's magnitude mean), rescaled to camera_motion's 0..1
+        # range. +x = on-screen content drifts right, +y = drifts down.
+        # Consumed by the semantic_fx whip-pan direction match.
+        mean_vec = np.mean(np.stack(cam_vecs), axis=0)
+        vec_mag = float(np.linalg.norm(mean_vec))
+        if vec_mag > 1e-9:
+            dir_scale = min(1.0, vec_mag / 0.35) / vec_mag
+            camera_dir_x = round(float(mean_vec[0]) * dir_scale, 4)
+            camera_dir_y = round(float(mean_vec[1]) * dir_scale, 4)
+        else:
+            camera_dir_x = camera_dir_y = 0.0
         return {
             "kinetic": round(min(1.0, float(np.mean(kin_vals)) / 0.35), 4),
             "subject_motion": round(min(1.0, float(np.mean(subj_vals)) / 0.25), 4),
             "camera_motion": round(min(1.0, float(np.mean(cam_vals)) / 0.35), 4),
+            "camera_dir_x": camera_dir_x,
+            "camera_dir_y": camera_dir_y,
         }
     except Exception as exc:
         print(f"   ⚠️  Optical-flow motion metrics failed ({exc}); keys omitted "
@@ -1520,6 +1545,7 @@ def _annotate_lowfps_media(video_file: str, fps: float, is_gif: bool,
     Adds ONLY new candidate fields — ``loop_seam`` (grayscale absdiff mean of
     last vs. first frame, 0..1, 0 = seamless loop; GIFs only) and
     ``kinetic_native``/``subject_motion_native``/``camera_motion_native``
+    (plus ``camera_dir_x_native``/``camera_dir_y_native``, v13)
     (``_measure_flow`` on consecutive native frames with dt = 1/source_fps;
     sub-15fps sources only). The existing kinetic/motion keys are never
     touched, so plans that ignore these fields stay byte-identical. Values are
@@ -1573,11 +1599,13 @@ def _annotate_lowfps_media(video_file: str, fps: float, is_gif: bool,
                     flow = whole_flow
                 else:
                     flow = _measure_flow(window, dt)
-                for key in ("kinetic", "subject_motion", "camera_motion"):
+                flow_keys = ("kinetic", "subject_motion", "camera_motion",
+                             "camera_dir_x", "camera_dir_y")
+                for key in flow_keys:
                     if key in flow:
                         candidate[f"{key}_native"] = float(flow[key])
-                        annotated += 1
-            note_parts.append(f"native flow on {annotated // 3} candidates "
+                annotated += 1 if flow else 0
+            note_parts.append(f"native flow on {annotated} candidates "
                               f"(dt={dt:.3f}s)")
         print(f"      Low-fps media extras: {', '.join(note_parts)}")
     except Exception as exc:
@@ -2052,7 +2080,8 @@ def _build_candidate(
     # Optical-flow keys are copied ONLY when the measurement produced them —
     # a failed flow pass omits them so stage-6 scoring falls back to the plain
     # frame-diff `motion` instead of reading an errored clip as perfectly calm.
-    for flow_key in ("kinetic", "subject_motion", "camera_motion"):
+    for flow_key in ("kinetic", "subject_motion", "camera_motion",
+                     "camera_dir_x", "camera_dir_y"):
         if flow_key in metrics:
             candidate[flow_key] = float(metrics[flow_key])
     return candidate

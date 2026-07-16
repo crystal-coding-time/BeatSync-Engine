@@ -148,6 +148,11 @@ def _sem_field(clip: Dict, *keys) -> Optional[float]:
 
 def _sem_needs_motion(clip: Dict) -> bool:
     # Glitch/shake family sells motion; veto on footage we KNOW is serene.
+    # Stills short-circuit first: a photo has zero real motion no matter what
+    # Qwen's action_score says about its DEPICTED action (a frozen explosion
+    # is still frozen), so the action escape hatch below must not apply.
+    if str(clip.get('media_type', '')) == 'still':
+        return False
     kinetic = _sem_field(clip, 'kinetic', 'motion')
     action = _sem_field(clip, 'action', 'action_score', 'action_intensity')
     if kinetic is None and action is None:

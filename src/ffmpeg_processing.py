@@ -1820,6 +1820,102 @@ def build_ken_burns_filter(rng, target_size: Tuple[int, int], fps: float,
     )
 
 
+# Still-motion (opt-in `still_motion` setting) camera-move tuning. Pans hold
+# a fixed zoom and traverse the full pan margin; push-ins ramp zoom over the
+# segment (travel as a fraction of 1.0, same convention as HYBRID_FG_ZOOM).
+STILL_MOTION_PAN_ZOOM = 1.12
+STILL_MOTION_PUSH_TRAVEL = (0.14, 0.20)   # build/rhythm
+STILL_MOTION_DROP_TRAVEL = (0.24, 0.32)   # drop
+# An anchor closer to center than this (normalized) can't pick a meaningful
+# pan direction, so the move falls back to the longer-margin axis + rng coin.
+_STILL_MOTION_ANCHOR_DEADZONE = 0.02
+
+
+def build_still_motion_filter(rng, target_size: Tuple[int, int], fps: float,
+                              frame_count: int, *, target=None,
+                              anchor=None) -> Tuple[str, str]:
+    """Energy-conditioned, anchor-aware camera move for a still image.
+
+    Opt-in replacement for build_ken_burns_filter (which stays the default),
+    with the same zoompan contract: runs after the fit chain (input already
+    target-sized), s= keeps the size, d=1 keeps the frame count, and `on` is
+    the output frame counter. Profile follows the planner's segment target:
+
+    * soft/flow (and anything unknown) — slow lateral pan at a fixed modest
+      zoom, traversing the full pan margin toward the subject anchor (or
+      along the longer-margin axis with an rng coin when there is none);
+    * build/rhythm — smoothstep push-in centered on the anchor point;
+    * drop — larger, ease-out push-in (decisive start, settles on the
+      subject).
+
+    Anchor is the normalized {"cx","cy"} dict (see _resolve_anchor). It is
+    measured on the SOURCE frame, but an anchored fit crop re-centers toward
+    the subject, so steering with the source fractions always moves toward
+    (never away from) the subject; clip() keeps the zoompan window inside
+    the frame regardless. Callers seed rng per segment on a dedicated
+    stream ('kenburns_energy') so the legacy 'kenburns' stream — and every
+    existing plan — is untouched. Returns (filter, human description).
+    """
+    w, h = target_size
+    n = max(2, int(frame_count))
+    pt = _resolve_anchor(anchor)
+    kind = str(target or 'flow').lower()
+
+    if kind in ('build', 'rhythm', 'drop'):
+        # Push-in centered on the subject (frame center without one). The
+        # comma-free easing polynomials keep the filter-arg parser happy;
+        # clip() commas are escaped like _anchored_crop's.
+        if kind == 'drop':
+            lo, hi = STILL_MOTION_DROP_TRAVEL
+            progress = f"(on/{n})*(2-on/{n})"          # ease-out quad
+        else:
+            lo, hi = STILL_MOTION_PUSH_TRAVEL
+            progress = f"(on/{n})*(on/{n})*(3-2*on/{n})"  # smoothstep
+        dz = lo + (hi - lo) * rng.random()
+        cx, cy = pt if pt is not None else (0.5, 0.5)
+        zoom_expr = f"1+{dz:.4f}*{progress}"
+        x_expr = f"clip(iw*{cx:.4f}-iw/zoom/2\\,0\\,iw-iw/zoom)"
+        y_expr = f"clip(ih*{cy:.4f}-ih/zoom/2\\,0\\,ih-ih/zoom)"
+        desc = (f"{kind} push-in +{dz:.2f}"
+                + (" @anchor" if pt is not None else ""))
+    else:
+        # Lateral pan at a fixed modest zoom. Axis/direction: toward the
+        # anchor, weighted by each axis's real pixel margin; centered or
+        # absent anchor falls back to the longer-margin axis + rng coin.
+        z = STILL_MOTION_PAN_ZOOM
+        zoom_expr = f"{z:.4f}"
+        mx = w * (1.0 - 1.0 / z)
+        my = h * (1.0 - 1.0 / z)
+        dead = _STILL_MOTION_ANCHOR_DEADZONE
+        if pt is not None and (abs(pt[0] - 0.5) > dead
+                               or abs(pt[1] - 0.5) > dead):
+            axis = 'x' if abs(pt[0] - 0.5) * mx >= abs(pt[1] - 0.5) * my else 'y'
+            toward_end = (pt[0] if axis == 'x' else pt[1]) > 0.5
+        else:
+            axis = 'x' if mx >= my else 'y'
+            toward_end = rng.random() < 0.5
+        progress = f"(on/{n})*(on/{n})*(3-2*on/{n})"      # smoothstep
+        sweep = progress if toward_end else f"(1-{progress})"
+        if axis == 'x':
+            x_expr = f"(iw-iw/zoom)*{sweep}"
+            y_expr = (f"clip(ih*{pt[1]:.4f}-ih/zoom/2\\,0\\,ih-ih/zoom)"
+                      if pt is not None else "(ih-ih/zoom)/2")
+            direction = 'lr' if toward_end else 'rl'
+        else:
+            y_expr = f"(ih-ih/zoom)*{sweep}"
+            x_expr = (f"clip(iw*{pt[0]:.4f}-iw/zoom/2\\,0\\,iw-iw/zoom)"
+                      if pt is not None else "(iw-iw/zoom)/2")
+            direction = 'tb' if toward_end else 'bt'
+        desc = (f"{kind} pan {direction} @z{z:.2f}"
+                + (" @anchor" if pt is not None else ""))
+
+    return (
+        f"zoompan=z='{zoom_expr}':d=1:x='{x_expr}':y='{y_expr}'"
+        f":s={w}x{h}:fps={fps}",
+        desc,
+    )
+
+
 def _lut3d_filter(cube_path: str) -> str:
     """lut3d with the path escaped for filter-arg parsing (\\ : ' are special)."""
     escaped = (cube_path.replace('\\', '/')

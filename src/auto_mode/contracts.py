@@ -214,6 +214,14 @@ class _PlannedClipRequired(TypedDict):
     action_score: Optional[float]
     beauty_score: Optional[float]
     semantic: Optional[dict]
+    # v13 additions: analysis media type (still/gif/video) for the semantic_fx
+    # still gates, and measured camera-drift direction for the whip-pan
+    # direction match (native variants carry sub-15fps re-measurements).
+    media_type: Optional[str]
+    camera_dir_x: Optional[float]
+    camera_dir_y: Optional[float]
+    camera_dir_x_native: Optional[float]
+    camera_dir_y_native: Optional[float]
 
 
 class PlannedClip(_PlannedClipRequired, total=False):

@@ -52,6 +52,7 @@ from ffmpeg_processing import (
     is_image_source,
     contributes_render_fps,
     build_ken_burns_filter,
+    build_still_motion_filter,
     count_video_frames,
     retime_source_window,
     build_crossfade_chunk,
@@ -536,11 +537,26 @@ def create_clip_parallel(job: ClipJob):
             clip_start = 0.0
             if not any('zoompan' in f for f in effect_filters):
                 frame_count = max(1, seconds_to_frame_count(source_duration, job.fps))
-                ken_burns = build_ken_burns_filter(
-                    _stable_rng('kenburns', i, video_file),
-                    target_size, job.fps, frame_count,
-                )
-                effect_filters = [ken_burns] + effect_filters
+                if opts.get('still_motion', False):
+                    # Opt-in still treatments: the move follows the segment's
+                    # musical character and steers toward the subject anchor.
+                    # Dedicated rng stream so the legacy 'kenburns' stream
+                    # (and every existing plan) stays untouched.
+                    still_move, move_desc = build_still_motion_filter(
+                        _stable_rng('kenburns_energy', i, video_file),
+                        target_size, job.fps, frame_count,
+                        target=(planned_clip or {}).get('target'),
+                        anchor=(planned_clip or {}).get('subject_anchor'),
+                    )
+                    print(f"   🎞️ Still motion: {move_desc} for "
+                          f"{os.path.basename(video_file)}")
+                    effect_filters = [still_move] + effect_filters
+                else:
+                    ken_burns = build_ken_burns_filter(
+                        _stable_rng('kenburns', i, video_file),
+                        target_size, job.fps, frame_count,
+                    )
+                    effect_filters = [ken_burns] + effect_filters
 
         extract_kwargs = {
             'video_file': video_file,
@@ -747,6 +763,7 @@ class RenderContext:
     semantic_variety: float
     media_aware: bool
     semantic_fx: bool
+    still_motion: bool
     speed_ramps: bool
     split_screen: bool
     crossfades: bool
@@ -809,6 +826,9 @@ def _resolve_render_config(audio_file: str, video_files: VideoList,
     # every existing plan stays byte-identical.
     media_aware = bool((settings or {}).get('media_aware', False))
     semantic_fx = bool((settings or {}).get('semantic_fx', False))
+    # Still-image treatments (energy-conditioned camera moves) ride the same
+    # settings-dict-only route; False = legacy Ken Burns, byte-identical.
+    still_motion = bool((settings or {}).get('still_motion', False))
 
     video_creation_started = time.perf_counter()
 
@@ -934,6 +954,7 @@ def _resolve_render_config(audio_file: str, video_files: VideoList,
         text_font=text_font,
         variety=variety, semantic_variety=semantic_variety,
         media_aware=media_aware, semantic_fx=semantic_fx,
+        still_motion=still_motion,
         speed_ramps=speed_ramps, split_screen=split_screen,
         crossfades=crossfades, selected_beats=selected_beats,
         segment_frames=segment_frames, segment_durations=segment_durations,
@@ -1000,6 +1021,10 @@ def _plan_visuals(ctx: RenderContext) -> None:
         # they choose WHICH source serves a segment, never how it is rendered,
         # so ProRes precise mode keeps them too).
         media_aware=ctx.media_aware,
+        # semantic_fx reaches the planner too (not just effects.py): boundary
+        # transition assignment gates whip pans on stills and matches whip
+        # direction to measured camera drift. Off = historical path.
+        semantic_fx=ctx.semantic_fx,
     )
     if planned_clip_sequence:
         plan_summary = summarize_clip_plan(
@@ -1458,6 +1483,9 @@ def _render_standard(ctx: RenderContext) -> str:
         # Content-aware effect selection (veto matrix + impact-weighted
         # firing) inside build_effect_filters; False = historical engine.
         'semantic_fx': ctx.semantic_fx,
+        # Still-image camera moves conditioned on the segment's musical
+        # character; False = the legacy Ken Burns builder, byte-identical.
+        'still_motion': ctx.still_motion,
         # Split transitions ride the effects engine, so they follow the
         # style: any non-clean style gets them.
         'transitions': bool(effect_style and effect_style != 'clean'),

@@ -126,6 +126,10 @@ class RenderSettings:
     # Media-aware planning: upscale/loop-seam penalties and native-fps
     # kinetics in the stage6 auction.
     media_aware: bool = False
+    # Still-image treatments: energy-conditioned, anchor-aware camera moves
+    # on stills (replaces the generic Ken Burns; see
+    # ffmpeg_processing.build_still_motion_filter).
+    still_motion: bool = False
 
     @classmethod
     def from_dict(cls, d: dict | None, base: 'RenderSettings | None' = None) -> 'RenderSettings':
@@ -175,6 +179,7 @@ class RenderSettings:
             # over the dropdown; '' means the historic auto lookup.
             'text_font': (self.text_font_path or '').strip() or self.text_font,
             'media_aware': bool(self.media_aware),
+            'still_motion': bool(self.still_motion),
         }
 
 
@@ -217,6 +222,7 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
                        text_font: str = _RS_DEFAULTS.text_font,
                        text_font_path: str = _RS_DEFAULTS.text_font_path,
                        media_aware: bool = _RS_DEFAULTS.media_aware,
+                       still_motion: bool = _RS_DEFAULTS.still_motion,
                        settings: dict | None = None,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None) -> StatusResult:
@@ -237,6 +243,7 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
             text_style=text_style, text_accent=text_accent,
             text_font=text_font, text_font_path=text_font_path,
             media_aware=media_aware,
+            still_motion=still_motion,
         )
         rs = RenderSettings.from_dict(settings, base=rs)
         parallel_workers = PARALLEL_WORKERS
@@ -511,6 +518,7 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
                  text_entries: str, text_position: str,
                  text_scale: float, text_style: str, text_accent: str,
                  text_font: str, text_font_path: str, media_aware: bool,
+                 still_motion: bool,
                  session_state: dict) -> Iterator[StatusResult]:
     status_queue: queue.Queue[str | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
@@ -532,7 +540,7 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
         variety, semantic_variety, semantic_fx,
         speed_ramps, split_screen, crossfades,
         text_entries, text_position, text_scale, text_style, text_accent,
-        text_font, text_font_path, media_aware,
+        text_font, text_font_path, media_aware, still_motion,
     ), strict=True))
 
     def progress_callback(message: str) -> None:
@@ -593,3 +601,15 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
 
     thread.join()
     yield result_queue.get()
+
+
+# Import-time guard for the Gradio positional boundary: process_video's
+# settings parameters must mirror SETTINGS_KEYS exactly (name and order).
+# gui.py's assert covers components-vs-keys; this covers keys-vs-signature —
+# a RenderSettings field added without extending process_video otherwise
+# only fails at click time ("takes N positional arguments but N+1 were given").
+import inspect as _inspect
+_pv_params = tuple(_inspect.signature(process_video).parameters)
+assert _pv_params[5:-1] == SETTINGS_KEYS, (
+    f"process_video settings params {_pv_params[5:-1]} != SETTINGS_KEYS {SETTINGS_KEYS}")
+del _inspect, _pv_params

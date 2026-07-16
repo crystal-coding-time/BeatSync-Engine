@@ -598,6 +598,9 @@ def create_ui() -> gr.Blocks:
                         semantic_fx_input = gr.Checkbox(
                             value=False, label='Content-aware effects',
                             info='Effects check the footage before firing: no glitch or shake on serene clips, no mirror effects on face close-ups, and effects concentrate where the music hits hardest. Untagged clips fall back to measured motion; missing data means the effect behaves as before.')
+                        still_motion_input = gr.Checkbox(
+                            value=False, label='Smart photo motion',
+                            info='Photos move with the music instead of the generic drift: slow pans toward the subject on calm parts, push-ins on builds, decisive punch-ins on drops. Uses the detected face/subject as the camera target when one is found.')
                         with gr.Accordion('Customize effects (optional)', open=False):
                             effect_mode_input = gr.Radio(
                                 choices=[('Curated', 'curated'), ('Custom', 'custom'), ('Surprise shuffle', 'shuffle')],
@@ -796,7 +799,7 @@ def create_ui() -> gr.Blocks:
                     effect_style_input, look_input,
                     effect_mode_input, effect_palette_input, effect_seed_input,
                     effect_intensity_input, semantic_variety_input,
-                    semantic_fx_input,
+                    semantic_fx_input, still_motion_input,
                     speed_ramps_input, split_screen_input, crossfades_input,
                     text_entries_input, text_position_input, text_scale_input,
                     text_style_input, text_accent_input,
@@ -880,6 +883,7 @@ def create_ui() -> gr.Blocks:
             text_style_input, text_accent_input,
             text_font_input, text_font_path_input,
             media_aware_input,
+            still_motion_input,
         ]
         assert len(SETTINGS_KEYS) == len(settings_components)
 
