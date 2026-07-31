@@ -652,6 +652,9 @@ def create_ui() -> gr.Blocks:
                         semantic_variety_input = gr.Slider(
                             0.0, 1.0, value=0.4, step=0.05, label='Visual variety',
                             info='Avoid runs of visually similar shots. Breaks near-ties; never overrides a clearly better-fitting clip. Needs the DINOv2 model (scripts/fetch_dinov2.py) and onnxruntime.')
+                        cut_density_input = gr.Slider(
+                            0.0, 1.0, value=0.55, step=0.05, label='Cut density',
+                            info='How hard the cutting rate follows the music. 0 = the previous pacing exactly (near-uniform bar grid). Higher cuts each section dense relative to the track\'s own peak — drops and choruses approach one cut per beat while intros and breakdowns stay slow; the top of the range also unlocks half-beat cutting on the hottest sections. Changes cut times, so the whole edit is re-planned.')
                         media_aware_input = gr.Checkbox(
                             value=True, label='Media-aware selection',
                             info='Smarter picks for mixed uploads: low-resolution clips are less likely to be blown up onto the canvas, GIFs prefer segments they can cover in one pass (seamless loops are exempt), and GIF motion is measured at its native speed.')
@@ -880,6 +883,7 @@ def create_ui() -> gr.Blocks:
             effect_style_input, effect_intensity_input,
             effect_mode_input, effect_palette_input, effect_seed_input,
             look_input, variety_input, semantic_variety_input,
+            cut_density_input,
             semantic_fx_input,
             speed_ramps_input, split_screen_input, crossfades_input,
             text_entries_input, text_position_input, text_scale_input,

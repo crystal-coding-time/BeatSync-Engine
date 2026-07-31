@@ -114,6 +114,15 @@ class RenderSettings:
     look_cube: str = ''
     variety: float = 0.4
     semantic_variety: float = 0.4
+    # Pacing dial for stage-4 cut selection (0..1). 0.0 is the legacy V3.2
+    # pacing byte-for-byte; higher values make cut density track the music
+    # instead of settling near a uniform bar grid. Ships above 0 because the
+    # default edit barely responded to the music at all. Unlike every other
+    # setting here this one changes cut TIMES, so it is part of `analysis_key`
+    # below — otherwise the stage 1-5 cache would serve the previous value's
+    # cut list and the slider would look inert on a re-render.
+    # Must stay in lockstep with the GUI slider default.
+    cut_density: float = 0.55
     # Content-aware effects: veto primitives that clash with the clip's
     # semantic/motion profile and weight firing by musical impact (see
     # effects.SEMANTIC_FX_MATRIX). On by default — every gate degrades to the
@@ -177,6 +186,7 @@ class RenderSettings:
             'look_cube': (None if is_prores else (self.look_cube or None)),
             'variety': self.variety,
             'semantic_variety': self.semantic_variety,
+            'cut_density': self.cut_density,
             'semantic_fx': bool(self.semantic_fx),
             'speed_ramps': bool(self.speed_ramps),
             'split_screen': bool(self.split_screen),
@@ -221,6 +231,7 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
                        look_cube: str = _RS_DEFAULTS.look_cube,
                        variety: float = _RS_DEFAULTS.variety,
                        semantic_variety: float = _RS_DEFAULTS.semantic_variety,
+                       cut_density: float = _RS_DEFAULTS.cut_density,
                        semantic_fx: bool = _RS_DEFAULTS.semantic_fx,
                        speed_ramps: bool = _RS_DEFAULTS.speed_ramps,
                        split_screen: bool = _RS_DEFAULTS.split_screen,
@@ -247,6 +258,7 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
             effect_mode=effect_mode, effect_palette=effect_palette,
             effect_seed=effect_seed, look_cube=look_cube,
             variety=variety, semantic_variety=semantic_variety,
+            cut_density=cut_density,
             semantic_fx=semantic_fx,
             speed_ramps=speed_ramps, split_screen=split_screen,
             crossfades=crossfades, text_entries=text_entries,
@@ -364,7 +376,11 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
         # in → identical plan+encode out; only the minutes of re-analysis are
         # skipped. Cache is per-Gradio-session and the key invalidates it the
         # moment the audio or video selection changes.
-        analysis_key = (tuple(local_audio_paths), tuple(local_video_paths), bool(use_gpu))
+        # cut_density is in the key because it is the one render setting that
+        # changes stage-4 output; without it, moving the slider and re-rendering
+        # would silently reuse the cached cut list.
+        analysis_key = (tuple(local_audio_paths), tuple(local_video_paths), bool(use_gpu),
+                        round(float(rs.cut_density), 4))
         _cached = session_state.get('analysis_cache')
         if (isinstance(_cached, dict) and _cached.get('key') == analysis_key
                 and _cached.get('local_audio_path')
@@ -381,6 +397,7 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
                     local_audio_path,
                     use_gpu=use_gpu,
                     video_files=local_video_paths,
+                    cut_density=rs.cut_density,
                     progress_callback=progress_callback,
                     console_callback=_audio_console_cb,
                 )
@@ -411,6 +428,7 @@ def _process_video_impl(audio_files: VideoFilesInput, video_files: VideoFilesInp
                     use_gpu=use_gpu,
                     enable_qwen_semantics=True,
                     qwen_model_path=None,
+                    cut_density=rs.cut_density,
                     progress_callback=progress_callback,
                     console_callback=_audio_console_cb,
                 )
@@ -524,6 +542,7 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
                  effect_intensity: float, effect_mode: str,
                  effect_palette: List[str], effect_seed: float,
                  look_cube: str, variety: float, semantic_variety: float,
+                 cut_density: float,
                  semantic_fx: bool, speed_ramps: bool,
                  split_screen: bool, crossfades: bool,
                  text_entries: str, text_position: str,
@@ -548,7 +567,7 @@ def process_video(audio_files: VideoFilesInput, video_files: VideoFilesInput,
     render_settings = dict(zip(SETTINGS_KEYS, (
         fit_mode, output_format, effect_style, effect_intensity,
         effect_mode, effect_palette, effect_seed, look_cube,
-        variety, semantic_variety, semantic_fx,
+        variety, semantic_variety, cut_density, semantic_fx,
         speed_ramps, split_screen, crossfades,
         text_entries, text_position, text_scale, text_style, text_accent,
         text_font, text_font_path, media_aware, still_motion,

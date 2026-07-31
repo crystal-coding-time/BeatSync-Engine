@@ -16,6 +16,7 @@ Existing project imports remain compatible:
     from auto_mode import analyze_beats_auto
 """
 
+import dataclasses
 import os
 import sys
 import warnings
@@ -72,6 +73,17 @@ class AutoWaveConfig:
     # Global cap: protects against too many cuts in very dense music.
     target_cut_ratio_min: float = 0.22
     target_cut_ratio_max: float = 0.46
+
+    # Pacing dial (stage 4). 0.0 reproduces the V3.2 pacing above EXACTLY --
+    # every density-aware branch in stage4_select is gated on `> 0.0`, so the
+    # legacy code path runs untouched and the render stays byte-identical.
+    # Rising values make cut density track the music harder: the beat-step map
+    # switches to a SECTION-LOCAL percentile (a chorus gets dense relative to
+    # the chorus, not to the whole track), the cut-count cap and its prune go
+    # per-section on a section-energy budget, and the minimum cut interval
+    # becomes tempo-relative so half-beat cutting is reachable on drops.
+    # Callers pass it per render; the module CONFIG singleton stays at 0.0.
+    cut_density: float = 0.0
 
     # Auto Mode V4: analyze source footage and let the renderer use an
     # audio-visual clip plan instead of random source sampling.
@@ -449,6 +461,7 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                        enable_video_analysis: bool = True,
                        enable_qwen_semantics: bool = True,
                        qwen_model_path: str = None,
+                       cut_density: float = 0.0,
                        progress_callback: Callable[[str], None] | None = None,
                        console_callback: Callable[[int, str], None] | None = None) -> Tuple[np.ndarray, Dict]:
     """
@@ -458,8 +471,16 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     - small waves: longer holds, mainly phrase/bar anchors;
     - medium waves: cuts every 2-4 beats;
     - big waves: tighter 1-2 beat rhythm, but only on strong musical impacts.
+
+    ``cut_density`` (0..1) is the per-render pacing dial; 0.0 is the legacy
+    V3.2 pacing, byte-for-byte. It rides in the frozen config rather than a
+    separate argument so every stage-4 helper sees it without a signature
+    change, and the module-level CONFIG singleton is never mutated.
     """
     cfg = CONFIG
+    cut_density = min(1.0, max(0.0, float(cut_density or 0.0)))
+    if cut_density > 0.0:
+        cfg = dataclasses.replace(CONFIG, cut_density=cut_density)
 
     print("🤖 AUTO MODE V4 - Audio-Visual Rhythmic GMV/AMV Planner")
     print("   Rhythm-first audio cuts + semantic video moment matching")
