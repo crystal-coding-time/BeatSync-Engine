@@ -1648,6 +1648,11 @@ def _retime_speeds(retime: dict) -> Tuple[float, float]:
     if kind == 'ramp':
         s0 = float(retime.get('speed_start', 1.0))
         s1 = float(retime.get('speed_end', 1.0))
+    elif kind == 'tail_ramp':
+        # Anticipation tail: unity head, linear 1.0 -> speed_end accel over
+        # the final tail_seconds (see _retime_filters / retime_source_window).
+        s0 = 1.0
+        s1 = float(retime.get('speed_end', 1.0))
     else:
         s0 = s1 = float(retime.get('speed', 1.0))
     clamp = lambda s: max(RETIME_MIN_SPEED, min(RETIME_MAX_SPEED, s))
@@ -1677,6 +1682,16 @@ def retime_source_window(output_duration: float, retime: dict | None,
         freeze = min(int(retime.get('freeze_frames', 0)), out_frames - 1)
         content_frames = max(1, out_frames - freeze)
         return content_frames / fps + RETIME_SLACK_FRAMES / fps
+    if retime.get('kind') == 'tail_ramp':
+        # Head runs at 1.0x (consumes its own length of source); only the
+        # final tail_seconds ramp 1.0 -> speed_end, consuming the linear-ramp
+        # average tail * (s0 + s1) / 2 — same integral as the whole-segment
+        # ramp, applied to the tail alone. Slack mirrors the generic branch.
+        s0, s1 = _retime_speeds(retime)
+        T = max(0.0, float(output_duration))
+        tail = min(max(0.0, float(retime.get('tail_seconds', 0.0))), T)
+        slack = (RETIME_SLACK_FRAMES / fps) * max(1.0, s0, s1)
+        return (T - tail) + tail * (s0 + s1) / 2.0 + slack
     s0, s1 = _retime_speeds(retime)
     avg = (s0 + s1) / 2.0
     slack = (RETIME_SLACK_FRAMES / fps) * max(1.0, s0, s1)
@@ -1714,6 +1729,31 @@ def _retime_filters(retime: dict, output_duration: float, fps: float) -> List[st
             f"loop=loop={freeze + RETIME_SLACK_FRAMES}:size=1:start={content_frames - 1}",
             f"setpts=N/{fps}/TB",
         ]
+    if kind == 'tail_ramp':
+        # Anticipation tail (boundary ramps): the head plays at 1.0x and only
+        # the final `tail_seconds` accelerate linearly 1.0 -> speed_end, so
+        # the cut into the next segment feels rushed-into. Piecewise inverse
+        # time map, one monotonic setpts (never enable= / tmix — the
+        # documented frame-dropper): for source time τ <= head the output
+        # time is τ itself; past the joint it is the whole-segment ramp
+        # inverse rebased to the joint, t = head + (sqrt(s0²+2a·(τ−head)) −
+        # s0)/a with a=(s1−s0)/tail. Continuous at τ=head (both branches give
+        # head) with matching slope (tail speed starts at s0=1.0), and
+        # monotonic for positive speeds, which the downstream fps= requires.
+        # max(0, ...) mirrors the generic ramp's sqrt-domain guard.
+        s0, s1 = _retime_speeds(retime)
+        T = max(0.05, float(output_duration))
+        tail = min(max(0.0, float(retime.get('tail_seconds', 0.0))), T)
+        if tail <= 0.0 or abs(s1 - s0) < 0.01:
+            return []
+        head = T - tail
+        a = (s1 - s0) / tail
+        expr = (
+            f"if(lte(PTS*TB,{head:.6f}),PTS,"
+            f"({head:.6f}+(sqrt(max(0,{s0 * s0:.8f}+{2.0 * a:.8f}"
+            f"*(PTS*TB-{head:.6f})))-{s0:.6f})/{a:.8f})/TB)"
+        )
+        return [f"setpts='{expr}'"]
     s0, s1 = _retime_speeds(retime)
     if abs(s1 - s0) < 0.01:
         return [f"setpts=PTS/{s0:.6f}"]

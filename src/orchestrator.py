@@ -101,7 +101,12 @@ class RenderSettings:
 
     fit_mode: str = 'crop'
     output_format: str = DEFAULT_OUTPUT_FORMAT
-    effect_style: str = 'clean'
+    # 'hype' is the shipped default: the aggressive preset (pack_cap=3, strobe/
+    # pixelize/posterize/hue-sweep/shake unlocked). 'clean' emits ZERO effect
+    # filters, which also disables split transitions and beat-reactive echo
+    # margins — the whole effects engine is dead unless a style is picked.
+    # Must stay in lockstep with the GUI radio default.
+    effect_style: str = 'hype'
     effect_intensity: float = 0.7
     effect_mode: str = 'curated'
     effect_palette: List[str] | None = None
@@ -111,8 +116,11 @@ class RenderSettings:
     semantic_variety: float = 0.4
     # Content-aware effects: veto primitives that clash with the clip's
     # semantic/motion profile and weight firing by musical impact (see
-    # effects.SEMANTIC_FX_MATRIX).
-    semantic_fx: bool = False
+    # effects.SEMANTIC_FX_MATRIX). On by default — every gate degrades to the
+    # historical behavior on clips with no measured data, so the cost of
+    # having it on is nil and the cost of having it off is glitch effects on
+    # serene footage. Must stay in lockstep with the GUI checkbox default.
+    semantic_fx: bool = True
     speed_ramps: bool = False
     split_screen: bool = True
     crossfades: bool = False
@@ -124,12 +132,15 @@ class RenderSettings:
     text_font: str = ''       # font picker dropdown ('' = auto)
     text_font_path: str = ''  # custom file path box; wins over the dropdown
     # Media-aware planning: upscale/loop-seam penalties and native-fps
-    # kinetics in the stage6 auction.
-    media_aware: bool = False
+    # kinetics in the stage6 auction. On by default; every penalty is zero for
+    # a library of uniform real video, so it only bites on mixed uploads.
+    # Must stay in lockstep with the GUI checkbox default.
+    media_aware: bool = True
     # Still-image treatments: energy-conditioned, anchor-aware camera moves
     # on stills (replaces the generic Ken Burns; see
-    # ffmpeg_processing.build_still_motion_filter).
-    still_motion: bool = False
+    # ffmpeg_processing.build_still_motion_filter). On by default; no-op for
+    # renders without stills. Must stay in lockstep with the GUI checkbox.
+    still_motion: bool = True
 
     @classmethod
     def from_dict(cls, d: dict | None, base: 'RenderSettings | None' = None) -> 'RenderSettings':

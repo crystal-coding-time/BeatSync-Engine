@@ -45,12 +45,23 @@ setup_environment()
 # pre-existing field is derived exactly as in v11, so plans that ignore the
 # new fields stay byte-identical.
 # v13: candidates additionally carry camera_dir_x/camera_dir_y (dominant
-# camera-motion direction from the mean Farneback camera vector, same 0..1
-# scale as camera_motion; plus *_native variants for sub-15fps sources) —
-# consumed by the semantic_fx whip-pan direction match. Every pre-existing
-# field is derived exactly as in v12, so plans that ignore the new fields
-# stay byte-identical.
-ANALYSIS_VERSION = "auto_av_analysis_v13_camdir"
+# camera-motion direction from the mean Farneback camera vector, on the same
+# 0..1 screen-heights/sec scale as kinetic; plus *_native variants for
+# sub-15fps sources) — consumed by the semantic_fx whip-pan direction match.
+# Every pre-existing field is derived exactly as in v12, so plans that ignore
+# the new fields stay byte-identical.
+# v14: optical flow is now measured on ADJACENT NATIVE FRAME PAIRS (dt=1/fps)
+# instead of between consecutive metric samples (dt~0.2-0.8s). Farneback
+# correspondence is exact only up to ~14px of displacement on a 360-wide
+# analysis frame; the old spacing put every real source far past that, so
+# kinetic/subject_motion/camera_dir_* peaked around a gentle pan and then
+# INVERTED into a 5-7px noise floor (fast footage read calmer than moderate
+# footage) and additionally scaled with window length. Native pairs keep the
+# whole 0..1 range inside the exact regime at >=24fps. The normalization
+# divisors moved with it (see _FLOW_*_FULL_SCALE) and the write-only
+# camera_motion field was dropped. Metric samples (brightness/contrast/
+# quality/subject_anchor/motion) are UNCHANGED — only the flow pairs moved.
+ANALYSIS_VERSION = "auto_av_analysis_v14_nativeflow"
 DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models")
 DEFAULT_QWEN_GGUF_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "Qwen3VL-2B-Instruct-Q8_0.gguf")
 DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
@@ -1286,12 +1297,19 @@ def _make_candidate_windows(boundaries: Sequence[float], duration: float) -> Lis
 def _measure_windows(cap: cv2.VideoCapture, fps: float, windows: Sequence[Dict],
                      use_gpu: bool = False) -> List[Dict]:
     plans = [_window_sample_plan(fps, float(w["start"]), float(w["end"])) for w in windows]
-    targets = sorted({idx for plan in plans for idx in plan["frame_indices"]})
+    # Targets = metric samples + their native flow partners (v14). The partners
+    # ride the same forward pass: each one replaces a grab() with a read(), so
+    # the decode cost is one extra retrieve/resize per sample, not a new seek.
+    targets, gray_only = _plan_frame_targets(plans)
     if not targets:
         return [{} for _ in windows]
 
+    # The sequential-vs-seek decision still keys on the METRIC samples alone:
+    # flow partners sit one frame from a sample they never skip ahead of, so
+    # counting them would halve the ratio and silently move the tuned boundary.
+    metric_count = len({int(idx) for plan in plans for idx in plan["frame_indices"]})
     frame_span = max(1, targets[-1] - targets[0] + 1)
-    seek_ratio = frame_span / max(1, len(targets))
+    seek_ratio = frame_span / max(1, metric_count)
     sequential_limit = float(os.environ.get("BEATSYNC_SEQUENTIAL_SAMPLE_RATIO", "80"))
     use_sequential = (
         os.environ.get("BEATSYNC_SEQUENTIAL_WINDOW_SAMPLING", "1") != "0"
@@ -1299,20 +1317,7 @@ def _measure_windows(cap: cv2.VideoCapture, fps: float, windows: Sequence[Dict],
     )
 
     def build_metric(plan: Dict, frame_map: Dict[int, np.ndarray]) -> Dict:
-        frames = []
-        sample_times = []
-        for frame_idx, sample_time in zip(plan["frame_indices"], plan["sample_times"]):
-            frame = frame_map.get(frame_idx)
-            if frame is not None:
-                frames.append(frame)
-                sample_times.append(sample_time)
-        return _measure_frame_samples(
-            frames,
-            np.asarray(sample_times, dtype=float),
-            plan["start"],
-            plan["duration"],
-            use_gpu,
-        )
+        return _build_window_metric(plan, frame_map, use_gpu)
 
     if use_sequential:
         print(
@@ -1320,7 +1325,7 @@ def _measure_windows(cap: cv2.VideoCapture, fps: float, windows: Sequence[Dict],
             f"(span/target={seek_ratio:.1f}, limit={sequential_limit:g})"
         )
         read_started = time.perf_counter()
-        frame_map = _read_ordered_frames(cap, targets)
+        frame_map = _read_ordered_frames(cap, targets, gray_only=gray_only)
         read_elapsed = time.perf_counter() - read_started
         approx_ram_mb = sum(getattr(frame, "nbytes", 0) for frame in frame_map.values()) / (1024 * 1024)
         print(
@@ -1363,25 +1368,83 @@ def _measure_windows(cap: cv2.VideoCapture, fps: float, windows: Sequence[Dict],
 
 
 def _window_sample_plan(fps: float, start: float, end: float) -> Dict:
+    """Metric sample positions + the ADJACENT-PAIR positions flow is measured on.
+
+    ``sample_times``/``frame_indices`` are the metric samples (brightness,
+    contrast, sharpness, frame-diff motion, subject anchor) and are unchanged:
+    3..8 positions spread across the middle 76% of the window.
+
+    ``flow_pairs`` (v14) is what optical flow actually runs on: for every metric
+    sample, the NEIGHBOURING source frame, so Farneback sees one native frame
+    interval (``flow_dt`` = 1/fps) instead of the 0.2-0.8s gap between metric
+    samples. Correspondence over gaps that wide exceeds Farneback's ~14px
+    capture range on a 360-wide analysis frame, which made the old magnitudes
+    non-monotone in true velocity. Pairs are clamped to the window's own frame
+    range [lo, hi] — window edges are scene cuts, and a pair straddling a cut
+    measures the cut, not the motion — so the last sample pairs BACKWARD when
+    stepping forward would leave the window. Pairs are deduped, ordered.
+    """
     duration = max(0.0, end - start)
+    flow_dt = 1.0 / max(1e-6, float(fps))
     if duration <= 0.05:
-        return {"start": start, "duration": duration, "sample_times": [], "frame_indices": []}
+        return {"start": start, "duration": duration, "sample_times": [],
+                "frame_indices": [], "flow_pairs": [], "flow_dt": flow_dt}
 
     sample_count = int(np.clip(math.ceil(duration * 1.4), 3, 8))
     sample_times = np.linspace(start + duration * 0.12, end - duration * 0.12, sample_count)
     frame_indices = [max(0, int(round(float(t) * fps))) for t in sample_times]
+
+    lo = max(0, int(math.ceil(start * fps - 1e-6)))
+    hi = int(math.floor(end * fps + 1e-6))
+    flow_pairs: List[tuple] = []
+    seen = set()
+    for frame_idx in frame_indices:
+        if frame_idx + 1 <= hi:
+            pair = (frame_idx, frame_idx + 1)
+        elif frame_idx - 1 >= lo:
+            pair = (frame_idx - 1, frame_idx)
+        else:
+            continue  # window spans <2 source frames
+        if pair not in seen:
+            seen.add(pair)
+            flow_pairs.append(pair)
+
     return {
         "start": start,
         "duration": duration,
         "sample_times": sample_times,
         "frame_indices": frame_indices,
+        "flow_pairs": flow_pairs,
+        "flow_dt": flow_dt,
     }
 
 
-def _read_ordered_frames(cap: cv2.VideoCapture, frame_indices: Sequence[int]) -> Dict[int, np.ndarray]:
+def _plan_frame_targets(plans: Sequence[Dict]) -> tuple:
+    """(sorted frame indices to decode, subset needed only as flow partners).
+
+    Flow-only frames are stored grayscale (1/3 the RAM of the BGR metric
+    frames) — flow is the only thing that reads them.
+    """
+    metric = {int(idx) for plan in plans for idx in plan["frame_indices"]}
+    flow = {int(i) for plan in plans for pair in plan["flow_pairs"] for i in pair}
+    return sorted(metric | flow), (flow - metric)
+
+
+def _read_ordered_frames(cap: cv2.VideoCapture, frame_indices: Sequence[int],
+                         gray_only: "set | None" = None,
+                         max_grab_gap: "int | None" = None) -> Dict[int, np.ndarray]:
+    """Decode the requested frames in one forward pass.
+
+    ``gray_only`` indices are stored single-channel (flow partners).
+    ``max_grab_gap`` bounds how many frames may be grab()-skipped before a
+    seek is preferred instead; None = unlimited (the sequential path), 0 =
+    always seek unless the reader is already positioned (the random-seek
+    fallback path).
+    """
     frames: Dict[int, np.ndarray] = {}
     if not frame_indices:
         return frames
+    gray_only = gray_only or set()
 
     first = int(frame_indices[0])
     cap.set(cv2.CAP_PROP_POS_FRAMES, first)
@@ -1389,7 +1452,8 @@ def _read_ordered_frames(cap: cv2.VideoCapture, frame_indices: Sequence[int]) ->
 
     for frame_idx in frame_indices:
         frame_idx = int(frame_idx)
-        if frame_idx < current:
+        gap = frame_idx - current
+        if gap < 0 or (max_grab_gap is not None and gap > max_grab_gap):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             current = frame_idx
         while current < frame_idx:
@@ -1402,8 +1466,59 @@ def _read_ordered_frames(cap: cv2.VideoCapture, frame_indices: Sequence[int]) ->
         current += 1
         if not ok or frame is None:
             continue
-        frames[frame_idx] = _resize_for_analysis(frame, max_width=360)
+        small = _resize_for_analysis(frame, max_width=360)
+        frames[frame_idx] = (cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                             if frame_idx in gray_only else small)
     return frames
+
+
+def _gray_from_map(frame_map: Dict[int, np.ndarray], frame_idx: int):
+    frame = frame_map.get(int(frame_idx))
+    if frame is None:
+        return None
+    return frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+def _flow_from_plan(plan: Dict, frame_map: Dict[int, np.ndarray]) -> Dict[str, float]:
+    """Optical flow for one window from its planned native frame pairs.
+
+    Preserves _measure_flow's load-bearing distinction: no PLANNED pairs means
+    the window genuinely spans fewer than two source frames -> all zeros
+    (motionless); planned pairs that all failed to decode is a measurement
+    FAILURE -> {} (keys omitted, so stage-6 falls back to frame-diff motion).
+    """
+    planned = plan.get("flow_pairs") or []
+    if not planned:
+        return dict(_ZERO_FLOW)
+    pairs = []
+    for a, b in planned:
+        prev = _gray_from_map(frame_map, a)
+        curr = _gray_from_map(frame_map, b)
+        if prev is None or curr is None or prev.shape != curr.shape:
+            continue
+        pairs.append((prev, curr))
+    if not pairs:
+        return {}
+    return _measure_flow_pairs(pairs, float(plan.get("flow_dt", 0.0)))
+
+
+def _build_window_metric(plan: Dict, frame_map: Dict[int, np.ndarray],
+                         use_gpu: bool = False) -> Dict:
+    frames: List[np.ndarray] = []
+    sample_times: List[float] = []
+    for frame_idx, sample_time in zip(plan["frame_indices"], plan["sample_times"]):
+        frame = frame_map.get(int(frame_idx))
+        if frame is not None and frame.ndim == 3:
+            frames.append(frame)
+            sample_times.append(float(sample_time))
+    return _measure_frame_samples(
+        frames,
+        np.asarray(sample_times, dtype=float),
+        plan["start"],
+        plan["duration"],
+        use_gpu,
+        flow=_flow_from_plan(plan, frame_map),
+    )
 
 
 def _measure_window(cap: cv2.VideoCapture, fps: float, start: float, end: float,
@@ -1411,19 +1526,12 @@ def _measure_window(cap: cv2.VideoCapture, fps: float, start: float, end: float,
     plan = _window_sample_plan(fps, start, end)
     if plan["duration"] <= 0.05:
         return {}
-
-    frames: List[np.ndarray] = []
-    used_times: List[float] = []
-    for frame_idx, sample_time in zip(plan["frame_indices"], plan["sample_times"]):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            continue
-        frame = _resize_for_analysis(frame, max_width=360)
-        frames.append(frame)
-        used_times.append(float(sample_time))
-
-    return _measure_frame_samples(frames, np.asarray(used_times, dtype=float), start, plan["duration"], use_gpu)
+    targets, gray_only = _plan_frame_targets([plan])
+    # max_grab_gap=0: this is the random-seek fallback, so seek to each sample —
+    # but a flow partner sitting right after its sample costs no extra seek.
+    frame_map = _read_ordered_frames(cap, targets, gray_only=gray_only,
+                                     max_grab_gap=0)
+    return _build_window_metric(plan, frame_map, use_gpu)
 
 
 def _score_from_primitives(brightness: float, contrast: float, saturation: float,
@@ -1457,38 +1565,78 @@ def _score_from_primitives(brightness: float, contrast: float, saturation: float
     }
 
 
-def _mean_sample_dt(sample_times: np.ndarray) -> float:
-    """Mean spacing in seconds between sampled frames; 0.0 when fewer than 2."""
-    if sample_times is None or len(sample_times) < 2:
-        return 0.0
-    return float(np.mean(np.diff(np.asarray(sample_times, dtype=float))))
+# Flow normalization (v14). The per-pair means below are already in
+# screen-heights/second (pixels / analysis-frame-height / dt), so these
+# divisors are literally "the velocity that reads 1.0".
+#
+# Why 1.0 sh/s: Farneback at these parameters on a 360-wide analysis frame is
+# EXACT (<0.01px error) up to ~14px of inter-frame displacement, degrades at
+# 16px and collapses to a 5-7px noise floor by 20px — measured, see the v14
+# note at the top of this file. At native dt the displacement that 1.0 sh/s
+# implies is frame_height/fps px = 8.4px @24fps, 6.7px @30fps, 3.4px @60fps
+# (16:9) — the whole 0..1 range stays inside the exact regime for every real
+# source. Editorially 1.0 sh/s is a camera crossing one full frame height per
+# second (a 16:9 frame width in 1.8s): genuinely energetic, and anything
+# faster is a whip that should simply read "max". The old 0.35 sh/s divisor
+# was chosen against the 0.2-0.8s sample spacing, where it meant up to 42px of
+# displacement — a distance the algorithm provably cannot resolve, so most of
+# the scale was unreachable except through noise. (Measured across 13k cached
+# v12/v13 candidate windows of real footage: old kinetic p50 0.054, p90 0.158,
+# p99 0.309 — the whole library lived in the noise floor.)
+# Note any value up to ~1.66 stays resolvable at 24fps; 1.0 was picked so that
+# active handheld/pan footage spreads over the upper half instead of clipping.
+# If real libraries turn out to cluster low, retune HERE and bump
+# ANALYSIS_VERSION — nothing else reads the raw sh/s.
+_FLOW_KINETIC_FULL_SCALE = 1.0
+# Subject residual keeps its historical 0.25/0.35 = 0.714 ratio to kinetic:
+# after the camera vector is subtracted, a moving subject occupies a fraction
+# of the frame, so the mean residual runs well below the gross velocity.
+_FLOW_SUBJECT_FULL_SCALE = 0.7
+# camera_dir_* shares kinetic's scale (it is a signed velocity, not a residual).
+_FLOW_CAMERA_DIR_FULL_SCALE = _FLOW_KINETIC_FULL_SCALE
+
+_ZERO_FLOW = {"kinetic": 0.0, "subject_motion": 0.0,
+              "camera_dir_x": 0.0, "camera_dir_y": 0.0}
 
 
 def _measure_flow(gray_frames: Sequence[np.ndarray], sample_dt: float) -> Dict[str, float]:
-    """Dense Farneback optical flow over the already-decoded gray samples.
+    """Optical flow over a run of CONSECUTIVE gray frames spaced sample_dt apart.
+
+    Used by the low-fps extras pass, which decodes whole native runs. The
+    windowed candidate path goes through _flow_from_plan/_measure_flow_pairs
+    instead (its metric samples are far apart; only the native neighbours of
+    those samples are paired)."""
+    if len(gray_frames) < 2:
+        return dict(_ZERO_FLOW)
+    return _measure_flow_pairs(
+        [(gray_frames[i - 1], gray_frames[i]) for i in range(1, len(gray_frames))],
+        sample_dt,
+    )
+
+
+def _measure_flow_pairs(pairs: Sequence[tuple], sample_dt: float) -> Dict[str, float]:
+    """Dense Farneback optical flow over (prev, curr) gray frame pairs.
 
     Measurement only — nothing consumes these keys here; the stage-6 planner
-    reads them separately. Returns kinetic / subject_motion / camera_motion
-    (plus the camera_dir_x/camera_dir_y direction components, v13),
-    each 0..1: per-pair means are normalized by frame height and sample_dt
-    (screen-heights/sec), then averaged and scaled. Values are rounded to 4dp
-    as the determinism firewall for the JSON sidecar cache. Single frame
-    (still image) or unusable spacing -> all zeros (genuinely motionless).
-    A measurement FAILURE returns {} — keys omitted, NOT zeros — so the
-    planner's `candidate.get("kinetic", motion)` fallback engages instead of
-    scoring an errored clip as perfectly calm footage."""
-    zeros = {"kinetic": 0.0, "subject_motion": 0.0, "camera_motion": 0.0,
-             "camera_dir_x": 0.0, "camera_dir_y": 0.0}
-    if len(gray_frames) < 2 or not (sample_dt > 1e-6):
-        return zeros
+    reads them separately. Returns kinetic / subject_motion (plus the
+    camera_dir_x/camera_dir_y direction components, v13), each 0..1: per-pair
+    means are normalized by frame height and sample_dt (screen-heights/sec),
+    then averaged and scaled by the _FLOW_*_FULL_SCALE divisors. Values are
+    rounded to 4dp as the determinism firewall for the JSON sidecar cache.
+    No pairs (single frame / still image) or unusable spacing -> all zeros
+    (genuinely motionless). A measurement FAILURE returns {} — keys omitted,
+    NOT zeros — so the planner's `candidate.get("kinetic", motion)` fallback
+    engages instead of scoring an errored clip as perfectly calm footage.
+
+    ``sample_dt`` is expected to be one native frame interval (1/fps): the
+    magnitudes are only trustworthy while displacement stays under ~14px."""
+    if not pairs or not (sample_dt > 1e-6):
+        return dict(_ZERO_FLOW)
     try:
         kin_vals: List[float] = []
         subj_vals: List[float] = []
-        cam_vals: List[float] = []
         cam_vecs: List[np.ndarray] = []
-        for i in range(1, len(gray_frames)):
-            prev = gray_frames[i - 1]
-            curr = gray_frames[i]
+        for prev, curr in pairs:
             flow = cv2.calcOpticalFlowFarneback(
                 prev, curr, None,
                 pyr_scale=0.5, levels=3, winsize=15,
@@ -1500,25 +1648,23 @@ def _measure_flow(gray_frames: Sequence[np.ndarray], sample_dt: float) -> Dict[s
             residual = np.linalg.norm(flow - camera, axis=2)  # subject motion
             kin_vals.append(float(np.mean(mag)) / norm)
             subj_vals.append(float(np.mean(residual)) / norm)
-            cam_vals.append(float(np.linalg.norm(camera)) / norm)
             cam_vecs.append(camera / norm)  # signed vector, screen-heights/sec
         # Dominant camera-motion DIRECTION: the vector mean of the per-pair
         # camera vectors (so back-and-forth shake cancels toward zero, unlike
-        # camera_motion's magnitude mean), rescaled to camera_motion's 0..1
-        # range. +x = on-screen content drifts right, +y = drifts down.
+        # kinetic's magnitude mean), rescaled onto the same 0..1 range.
+        # +x = on-screen content drifts right, +y = drifts down.
         # Consumed by the semantic_fx whip-pan direction match.
         mean_vec = np.mean(np.stack(cam_vecs), axis=0)
         vec_mag = float(np.linalg.norm(mean_vec))
         if vec_mag > 1e-9:
-            dir_scale = min(1.0, vec_mag / 0.35) / vec_mag
+            dir_scale = min(1.0, vec_mag / _FLOW_CAMERA_DIR_FULL_SCALE) / vec_mag
             camera_dir_x = round(float(mean_vec[0]) * dir_scale, 4)
             camera_dir_y = round(float(mean_vec[1]) * dir_scale, 4)
         else:
             camera_dir_x = camera_dir_y = 0.0
         return {
-            "kinetic": round(min(1.0, float(np.mean(kin_vals)) / 0.35), 4),
-            "subject_motion": round(min(1.0, float(np.mean(subj_vals)) / 0.25), 4),
-            "camera_motion": round(min(1.0, float(np.mean(cam_vals)) / 0.35), 4),
+            "kinetic": round(min(1.0, float(np.mean(kin_vals)) / _FLOW_KINETIC_FULL_SCALE), 4),
+            "subject_motion": round(min(1.0, float(np.mean(subj_vals)) / _FLOW_SUBJECT_FULL_SCALE), 4),
             "camera_dir_x": camera_dir_x,
             "camera_dir_y": camera_dir_y,
         }
@@ -1528,10 +1674,13 @@ def _measure_flow(gray_frames: Sequence[np.ndarray], sample_dt: float) -> Dict[s
         return {}
 
 
-# Sources below this fps get an additional native-frame-pair flow measurement:
-# the standard window sampling spaces samples ~0.3-0.7s apart, and Farneback
-# magnitudes over gaps that wide (several source frames of displacement) are
-# garbage. GIFs typically run 10-15fps.
+# Sources below this fps get an additional flow measurement over EVERY
+# consecutive native pair in the candidate window, not just the pairs at the
+# 3-8 metric sample positions. Since v14 the main path is already native-dt, so
+# this is a density refinement rather than the correction it used to be: at
+# 10-15fps (GIF territory) a window holds only a handful of frames, per-frame
+# displacement is at its largest, and a few sampled pairs are a noisy estimate
+# of the window's motion. GIFs typically run 10-15fps.
 _NATIVE_FLOW_MAX_FPS = 15.0
 # Full-decode cap for the extras pass (low-fps sources only, frames already
 # resized to <=360px — at 15fps this covers 80s of source).
@@ -1544,10 +1693,11 @@ def _annotate_lowfps_media(video_file: str, fps: float, is_gif: bool,
 
     Adds ONLY new candidate fields — ``loop_seam`` (grayscale absdiff mean of
     last vs. first frame, 0..1, 0 = seamless loop; GIFs only) and
-    ``kinetic_native``/``subject_motion_native``/``camera_motion_native``
+    ``kinetic_native``/``subject_motion_native``
     (plus ``camera_dir_x_native``/``camera_dir_y_native``, v13)
-    (``_measure_flow`` on consecutive native frames with dt = 1/source_fps;
-    sub-15fps sources only). The existing kinetic/motion keys are never
+    (``_measure_flow`` on EVERY consecutive native frame pair in the window
+    with dt = 1/source_fps; sub-15fps sources only). The existing
+    kinetic/motion keys are never
     touched, so plans that ignore these fields stay byte-identical. Values are
     4dp-rounded like the rest of the sidecar (determinism firewall). Any
     failure leaves the fields absent after one log line — the media-aware
@@ -1599,7 +1749,7 @@ def _annotate_lowfps_media(video_file: str, fps: float, is_gif: bool,
                     flow = whole_flow
                 else:
                     flow = _measure_flow(window, dt)
-                flow_keys = ("kinetic", "subject_motion", "camera_motion",
+                flow_keys = ("kinetic", "subject_motion",
                              "camera_dir_x", "camera_dir_y")
                 for key in flow_keys:
                     if key in flow:
@@ -1614,9 +1764,17 @@ def _annotate_lowfps_media(video_file: str, fps: float, is_gif: bool,
 
 
 def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarray,
-                           start: float, duration: float, use_gpu: bool = False) -> Dict:
+                           start: float, duration: float, use_gpu: bool = False,
+                           flow: "Dict[str, float] | None" = None) -> Dict:
+    """Per-window metrics from the decoded metric samples.
+
+    ``flow`` (v14) is measured elsewhere — on native frame PAIRS, not on these
+    samples (see _flow_from_plan) — and merged in verbatim. The only caller
+    that omits it is the single-frame still path, which is motionless by
+    construction, so the default is the all-zeros flow."""
     if not frames:
         return {}
+    flow_metrics = dict(_ZERO_FLOW) if flow is None else flow
 
     if use_gpu and GPU_AVAILABLE and cp is not None:
         try:
@@ -1624,11 +1782,8 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
             # Anchor stays on CPU (numpy/cv2) even on the GPU metrics path so
             # both paths emit an identical schema.
             metrics["subject_anchor"] = _compute_subject_anchor(frames, sample_times, start)
-            # Flow too: computed on CPU from the same frames for schema parity.
-            metrics.update(_measure_flow(
-                [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames],
-                _mean_sample_dt(sample_times),
-            ))
+            # Flow too: computed on CPU from native pairs for schema parity.
+            metrics.update(flow_metrics)
             return metrics
         except Exception as exc:
             # Graceful degradation: one log line, then fall through to the CPU
@@ -1667,7 +1822,7 @@ def _measure_frame_samples(frames: Sequence[np.ndarray], sample_times: np.ndarra
     metrics["subject_anchor"] = _compute_subject_anchor(
         frames, sample_times, start, gray_frames=gray_frames, diff_maps=diff_maps
     )
-    metrics.update(_measure_flow(gray_frames, _mean_sample_dt(sample_times)))
+    metrics.update(flow_metrics)
     return metrics
 
 
@@ -2080,7 +2235,10 @@ def _build_candidate(
     # Optical-flow keys are copied ONLY when the measurement produced them —
     # a failed flow pass omits them so stage-6 scoring falls back to the plain
     # frame-diff `motion` instead of reading an errored clip as perfectly calm.
-    for flow_key in ("kinetic", "subject_motion", "camera_motion",
+    # (v14 dropped the write-only top-level `camera_motion`: nothing read it,
+    # and it collided by name with semantic["camera_motion"] below, which is a
+    # different quantity — the Qwen/fabricated field, i.e. frame-diff motion.)
+    for flow_key in ("kinetic", "subject_motion",
                      "camera_dir_x", "camera_dir_y"):
         if flow_key in metrics:
             candidate[flow_key] = float(metrics[flow_key])

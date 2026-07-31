@@ -153,15 +153,18 @@ class TransitionSpec(TypedDict, total=False):
 
 
 class RetimeSpec(TypedDict, total=False):
-    # `kind` is always present ("constant"/"ramp"/"freeze"); the rest depend on
-    # kind (constant->speed[,interp]; ramp->speed_start/speed_end;
-    # freeze->freeze_frames).
+    # `kind` is always present ("constant"/"ramp"/"freeze"/"tail_ramp"); the
+    # rest depend on kind (constant->speed[,interp]; ramp->speed_start/
+    # speed_end; freeze->freeze_frames; tail_ramp->speed_end/tail_seconds —
+    # unity head, linear 1.0->speed_end accel over the final tail_seconds;
+    # emitted only by _assign_boundary_ramps' anticipation ramps).
     kind: str
     speed: float
     interp: int
     speed_start: float
     speed_end: float
     freeze_frames: int
+    tail_seconds: float
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +213,8 @@ class _PlannedClipRequired(TypedDict):
     # effect gate (effects._sem_field); None/absent degrades gracefully.
     kinetic: Optional[float]
     subject_motion: Optional[float]
+    kinetic_native: Optional[float]
+    subject_motion_native: Optional[float]
     motion: Optional[float]
     action_score: Optional[float]
     beauty_score: Optional[float]

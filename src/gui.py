@@ -587,7 +587,7 @@ def create_ui() -> gr.Blocks:
                     with gr.Tab('Vibe'):
                         effect_style_input = gr.Radio(
                             choices=[('Minimal (clean cuts)', 'clean'), ('Music video (AMV)', 'amv'), ('Hype', 'hype')],
-                            value='clean', label='Style',
+                            value='hype', label='Style',
                             info='How energetic the edit feels. Beat-aware effects: zooms and flashes on drops, saturation pulses on the beat. Minimal disables effects in every mode.')
                         look_input = gr.Dropdown(
                             choices=list_looks(), value='', label='Look',
@@ -595,11 +595,14 @@ def create_ui() -> gr.Blocks:
                         effect_intensity_input = gr.Slider(
                             0.0, 1.0, value=0.7, step=0.05, label='Effect intensity',
                             info='How hard the beat-aware effects hit. Lower = subtle pulses; higher = punchier zooms and flashes on the drops.')
+                        # Defaults here must match RenderSettings in
+                        # orchestrator.py exactly, or the UI and the headless
+                        # entry point would render differently.
                         semantic_fx_input = gr.Checkbox(
-                            value=False, label='Content-aware effects',
+                            value=True, label='Content-aware effects',
                             info='Effects check the footage before firing: no glitch or shake on serene clips, no mirror effects on face close-ups, and effects concentrate where the music hits hardest. Untagged clips fall back to measured motion; missing data means the effect behaves as before.')
                         still_motion_input = gr.Checkbox(
-                            value=False, label='Smart photo motion',
+                            value=True, label='Smart photo motion',
                             info='Photos move with the music instead of the generic drift: slow pans toward the subject on calm parts, push-ins on builds, decisive punch-ins on drops. Uses the detected face/subject as the camera target when one is found.')
                         with gr.Accordion('Customize effects (optional)', open=False):
                             effect_mode_input = gr.Radio(
@@ -650,7 +653,7 @@ def create_ui() -> gr.Blocks:
                             0.0, 1.0, value=0.4, step=0.05, label='Visual variety',
                             info='Avoid runs of visually similar shots. Breaks near-ties; never overrides a clearly better-fitting clip. Needs the DINOv2 model (scripts/fetch_dinov2.py) and onnxruntime.')
                         media_aware_input = gr.Checkbox(
-                            value=False, label='Media-aware selection',
+                            value=True, label='Media-aware selection',
                             info='Smarter picks for mixed uploads: low-resolution clips are less likely to be blown up onto the canvas, GIFs prefer segments they can cover in one pass (seamless loops are exempt), and GIF motion is measured at its native speed.')
                         split_screen_input = gr.Checkbox(
                             value=True, label='Pair vertical clips (split screen)',

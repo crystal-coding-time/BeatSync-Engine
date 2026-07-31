@@ -183,6 +183,40 @@ def build_planned_clip_sequence(
     sources toward an even spread at 1.0.
 
     PLAN STABILITY / SLIDER SEMANTICS
+      * Wave-17 repetition fix (accepted, deliberate — same precedent as the
+        wave-12, wave-15 and wave-16 redesigns below; ALL plans change,
+        INCLUDING variety=0, and there is no kill switch). Three coupled
+        changes attack "clips loop noticeably", whose root cause was that
+        ``_plan_source_window`` had no memory: for a shared anchor and a fixed
+        per-target ``align``, two windows of different durations are strictly
+        NESTED around the same anchor frame, so every reuse of a candidate
+        replayed essentially the same footage even though analysis windows run
+        up to 5.2s against ~1.2s segments (roughly 4 disjoint segment-length
+        windows per candidate that the formula could never reach).
+        (a) A per-run SUB-WINDOW LEDGER (``spent``, candidate id -> spent
+        source intervals) is threaded into ``_plan_source_window`` — still the
+        single authority for window semantics, so the primary and duo-partner
+        paths stay identical — which now offsets a reuse onto the first
+        0.85*d-strided sub-window that overlaps nothing spent by more than
+        0.35*d, falling back to the anchor window when the span is under 2.2*d
+        or every sub-window is taken.
+        (b) The saturating ``min(0.28, usage[cid] * 0.10)`` reuse penalty
+        becomes ``_reuse_penalty``: an unbounded ``0.10 * log1p(usage) *
+        (1 + 2*variety)`` term plus an exhaustion term (up to 0.25) in the
+        fraction of the candidate's analysis span the ledger has served.
+        Previously the ONLY unbounded pressure was ``pf_ewma``, which is keyed
+        on ``video_file``, not candidate identity — so one candidate inside a
+        favoured source could win without limit once its capped penalty
+        saturated at the third use. Ledger-dependent, therefore applied
+        OUTSIDE ``_ScoreCache`` like the recency/PF/semantic/media-aware terms.
+        (c) ``recent_ids`` / ``recent_videos`` are sized from the MEDIAN
+        segment duration to cover ~20s / ~10s of screen time instead of a
+        fixed 10 / 5 segments, so fast passages keep a real recency memory.
+        Determinism is unaffected — no new rng; the ledger is a pure function
+        of the sequential pick order. Precise (lossless/ProRes) mode also gets the
+        new windows — window CHOICE is not on that mode's veto list (effects,
+        retimes, duos, crossfades, text); its extractions stay plain,
+        static-framed source windows, just better spread across the footage.
       * Wave-16 scoring rebalance (accepted, deliberate — same precedent as
         the wave-12 and wave-15 redesigns below): ``_score_candidate`` now
         (a) scores untagged (non-``ai_analyzed``) candidates on drop segments
@@ -304,9 +338,23 @@ def build_planned_clip_sequence(
             canvas_w = 0
         media_stats = Counter()
 
-    recent_ids = deque(maxlen=10)
-    recent_videos = deque(maxlen=5)
+    # Wave 17: recency windows measured in SECONDS, not in segments. The old
+    # fixed maxlen=10/5 meant ~12s / ~6s of memory at typical 1.2s cuts, but
+    # only ~4s / ~2s on a fast 0.4s-cut passage — exactly where a repeat is
+    # most visible. Sizing from the median segment duration keeps the window
+    # at a roughly constant ~20s (ids) / ~10s (sources) of screen time at any
+    # cut rate. Deterministic: numpy median over the same durations array the
+    # timeline is built from.
+    median_dur = float(np.median(durations_arr))
+    if not np.isfinite(median_dur) or median_dur <= 0.0:
+        median_dur = 1.0
+    recent_ids = deque(maxlen=max(8, int(round(20.0 / median_dur))))
+    recent_videos = deque(maxlen=max(4, int(round(10.0 / median_dur))))
     usage = Counter()
+    # Sub-window ledger: candidate id -> list of (start, end) source intervals
+    # already spent. _plan_source_window offsets reuse into unspent footage,
+    # and _reuse_penalty prices exhaustion. Purely a function of pick order.
+    spent: Dict[object, List[tuple]] = {}
     planned: List[PlannedClip] = []
 
     for i, profile in enumerate(profiles):
@@ -334,6 +382,7 @@ def build_planned_clip_sequence(
                 media_aware=media_aware,
                 canvas_w=canvas_w,
                 media_stats=media_stats,
+                spent=spent,
             )
         if not candidate:
             continue
@@ -342,6 +391,7 @@ def build_planned_clip_sequence(
             profile=profile,
             index=i,
             score_cache=score_cache,
+            spent=spent,
         )
         partner_candidate = None
         if duo_pair_files is not None:
@@ -368,15 +418,18 @@ def build_planned_clip_sequence(
                 media_aware=media_aware,
                 canvas_w=canvas_w,
                 media_stats=media_stats,
+                spent=spent,
             )
         if partner_candidate is not None:
             planned_clip["partner"] = _materialize_partner(
-                partner_candidate, profile)
+                partner_candidate, profile, spent)
         planned.append(planned_clip)
         recent_ids.append(candidate.get("id"))
         recent_videos.append(candidate.get("video_file"))
         usage[candidate.get("id")] += 1
         usage[candidate.get("video_file")] += 1
+        _record_source_window(spent, candidate, planned_clip["start_time"],
+                              planned_clip["source_duration"])
         if variety > 0.0:
             # Reservations flow through here too (they materialize above like
             # any pick), so a seated source counts toward its fair share.
@@ -388,12 +441,17 @@ def build_planned_clip_sequence(
             # A pane appearance is an appearance: the partner pays the same
             # usage / file-recency / PF / semantic costs going forward and
             # counts for coverage. Its id deliberately does NOT enter
-            # recent_ids — appending would evict primary ids from the
-            # maxlen-10 window faster; a partner only dodges the -0.28
-            # id-recency penalty, not the rest.
+            # recent_ids — appending would evict primary ids from that
+            # (wave-17 time-scaled) window faster; a partner only dodges the
+            # -0.28 id-recency penalty, not the rest. Its source window IS
+            # booked into the ledger: a pane replays frames just as visibly.
             recent_videos.append(partner_candidate.get("video_file"))
             usage[partner_candidate.get("id")] += 1
             usage[partner_candidate.get("video_file")] += 1
+            partner_clip = planned_clip["partner"]
+            _record_source_window(spent, partner_candidate,
+                                  partner_clip["start_time"],
+                                  partner_clip["source_duration"])
             if variety > 0.0:
                 pf_ewma.add(partner_candidate.get("video_file"), i)
             if semantic_variety > 0.0:
@@ -414,6 +472,9 @@ def build_planned_clip_sequence(
         # Retime specs never reach precise mode: the ProRes branch extracts
         # plain windows and must stay pristine for external editing.
         _assign_retime_specs(planned, candidates, fps)
+        # Anticipation ramps claim drop-entry boundaries the per-segment pass
+        # left untouched (same setting, dedicated rng stream).
+        _assign_boundary_ramps(planned, candidates, fps)
     return planned
 
 
@@ -428,10 +489,8 @@ def _assign_retime_specs(planned: List[PlannedClip], candidates: Sequence[Dict],
     run). Renderer probes (not the analysis metadata) decide runway.
     """
     from ffmpeg_processing import (
-        get_cached_video_duration,
         get_cached_video_fps,
         is_image_source,
-        retime_source_window,
         seconds_to_frame_count,
     )
 
@@ -496,46 +555,175 @@ def _assign_retime_specs(planned: List[PlannedClip], candidates: Sequence[Dict],
                 }
         if retime is None:
             continue
-
-        # source_fps lets retime_source_window add the interp over-provision
-        # (a no-op for non-interp specs); it must match extraction's window.
-        window = retime_source_window(final_duration, retime, fps,
-                                      source_fps=source_fps)
-
-        # Per-window runway: the retimed window must fit inside the scene
-        # window the candidate was chosen for (a ramp that spills across the
-        # scene cut hides a hard cut mid-slow-mo), and inside the real file.
-        candidate = by_id.get(clip.get("candidate_id")) or {}
-        cand_start = float(candidate.get("start", 0.0))
-        cand_end = float(candidate.get("end", cand_start))
-        video_duration = get_cached_video_duration(video_file)
-        scene_len = cand_end - cand_start
-        if scene_len > 0.0 and window > scene_len:
+        start = _retime_fit_start(clip, retime, by_id, fps, source_fps)
+        if start is None:
             continue
-        if window > video_duration - 0.05:
+        _attach_retime(clip, retime, start)
+
+
+def _retime_fit_start(clip: PlannedClip, retime: RetimeSpec, by_id: Dict,
+                      fps: float, source_fps: float) -> Optional[float]:
+    """Runway-gate a retime spec; returns the re-anchored start or None.
+
+    Pure check — never mutates the clip. Shared by _assign_retime_specs and
+    _assign_boundary_ramps so the two can never disagree on how much source a
+    retimed segment needs. Renderer probes (not analysis metadata) decide.
+    """
+    from ffmpeg_processing import (
+        get_cached_video_duration,
+        retime_source_window,
+    )
+
+    final_duration = float(clip.get("final_duration", 0.0))
+    # source_fps lets retime_source_window add the interp over-provision
+    # (a no-op for non-interp specs); it must match extraction's window.
+    window = retime_source_window(final_duration, retime, fps,
+                                  source_fps=source_fps)
+
+    # Per-window runway: the retimed window must fit inside the scene
+    # window the candidate was chosen for (a ramp that spills across the
+    # scene cut hides a hard cut mid-slow-mo), and inside the real file.
+    candidate = by_id.get(clip.get("candidate_id")) or {}
+    cand_start = float(candidate.get("start", 0.0))
+    cand_end = float(candidate.get("end", cand_start))
+    video_duration = get_cached_video_duration(clip.get("video_file"))
+    scene_len = cand_end - cand_start
+    if scene_len > 0.0 and window > scene_len:
+        return None
+    if window > video_duration - 0.05:
+        return None
+
+    # Re-anchor the start for the bigger window, inside both the scene
+    # window and the file. (Mirrors _materialize_clip's anchor semantics.)
+    start = float(clip.get("start_time", 0.0))
+    hi = min(cand_end - window if scene_len > 0.0 else video_duration - window,
+             video_duration - window)
+    lo = max(0.0, cand_start if scene_len > 0.0 else 0.0)
+    if hi < lo:
+        return None
+    return max(lo, min(start, hi))
+
+
+def _attach_retime(clip: PlannedClip, retime: RetimeSpec, start: float) -> None:
+    """Attach a runway-checked retime (start from _retime_fit_start)."""
+    clip["start_time"] = start
+    clip["retime"] = retime
+    # Retiming warps the segment's local clock (setpts sits between the
+    # source trim and the output fps=), so a source-time subject path no
+    # longer lines up with the `t` the renderer's crop expressions see —
+    # and this branch also re-anchors start_time, which the path was
+    # rebased against. Drop the tracked path and let the static anchor
+    # offset stand for retimed segments.
+    anchor = clip.get("subject_anchor")
+    if isinstance(anchor, dict) and "path_seg" in anchor:
+        anchor = dict(anchor)
+        anchor.pop("path_seg")
+        clip["subject_anchor"] = anchor
+
+
+# Boundary anticipation ramps (behind the same speed_ramps setting): how often
+# an ELIGIBLE drop-entry boundary actually fires, and the density cap — at
+# most one fired boundary per this many planned segments (floor of one).
+_BOUNDARY_RAMP_PROBABILITY = 0.25
+_BOUNDARY_RAMP_SEGMENTS_PER_FIRE = 8
+# Minimum segment lengths: the outgoing tail accel needs room to read as a
+# rush (and to keep the warped tail well under half the segment); the incoming
+# slow-open needs room to ease back to 1.0x without looking like a stutter.
+_BOUNDARY_RAMP_MIN_OUT_SECONDS = 1.2
+_BOUNDARY_RAMP_MIN_IN_SECONDS = 1.0
+
+
+def _assign_boundary_ramps(planned: List[PlannedClip],
+                           candidates: Sequence[Dict], fps: float) -> None:
+    """Anticipation ramps at drop entries: warp time across the boundary.
+
+    A fired boundary accelerates the OUTGOING segment's final 0.4-0.7s
+    (1.0x -> ~1.6x via the 'tail_ramp' retime kind) so the music's arrival
+    feels rushed-into, and opens the INCOMING drop at 0.4-0.5x exactly on its
+    first frame, easing back to 1.0x over the segment (the existing
+    whole-segment 'ramp' kind). Both sides must clear runway or neither
+    attaches — a half-fired boundary reads worse than a plain cut.
+
+    Runs after _assign_retime_specs and only claims boundaries where neither
+    side already carries a retime or partner. Crossfades stay mutually
+    exclusive for free: _select_crossfade_boundaries (video_processor) runs
+    later and skips any boundary whose clips carry a retime, so a fired
+    anticipation ramp deterministically wins the boundary.
+
+    RNG DISCIPLINE: every draw comes from a dedicated per-boundary
+    'boundary_ramp' stream — the per-segment 'retime' streams above are
+    seeded independently and keep their exact draw counts, so a run where no
+    boundary fires plans byte-identically to the pre-feature speed_ramps
+    engine.
+    """
+    from ffmpeg_processing import get_cached_video_fps, is_image_source
+
+    by_id = {c.get("id"): c for c in candidates}
+    cap = max(1, len(planned) // _BOUNDARY_RAMP_SEGMENTS_PER_FIRE)
+    fired = 0
+    for i in range(len(planned) - 1):
+        if fired >= cap:
+            break
+        out_clip, in_clip = planned[i], planned[i + 1]
+        if str(in_clip.get("target", "flow")) != "drop":
+            continue
+        if "retime" in out_clip or "retime" in in_clip:
+            continue
+        if "partner" in out_clip or "partner" in in_clip:
+            continue
+        out_file = out_clip.get("video_file")
+        in_file = in_clip.get("video_file")
+        if not out_file or not in_file:
+            continue
+        # Mirror _assign_retime_specs' media gates on BOTH sides: stills and
+        # GIFs (any container fps — display durations, not real frames) never
+        # retime, and sub-24fps sources are already frame-duplicated by the
+        # fps= normalization, so warping them is pure judder.
+        side_fps = []
+        for f in (out_file, in_file):
+            if is_image_source(f) or os.path.splitext(f)[1].lower() == ".gif":
+                break
+            probed = get_cached_video_fps(f)
+            if probed < 24.0:
+                break
+            side_fps.append(probed)
+        if len(side_fps) < 2:
+            continue
+        out_fps, in_fps = side_fps
+        out_len = float(out_clip.get("final_duration", 0.0))
+        in_len = float(in_clip.get("final_duration", 0.0))
+        if (out_len < _BOUNDARY_RAMP_MIN_OUT_SECONDS
+                or in_len < _BOUNDARY_RAMP_MIN_IN_SECONDS):
             continue
 
-        # Re-anchor the start for the bigger window, inside both the scene
-        # window and the file. (Mirrors _materialize_clip's anchor semantics.)
-        start = float(clip.get("start_time", 0.0))
-        hi = min(cand_end - window if scene_len > 0.0 else video_duration - window,
-                 video_duration - window)
-        lo = max(0.0, cand_start if scene_len > 0.0 else 0.0)
-        if hi < lo:
+        rng = _stable_rng("boundary_ramp", i, out_file, in_file)
+        if rng.random() >= _BOUNDARY_RAMP_PROBABILITY:
             continue
-        clip["start_time"] = max(lo, min(start, hi))
-        clip["retime"] = retime
-        # Retiming warps the segment's local clock (setpts sits between the
-        # source trim and the output fps=), so a source-time subject path no
-        # longer lines up with the `t` the renderer's crop expressions see —
-        # and this branch also re-anchors start_time, which the path was
-        # rebased against. Drop the tracked path and let the static anchor
-        # offset stand for retimed segments.
-        anchor = clip.get("subject_anchor")
-        if isinstance(anchor, dict) and "path_seg" in anchor:
-            anchor = dict(anchor)
-            anchor.pop("path_seg")
-            clip["subject_anchor"] = anchor
+        # out_len >= 1.2 keeps min(0.7, out_len / 2.0) >= 0.6 > 0.4, so the
+        # uniform's bounds never invert and the tail stays under half the
+        # outgoing segment (the cut must read as a rush, not a whole-segment
+        # speed-up).
+        tail = round(rng.uniform(0.4, min(0.7, out_len / 2.0)), 3)
+        out_speed = round(rng.uniform(1.45, 1.75), 3)
+        in_speed = round(rng.uniform(0.4, 0.5), 3)
+        out_retime: RetimeSpec = {"kind": "tail_ramp", "speed_end": out_speed,
+                                  "tail_seconds": tail}
+        in_retime: RetimeSpec = {"kind": "ramp", "speed_start": in_speed,
+                                 "speed_end": 1.0}
+
+        out_start = _retime_fit_start(out_clip, out_retime, by_id, fps,
+                                      out_fps)
+        if out_start is None:
+            continue
+        in_start = _retime_fit_start(in_clip, in_retime, by_id, fps,
+                                     in_fps)
+        if in_start is None:
+            continue
+        _attach_retime(out_clip, out_retime, out_start)
+        _attach_retime(in_clip, in_retime, in_start)
+        fired += 1
+        print(f"   ⏱ Anticipation ramp @ boundary {i}: out tail "
+              f"1.0→{out_speed}x ({tail}s), drop opens at {in_speed}x")
 
 
 def _plan_coverage_reservations(candidates: Sequence[Dict],
@@ -562,8 +750,16 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
     Preserved semantics vs. greedy:
       * The per-(source, segment) seat score is identical, including the
         short-candidate duration penalty (-0.18 when the candidate is shorter
-        than 0.55x the segment) that steers short sources (GIFs, stills) onto
-        short segments.
+        than 0.55x the segment) that steers short sources — GIFs and short
+        scenes — onto short segments. It does NOT reach stills, despite what
+        this docstring claimed before wave 17: video_analysis pins a still's
+        planner-facing ``duration`` at 5.0 (one zero-width window, but the
+        still can fill any segment via Ken Burns), so the penalty would need a
+        segment longer than 5.0 / 0.55 = 9.09s, while the longest hold in
+        ``auto_mode/__init__.py`` is ``low_energy_max_hold = 3.80``. The claim
+        is corrected rather than the penalty widened: a still genuinely has no
+        length limit to protect, so penalizing it on long segments would be a
+        content regression, not a fix.
       * The drop-exemption tier is preserved: on a 'drop' segment a candidate
         scoring below ``best_raw[j] - 0.35`` is "exempt" — coverage should
         spend the flow/soft filler slots, not the money-shot drops. Exempt
@@ -809,18 +1005,21 @@ def _plan_coverage_reservations(candidates: Sequence[Dict],
 # out/in chains occupy ~0.2s and need normal footage around them to read.
 _TRANSITION_MIN_SEG = 0.3
 
-# semantic_fx only: minimum |camera_dir_x| (camera_motion 0..1 scale) before
-# a whip pan's direction is overridden to continue the outgoing clip's
-# measured horizontal camera drift. Below it the rng coin flip stands.
+# semantic_fx only: minimum |camera_dir_x| before a whip pan's direction is
+# overridden to continue the outgoing clip's measured horizontal camera drift.
+# Below it the rng coin flip stands. Analysis v14 put camera_dir_x on a
+# 1.0 screen-height/second full scale, so 0.10 = the camera drifting a tenth
+# of the frame height per second — a visible pan, not measurement noise.
 _WHIP_DIR_MATCH_MIN = 0.10
 
 
 def _whip_camera_dir_x(clip: PlannedClip) -> Optional[float]:
     """Horizontal camera-drift component for the whip-pan direction match.
 
-    Prefers the native-pair measurement (sub-15fps sources — the standard
-    sampling's flow is garbage there, same reasoning as the media-aware
-    kinetic correction); None when analysis produced neither."""
+    Prefers the native-pair measurement (sub-15fps sources measure every
+    consecutive frame in the window instead of only the 3-8 sample positions,
+    which matters most exactly where per-frame displacement is largest); None
+    when analysis produced neither."""
     for key in ("camera_dir_x_native", "camera_dir_x"):
         value = clip.get(key)
         if value is None:
@@ -1122,12 +1321,16 @@ def _media_aware_adjustment(candidate: Dict, profile: SegmentProfile,
         nothing, 2× pays the full seam penalty, 3×+ pays double. Seamless
         GIFs (seam≈0) stay preferred fillers at any length.
       * native-kinetic: sub-15fps sources carry ``kinetic_native`` (optical
-        flow on consecutive native frame pairs; the standard fixed-dt sampling
-        produces garbage magnitudes there). The cached score already paid the
-        wave-16 energy term with the bogus ``kinetic``; this adds exactly the
-        difference so the effective energy term uses the native measurement.
-        Wave 2 completes the swap for untagged DROP segments, whose cached
-        formula also paid 0.10 * kinetic directly.
+        flow over EVERY consecutive native frame pair in the window, not just
+        the pairs at the 3-8 metric sample positions — a density refinement
+        that matters most at 10-15fps, where a window holds few frames).
+        Since analysis v14 both measurements share the same native dt, so the
+        delta is small; before v14 it corrected an outright broken ``kinetic``.
+        The cached score already paid the wave-16 energy term with the sampled
+        ``kinetic``; this adds exactly the difference so the effective energy
+        term uses the denser measurement. Wave 2 completes the swap for
+        untagged DROP segments, whose cached formula also paid 0.10 * kinetic
+        directly.
 
     ``stats`` (when provided) counts per-evaluation fires for the one debug
     line the planner prints.
@@ -1199,6 +1402,7 @@ def _choose_candidate(
     media_aware: bool = False,
     canvas_w: int = 0,
     media_stats: "Counter | None" = None,
+    spent: "Dict[object, List[tuple]] | None" = None,
 ) -> Dict | None:
     best_candidate = None
     best_score = -999.0
@@ -1219,7 +1423,9 @@ def _choose_candidate(
             score -= 0.28
         if video_file in recent_videos:
             score -= 0.10
-        score -= min(0.28, usage[cid] * 0.10)
+        # Wave 17: unbounded candidate-identity reuse cost + footage
+        # exhaustion. Ledger-dependent, so it lives OUTSIDE _ScoreCache.
+        score -= _reuse_penalty(candidate, usage, variety, spent)
         if use_pf:
             share = pf_ewma.value(video_file, index) / max(1e-9, pf_total)
             pressure = share * source_count
@@ -1227,6 +1433,12 @@ def _choose_candidate(
         else:
             score -= min(file_cap, usage[video_file] * file_rate)
 
+        # Short-source penalty. Reachable for GIFs and short scenes (their
+        # candidate "duration" is the real analysis-window length); NOT for
+        # stills, whose duration video_analysis pins at 5.0 so they can fill
+        # any segment — firing would need a segment > 9.09s, above every
+        # *_max_hold ceiling in auto_mode/__init__.py. See the note in
+        # _plan_coverage_reservations.
         required_source = max(0.05, profile["duration"])
         candidate_duration = max(0.05, float(candidate.get("duration", required_source)))
         if candidate_duration < required_source * 0.55:
@@ -1365,12 +1577,36 @@ def _rebase_subject_anchor(candidate: Dict, start_time: float,
     return out
 
 
-def _plan_source_window(candidate: Dict, profile: SegmentProfile) -> tuple:
+def _plan_source_window(candidate: Dict, profile: SegmentProfile,
+                        spent: "Dict[object, List[tuple]] | None" = None) -> tuple:
     """(start_time, source_duration) for a candidate serving a segment.
 
     This is the single authority for source-window semantics — the primary
     clip (_materialize_clip) and a duo partner (_materialize_partner) must
     place their windows identically, so the math lives here once.
+
+    ANCHOR WINDOW (unchanged, and still the fallback). The window is placed so
+    the candidate's salient instant (``peak_time`` on drop/build, ``center``
+    otherwise) lands at a fixed fraction ``align`` into the segment.
+
+    SUB-WINDOW LEDGER (wave 17). The anchor formula alone has no memory, so
+    every reuse of one candidate replays the same frames: for a shared anchor
+    ``a`` and durations d1 < d2 the two windows are strictly NESTED
+    (``start1 - start2 = (d2-d1)*align > 0``, ``end1 - end2 = (d1-d2)*(1-align)
+    < 0``), always straddling the same frame — the direct cause of "clips loop
+    noticeably". Analysis windows run up to 5.2s (``_make_candidate_windows``)
+    while segments average ~1.2s, so a candidate typically holds ~4 disjoint
+    segment-length windows the anchor formula structurally cannot reach.
+
+    When ``spent`` is supplied (the per-run ledger of already-used source
+    intervals, keyed by candidate id) and the candidate's analysis span is at
+    least 2.2x the needed duration, this scans that span on a ``0.85 * d``
+    stride and returns the FIRST offset whose overlap with every spent
+    interval is under ``0.35 * d`` — a deterministic left-to-right scan, no
+    rng. A span too short to vary, or one whose sub-windows are all spent,
+    falls back to the anchor window, so behaviour degrades to the legacy
+    formula instead of failing. The returned start is clamped exactly as
+    before (video_processor re-clamps against the probed duration).
     """
     source_duration = max(0.05, float(profile["duration"]))
     video_duration = max(source_duration, float(candidate.get("video_duration", source_duration)))
@@ -1390,14 +1626,94 @@ def _plan_source_window(candidate: Dict, profile: SegmentProfile) -> tuple:
         align = 0.44
 
     start_time = anchor - source_duration * align
+
+    if spent is not None:
+        used = spent.get(candidate.get("id"))
+        span = _candidate_span(candidate)
+        if used and span >= source_duration * 2.2:
+            try:
+                span_start = float(candidate.get("start", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                span_start = 0.0
+            stride = source_duration * 0.85
+            tolerance = source_duration * 0.35
+            steps = int((span - source_duration) / stride) + 1
+            for k in range(steps):
+                t = span_start + k * stride
+                if all(min(t + source_duration, e) - max(t, s) < tolerance
+                       for s, e in used):
+                    start_time = t
+                    break
+
     start_time = max(0.0, min(start_time, max(0.0, video_duration - source_duration)))
     return start_time, source_duration
 
 
+def _candidate_span(candidate: Dict) -> float:
+    """Extent of the candidate's analysis window in source seconds (>= 0.0).
+
+    Stills carry start == end == 0.0 (video_analysis gives them one zero-width
+    window), so their span is 0.0 and every span-gated term below is inert for
+    them — exactly right: a single frame has no unspent footage to find.
+    """
+    try:
+        span = float(candidate.get("end", 0.0) or 0.0) - float(candidate.get("start", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(span) or span <= 0.0:
+        return 0.0
+    return span
+
+
+def _record_source_window(spent: "Dict[object, List[tuple]] | None",
+                          candidate: Dict, start_time: float,
+                          source_duration: float) -> None:
+    """Book one materialized window into the sub-window ledger.
+
+    Called once per pick (and once more for a duo partner) from
+    ``build_planned_clip_sequence``'s sequential loop, alongside the usage /
+    recency / PF bookkeeping. Ledger state is therefore a pure function of the
+    pick order — no rng, deterministic replay.
+    """
+    if spent is None:
+        return
+    spent.setdefault(candidate.get("id"), []).append(
+        (float(start_time), float(start_time) + float(source_duration)))
+
+
+def _reuse_penalty(candidate: Dict, usage: Counter, variety: float,
+                   spent: "Dict[object, List[tuple]] | None") -> float:
+    """Per-candidate reuse cost (wave 17): log-growth + footage exhaustion.
+
+    Replaces the pre-wave-17 ``min(0.28, usage[cid] * 0.10)``, which saturated
+    at the third use — after that the only unbounded pressure was ``pf_ewma``,
+    and that is keyed on ``video_file``, not on candidate identity, so a single
+    candidate inside a favoured source could be picked without limit. The log
+    term never saturates and scales with the variety slider.
+
+    The exhaustion term prefers candidates that still hold unspent footage: it
+    grows with the fraction of the candidate's analysis span the ledger has
+    already served, capped at 0.25. Because it reads ledger state it MUST be
+    applied OUTSIDE ``_ScoreCache`` (whose key is only
+    (candidate, target, quantized energy)) — same rule as the recency, PF,
+    semantic and media-aware terms.
+    """
+    penalty = 0.10 * math.log1p(usage[candidate.get("id")]) * (1.0 + 2.0 * variety)
+    if spent:
+        used = spent.get(candidate.get("id"))
+        if used:
+            span = _candidate_span(candidate)
+            if span > 0.0:
+                covered = sum(e - s for s, e in used)
+                penalty += 0.25 * min(1.0, covered / max(0.1, span))
+    return penalty
+
+
 def _materialize_clip(candidate: Dict, profile: SegmentProfile, index: int,
-                      score_cache: "_ScoreCache | None" = None) -> PlannedClip:
+                      score_cache: "_ScoreCache | None" = None,
+                      spent: "Dict[object, List[tuple]] | None" = None) -> PlannedClip:
     final_duration = max(0.05, float(profile["duration"]))
-    start_time, source_duration = _plan_source_window(candidate, profile)
+    start_time, source_duration = _plan_source_window(candidate, profile, spent)
     target = profile.get("target", "flow")
     _score = score_cache.score if score_cache is not None else _score_candidate
 
@@ -1426,6 +1742,12 @@ def _materialize_clip(candidate: Dict, profile: SegmentProfile, index: int,
         # renderer; missing candidate fields forward as None (graceful).
         "kinetic": candidate.get("kinetic"),
         "subject_motion": candidate.get("subject_motion"),
+        # Native-pair variants (sub-15fps sources measure every consecutive
+        # frame in the window, not just the sample positions). Forwarded so
+        # effects._sem_needs_motion / _sem_calm_subject can prefer them, the
+        # same native-first rule _whip_camera_dir_x already applies.
+        "kinetic_native": candidate.get("kinetic_native"),
+        "subject_motion_native": candidate.get("subject_motion_native"),
         "motion": candidate.get("motion"),
         "action_score": candidate.get("action_score"),
         "beauty_score": candidate.get("beauty_score"),
@@ -1501,6 +1823,7 @@ def _maybe_choose_duo_partner(
     media_aware: bool = False,
     canvas_w: int = 0,
     media_stats: "Counter | None" = None,
+    spent: "Dict[object, List[tuple]] | None" = None,
 ) -> Dict | None:
     """Partner candidate for a duo segment, or None to render the primary solo.
 
@@ -1553,7 +1876,9 @@ def _maybe_choose_duo_partner(
             score -= 0.28
         if video_file in recent_videos:
             score -= 0.10
-        score -= min(0.28, usage[cid] * 0.10)
+        # Same wave-17 reuse cost as the primary auction (shared helper — the
+        # two blocks must never drift apart).
+        score -= _reuse_penalty(candidate, usage, variety, spent)
         if use_pf:
             share = pf_ewma.value(video_file, index) / max(1e-9, pf_total)
             pressure = share * source_count
@@ -1590,14 +1915,16 @@ def _maybe_choose_duo_partner(
     return best_candidate
 
 
-def _materialize_partner(candidate: Dict, profile: SegmentProfile) -> PartnerClip:
+def _materialize_partner(candidate: Dict, profile: SegmentProfile,
+                         spent: "Dict[object, List[tuple]] | None" = None) -> PartnerClip:
     """The additive "partner" payload carried by a duo's planned clip.
 
     Window semantics are identical to the primary's (_plan_source_window is
-    shared), and the subject anchor is rebased onto the segment clock exactly
-    as for the primary so the pane crop can track the subject.
+    shared, ledger included), and the subject anchor is rebased onto the
+    segment clock exactly as for the primary so the pane crop can track the
+    subject.
     """
-    start_time, source_duration = _plan_source_window(candidate, profile)
+    start_time, source_duration = _plan_source_window(candidate, profile, spent)
     return {
         "video_file": candidate.get("video_file"),
         "start_time": start_time,

@@ -74,6 +74,14 @@ class EffectContext:
     # WHETHER an effect fires — that is its whole job, and it is allowed to
     # because the semantic_fx flag gates it.
     fire_scale: float = 1.0
+    # True only when the caller passed semantic_fx=True. Builders may read it
+    # to add a music gate that the historical engine never had (fisheye,
+    # vignette_grain's grain roll — the only two primitives that used to fire
+    # on a bare probability roll with no target/energy condition at all).
+    # Those gates sit behind this flag for the same reason SEMANTIC_FX_MATRIX
+    # does: skipping a roll or an emit changes the shared ctx.rng draw
+    # sequence, and the off-path must keep consuming the exact historical one.
+    semantic_fx: bool = False
 
 
 def _stable_rng(*parts) -> random.Random:
@@ -120,12 +128,13 @@ def _loudness_gain(ctx: EffectContext) -> float:
 #
 # Graceful degradation: every field read returns None when the planner didn't
 # supply it, and a predicate whose inputs are all unknown passes — un-analyzed
-# clips behave as today. Today's plan dicts (stage6 _materialize_clip) carry
-# 'impact' but NOT the optical-flow motion metrics (kinetic/subject_motion)
-# or stage5 semantic scores (action/beauty/character) — those still live on
-# the candidate dicts. The reads below cover both the flat spellings and the
-# stage5 'semantic' sub-dict spellings so the matrix lights up the moment the
-# planner starts forwarding them, without an effects.py change.
+# clips behave as today. Plan dicts (stage6 _materialize_clip) forward 'impact'
+# plus the optical-flow motion metrics (kinetic/subject_motion and their
+# *_native variants) and the stage5 semantic scores (action/beauty/character),
+# so the predicates below read real values. Each read still lists several
+# spellings — native-pair first, then the flat candidate key, then the stage5
+# 'semantic' sub-dict — so a plan missing any of them degrades instead of
+# failing.
 # ---------------------------------------------------------------------------
 
 
@@ -153,7 +162,7 @@ def _sem_needs_motion(clip: Dict) -> bool:
     # is still frozen), so the action escape hatch below must not apply.
     if str(clip.get('media_type', '')) == 'still':
         return False
-    kinetic = _sem_field(clip, 'kinetic', 'motion')
+    kinetic = _sem_field(clip, 'kinetic_native', 'kinetic', 'motion')
     action = _sem_field(clip, 'action', 'action_score', 'action_intensity')
     if kinetic is None and action is None:
         return True
@@ -169,7 +178,7 @@ def _sem_needs_impact(clip: Dict) -> bool:
 
 def _sem_calm_subject(clip: Dict) -> bool:
     # Smears read as mush over busy subjects.
-    subject = _sem_field(clip, 'subject_motion')
+    subject = _sem_field(clip, 'subject_motion_native', 'subject_motion')
     return subject is None or subject <= 0.5
 
 
@@ -193,15 +202,43 @@ SEMANTIC_FX_MATRIX = {
     'pixelize_burst': _sem_needs_motion,
     'chroma_shift': _sem_needs_motion,
     'shake': _sem_needs_motion,
+    # Zoom blur and the tmix smear SIMULATE motion. Over a still or a static
+    # shot there is nothing to smear, so both read as a rendering artifact —
+    # the same reasoning that already vetoes strobe/shake. (motion_smear over
+    # a still is worse than useless: tmix averages identical frames, so it
+    # costs a split/trim/concat subgraph to produce no visible change.)
+    'zoom_blur': _sem_needs_motion,
+    'motion_smear': _sem_needs_motion,
     'white_flash': _sem_needs_impact,
     'punch_zoom': _sem_needs_impact,
     'punch_fill': _sem_needs_impact,
+    # Posterize is the third member of the flash family (white_flash /
+    # pixelize_burst): a hard 0.3s stylization sold by the hit underneath it.
+    'posterize_flash': _sem_needs_impact,
     'trails': _sem_calm_subject,
     'hue_sweep': _sem_calm_subject,
+    # A multi-second sustained zoom fights a busy subject — the frame reads
+    # unstable rather than deliberate — so it takes the same calm-subject gate
+    # as the other slow, sustained treatments. Keyed on 'push_in' because
+    # push_in/pull_out share one builder that the sequences invoke under the
+    # 'push_in' slot only (see _PRIMITIVES / _CUSTOM_SEQUENCE); a 'pull_out'
+    # entry would never be consulted.
+    'push_in': _sem_calm_subject,
     'dutch_tilt': _sem_not_beauty_dominant,
     'fisheye': _sem_not_beauty_dominant,
+    # Pumping saturation ±0.35 on a shot whose whole point is its grade
+    # undercuts it, exactly like tilting one does.
+    'sat_pulse': _sem_not_beauty_dominant,
     'half_mirror': _sem_not_face_dominant,
     'kaleido_quad': _sem_not_face_dominant,
+    # beat_flip is mirror-family (it sets ctx.mirror_used and restructures the
+    # frame), so it inherits the mirror family's face veto.
+    'beat_flip': _sem_not_face_dominant,
+    # Deliberately NOT covered: 'vignette_grain'. It is the style's finishing
+    # look (a constant frame treatment), not a beat event — vetoing it per
+    # segment would make the vignette switch on and off between cuts, which
+    # reads worse than leaving it on everywhere. Its grain half is gated on
+    # the music instead, inside the builder.
 }
 
 
@@ -648,6 +685,15 @@ def _fx_hue_sweep(ctx: EffectContext) -> None:
 
 def _fx_fisheye(ctx: EffectContext) -> None:
     # Rare subtle fisheye bulge.
+    #
+    # Music gate (semantic_fx only): a lens warp is a flourish, so it belongs
+    # on the segments the edit is pushing — drops and builds — not on an
+    # arbitrary calm shot. Historically this was the one primitive besides
+    # vignette_grain's grain roll with no target/energy condition whatsoever.
+    # It runs BEFORE the roll (so a gated-out segment consumes no rng), which
+    # is safe only because the flag is off on the historical path.
+    if ctx.semantic_fx and ctx.target not in ('drop', 'build'):
+        return
     if ctx.curated:
         fire = ctx.hype and ctx.pack < ctx.pack_cap and ctx.rng.random() < 0.12 * ctx.k * ctx.fire_scale
     else:
@@ -738,6 +784,15 @@ def _fx_vignette_grain(ctx: EffectContext) -> None:
     if not fire:
         return
     ctx.filters.append("vignette=PI/5")
+    # The vignette is the finishing look and stays unconditional — it must not
+    # blink on and off between cuts. The grain is different: it is already
+    # re-rolled every segment, so under semantic_fx it is gated onto the hard
+    # targets, turning a random per-segment flicker into a texture that swells
+    # with the music. Gate before the roll: this is the LAST ctx.rng draw in
+    # both sequences, and the flag is off on the historical path, so no other
+    # primitive's draws can shift either way.
+    if ctx.semantic_fx and ctx.target not in ('drop', 'rhythm', 'build'):
+        return
     if ctx.rng.random() < 0.5 * ctx.k * ctx.fire_scale:
         ctx.filters.append("noise=alls=5:allf=t")
 
@@ -910,12 +965,15 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
     provided, beat-locked primitives gate on the real beats instead of a
     tempo-frequency approximation.
 
-    semantic_fx (default off) turns on content-aware effect selection: the
+    semantic_fx turns on content-aware effect selection: the
     SEMANTIC_FX_MATRIX vetoes primitives that clash with the clip's
-    semantic/motion profile, and firing probabilities scale with the
-    segment's musical impact (ctx.fire_scale). Off (the default) the loop,
-    thresholds and rng draw sequence are byte-identical to the
-    pre-semantic_fx engine.
+    semantic/motion profile, firing probabilities scale with the segment's
+    musical impact (ctx.fire_scale), and the two primitives that historically
+    fired on a bare probability roll (fisheye, vignette_grain's grain) pick up
+    a target gate. Off, the loop, thresholds and rng draw sequence are
+    byte-identical to the pre-semantic_fx engine. It defaults to False here
+    (the historical engine); the shipped render default is True — see
+    RenderSettings.semantic_fx in orchestrator.py.
     """
     if not style or style == 'clean':
         return []
@@ -994,6 +1052,7 @@ def build_effect_filters(planned_clip: Optional[Dict], style: str, intensity: fl
         # threshold by 1.0 is an IEEE754 no-op, so the off-path comparisons
         # (and draw sequence) stay bit-for-bit historical.
         fire_scale=(0.6 + 0.8 * _clamp01(clip.get('impact'))) if semantic_fx else 1.0,
+        semantic_fx=bool(semantic_fx),
     )
 
     vetoed: List[str] = []
